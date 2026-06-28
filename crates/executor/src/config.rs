@@ -63,11 +63,14 @@ pub struct PriceProbeCfg {
     pub window_ms: u64,
     /// Sample interval (ms).
     pub step_ms: u64,
+    /// Pre-signal lookback (ms): how far back to measure the Kalshi ask move that
+    /// preceded the trigger (logged in PXMETA). 0 disables the pre-move.
+    pub pre_window_ms: u64,
 }
 
 impl Default for PriceProbeCfg {
     fn default() -> Self {
-        PriceProbeCfg { enabled: false, window_ms: 1000, step_ms: 50 }
+        PriceProbeCfg { enabled: false, window_ms: 1000, step_ms: 50, pre_window_ms: 500 }
     }
 }
 

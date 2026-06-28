@@ -8,7 +8,7 @@
 //! memory across modules. Within the executor it lives behind a mutex shared by
 //! the mirror task (writer) and the trade task (reader).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use arb_core::event::{Event, Payload};
@@ -32,6 +32,7 @@ pub struct ExecBookMirror {
     books: HashMap<String, BookDepth>,       // instrument -> full top-N ladder
     meta: HashMap<String, MarketMetaLite>,   // cid -> lifecycle meta
     winners: HashMap<String, String>,        // cid -> winning instrument (resolved)
+    hist: HashMap<String, VecDeque<(i64, f64)>>, // instrument -> recent (recv_ts, best_ask), ~2s
 }
 
 impl ExecBookMirror {
@@ -47,6 +48,14 @@ impl ExecBookMirror {
                     b.instrument.clone(),
                     BookDepth { bids: b.bids.clone(), asks: b.asks.clone(), recv_ts_ns: b.recv_ts_ns },
                 );
+                // Rolling top-of-book ask history (~2s) for the pre-signal move.
+                let ask = b.asks.first().map(|&(p, _)| p).unwrap_or(0.0);
+                let h = self.hist.entry(b.instrument.clone()).or_default();
+                h.push_back((b.recv_ts_ns, ask));
+                let cutoff = b.recv_ts_ns - 2_000 * 1_000_000;
+                while h.front().is_some_and(|&(t, _)| t < cutoff) {
+                    h.pop_front();
+                }
             }
             Payload::Meta(m) => {
                 if let Some(mid) = market_id_of(&m.instrument) {
@@ -93,6 +102,19 @@ impl ExecBookMirror {
     /// ms to expiry for the market the instrument belongs to (None if unknown).
     pub fn tte_ms(&self, instrument: &str, now_ns: i64) -> Option<i64> {
         self.meta_of(instrument).map(|m| (m.expiry_ns - now_ns) / 1_000_000)
+    }
+
+    /// Best-ask at-or-before `ts_ns` from the rolling history (None if no entry).
+    fn ask_at(&self, instrument: &str, ts_ns: i64) -> Option<f64> {
+        let h = self.hist.get(instrument)?;
+        h.iter().rev().find(|&&(t, _)| t <= ts_ns).map(|&(_, a)| a)
+    }
+
+    /// Ask move (¢) on `instrument` from `from_ns` to `to_ns`, from the rolling
+    /// history. None if either side lacks history (e.g. just started). Used for
+    /// the pre-signal Kalshi move.
+    pub fn ask_move_c(&self, instrument: &str, from_ns: i64, to_ns: i64) -> Option<f64> {
+        Some((self.ask_at(instrument, to_ns)? - self.ask_at(instrument, from_ns)?) * 100.0)
     }
 
     pub fn winner_of(&self, instrument: &str) -> Option<String> {

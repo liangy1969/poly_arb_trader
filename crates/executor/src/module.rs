@@ -460,6 +460,24 @@ impl Engine {
         // signal moment; deltas are ¢ vs the signal book.
         if let Some(tx) = &self.px_tx {
             if let Some(b) = self.top(&inst) {
+                // Per-trigger metadata: tte + the pre-signal Kalshi ask move + the
+                // trigger. dry_run skips emit_trade, so this is the only record.
+                let (tte, pre) = {
+                    let m = self.mirror.lock().unwrap();
+                    let pre_w = self.cfg.price_probe.pre_window_ms as i64 * MS;
+                    (
+                        m.tte_ms(&inst, now_ns()),
+                        m.ask_move_c(&inst, plan.signal_ts_ns - pre_w, plan.signal_ts_ns),
+                    )
+                };
+                tracing::info!(
+                    target: "pxprobe",
+                    "PXMETA trade={} inst={} tte_ms={} pre_move_c={} signal_ask={:.3} bps={:+.2} yes_px={:.3} tgt_c={:+.1}",
+                    plan.trade_id, inst,
+                    tte.map(|t| t.to_string()).unwrap_or_else(|| "?".into()),
+                    pre.map(|v| format!("{:+.2}", v)).unwrap_or_else(|| "?".into()),
+                    plan.signal_ask, plan.trigger.move_bps, plan.trigger.yes_price, plan.trigger.target_move_c,
+                );
                 let _ = tx.send(PxProbe {
                     trade_id: plan.trade_id.clone(),
                     inst: inst.clone(),
