@@ -13,6 +13,9 @@ use serde::Deserialize;
 pub struct ExecutorCfg {
     /// Opt-in: when false the module is inert (like the recorder).
     pub enabled: bool,
+    /// Shadow / dry-run: process signals and fire the price probe, but place NO
+    /// order (no real money). Requires `enabled: true` so signals still flow.
+    pub dry_run: bool,
     pub venue: VenueCfg,
     pub sizing: SizingCfg,
     pub entry: EntryCfg,
@@ -158,6 +161,7 @@ impl Default for ExecutorCfg {
     fn default() -> Self {
         ExecutorCfg {
             enabled: false,
+            dry_run: false,
             venue: VenueCfg::default(),
             sizing: SizingCfg::default(),
             entry: EntryCfg::default(),

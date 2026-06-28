@@ -470,6 +470,14 @@ impl Engine {
             }
         }
 
+        // Shadow / dry-run: the probe has fired; place NO order, free the
+        // one-trade slot + arm the cooldown, and we're done. No real money.
+        if self.cfg.dry_run {
+            self.report(&plan.trade_id, &inst, "Shadow", "dry_run: probe only, no order");
+            self.pm.end_trade(now_ns(), self.cfg.risk.cooldown_ms);
+            return;
+        }
+
         // ── ENTRY: bounded FAK attempt loop (§5) ──
         let mut entry = LegSummary::default();
         let mut attempt = 0u32;
