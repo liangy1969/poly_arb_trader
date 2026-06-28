@@ -130,6 +130,19 @@ impl Module for Executor {
             None
         };
 
+        // Post-signal price-trajectory sampler (optional): on every triggered
+        // trade, log the traded-token book at a step_ms ladder over window_ms.
+        let px_tx = if self.cfg.price_probe.enabled {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<PxProbe>();
+            let m = mirror.clone();
+            let step = self.cfg.price_probe.step_ms.max(1);
+            let ladder: Vec<u64> = (0..=self.cfg.price_probe.window_ms).step_by(step as usize).collect();
+            self.handles.push(tokio::spawn(price_sampler(m, rx, ladder)));
+            Some(tx)
+        } else {
+            None
+        };
+
         let mut engine = Engine {
             cfg: self.cfg.clone(),
             bus: bus.clone(),
@@ -140,6 +153,7 @@ impl Module for Executor {
             seq: 0,
             hold_tx,
             maker_tx,
+            px_tx,
         };
         self.handles.push(tokio::spawn(async move {
             let mut sigsub = sigsub;
@@ -201,6 +215,8 @@ struct Engine {
     hold_tx: Option<tokio::sync::mpsc::UnboundedSender<HoldProbe>>,
     /// Maker-exit study probe (None = off).
     maker_tx: Option<tokio::sync::mpsc::UnboundedSender<MakerProbe>>,
+    /// Post-signal price-trajectory probe (None = off).
+    px_tx: Option<tokio::sync::mpsc::UnboundedSender<PxProbe>>,
 }
 
 /// One entry registered with the hold-period sampler: it samples the realized
@@ -225,6 +241,18 @@ struct MakerProbe {
     offer_px: f64,
     bid0: f64,
     fee_rate: f64,
+}
+
+/// One triggered signal registered with the price-trajectory sampler: it samples
+/// the traded-token top book at a ladder of offsets from `t0_ns` and logs the
+/// reprice path (bid/ask/mid + ¢ delta from the signal reference). Fires whether
+/// or not our order fills, so it validates signal direction on abandoned trades.
+struct PxProbe {
+    trade_id: String,
+    inst: String,
+    t0_ns: i64,
+    ref_ask: f64,
+    ref_mid: f64,
 }
 
 impl Engine {
@@ -426,6 +454,21 @@ impl Engine {
     async fn run_trade(&mut self, plan: TradePlan) {
         let inst = plan.instrument.clone();
         self.report(&plan.trade_id, &inst, "Entering", &format!("size={:.2}", plan.size_shares));
+
+        // Post-signal price-trajectory probe: fire BEFORE the entry loop so it
+        // captures the reprice path even if we abandon (no fill). Anchored at the
+        // signal moment; deltas are ¢ vs the signal book.
+        if let Some(tx) = &self.px_tx {
+            if let Some(b) = self.top(&inst) {
+                let _ = tx.send(PxProbe {
+                    trade_id: plan.trade_id.clone(),
+                    inst: inst.clone(),
+                    t0_ns: plan.signal_ts_ns,
+                    ref_ask: plan.signal_ask,
+                    ref_mid: 0.5 * (b.best_bid + b.best_ask),
+                });
+            }
+        }
 
         // ── ENTRY: bounded FAK attempt loop (§5) ──
         let mut entry = LegSummary::default();
@@ -685,6 +728,51 @@ async fn hold_sampler(
                             );
                         }
                         false // offset sampled → drop it
+                    });
+                }
+                probes.retain(|(_, pending)| !pending.is_empty());
+            }
+        }
+    }
+}
+
+/// Post-signal price-trajectory sampler. For each triggered trade, at every
+/// offset in the ladder it reads the traded-token top book and logs bid/ask/mid
+/// plus the ¢ delta from the signal reference — the reprice path, independent of
+/// whether our order filled. This is the ground-truth "was the signal right?"
+/// curve: if the mid walks our way over the next ~100-300ms the signal is real
+/// even when the order abandons.
+async fn price_sampler(
+    mirror: Arc<Mutex<ExecBookMirror>>,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<PxProbe>,
+    ladder: Vec<u64>,
+) {
+    let mut probes: Vec<(PxProbe, Vec<u64>)> = Vec::new();
+    let mut tick = tokio::time::interval(Duration::from_millis(10));
+    loop {
+        tokio::select! {
+            p = rx.recv() => match p {
+                Some(p) => probes.push((p, ladder.clone())),
+                None => break,
+            },
+            _ = tick.tick() => {
+                let now = now_ns();
+                for (probe, pending) in probes.iter_mut() {
+                    pending.retain(|&h| {
+                        if now < probe.t0_ns + h as i64 * MS {
+                            return true; // offset not reached yet
+                        }
+                        if let Some(b) = mirror.lock().unwrap().top(&probe.inst) {
+                            let mid = 0.5 * (b.best_bid + b.best_ask);
+                            tracing::info!(
+                                target: "pxprobe",
+                                "PXPROBE trade={} inst={} t_ms={h} bid={:.3} ask={:.3} mid={:.3} \
+                                 dmid_c={:.2} dask_c={:.2}",
+                                probe.trade_id, probe.inst, b.best_bid, b.best_ask, mid,
+                                (mid - probe.ref_mid) * 100.0, (b.best_ask - probe.ref_ask) * 100.0,
+                            );
+                        }
+                        false // sampled → drop this offset
                     });
                 }
                 probes.retain(|(_, pending)| !pending.is_empty());

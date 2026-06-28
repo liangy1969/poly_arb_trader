@@ -97,6 +97,8 @@ impl KalshiVenue {
         let base = if network == "mainnet" { PROD_BASE } else { DEMO_BASE }.to_string();
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(5))
+            .pool_idle_timeout(None)                 // never expire pooled TLS conns
+            .tcp_keepalive(Duration::from_secs(15))  // keep the socket alive through NAT/LB
             .build()
             .context("building reqwest client")?;
         tracing::info!("kalshi venue: base={base} max_order_usdc={max_order_usdc}");
@@ -231,16 +233,27 @@ impl TradingVenue for KalshiVenue {
     }
 
     fn start(&self, fills: FillSender) -> Vec<JoinHandle<()>> {
-        // v1: IOC fills return synchronously from submit(); no async producer yet.
-        // But we MUST keep the fill sender alive — if it drops, the executor's
-        // fill_rx closes and its select! loop breaks on the first poll (no signals
-        // ever processed). Park it until shutdown (the handle is aborted on stop()).
-        // P2: replace with a /portfolio/fills reconcile poll or the user fill WS.
+        // Keep the fill sender alive — if it drops, the executor's fill_rx closes
+        // and its select! loop breaks on the first poll (no signals ever processed).
         let keeper = tokio::spawn(async move {
             let _hold = fills;
             std::future::pending::<()>().await;
         });
-        vec![keeper]
+        // Connection warmer: ping a cheap public endpoint every 15s on the SAME
+        // client so the pooled TLS connection to Kalshi stays hot. A real order then
+        // reuses it and skips the cold-handshake penalty (~tens of ms). Same host as
+        // the order POST, so HTTP keep-alive shares the one connection. Critical here
+        // because 3bps signals are minutes apart — without this every order is cold.
+        let http = self.http.clone();
+        let url = format!("{}/exchange/status", self.base);
+        let warmer = tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(15));
+            loop {
+                tick.tick().await;
+                let _ = http.get(&url).send().await; // result ignored; just keep it warm
+            }
+        });
+        vec![keeper, warmer]
     }
 
     fn name(&self) -> &'static str {

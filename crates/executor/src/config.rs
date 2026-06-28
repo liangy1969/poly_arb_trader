@@ -29,6 +29,11 @@ pub struct ExecutorCfg {
     /// rest, fill if the bid lifts it, else fall through to a taker cross) vs the
     /// current taker cross. Measures fill rate + per-trade gain. Off by default.
     pub maker_probe: MakerProbeCfg,
+    /// Post-signal price-trajectory probe: on every triggered trade (filled OR
+    /// abandoned), sample the traded-token book every `step_ms` for `window_ms`
+    /// and log bid/ask/mid + delta from the signal price. Tells us whether the
+    /// signal was directionally right independent of whether our order filled.
+    pub price_probe: PriceProbeCfg,
 }
 
 #[derive(Clone, Deserialize)]
@@ -44,6 +49,22 @@ pub struct MakerProbeCfg {
 impl Default for MakerProbeCfg {
     fn default() -> Self {
         MakerProbeCfg { enabled: false, rest_ms: 1500, improve_tick: false }
+    }
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(default)]
+pub struct PriceProbeCfg {
+    pub enabled: bool,
+    /// Total trajectory window after the signal (ms).
+    pub window_ms: u64,
+    /// Sample interval (ms).
+    pub step_ms: u64,
+}
+
+impl Default for PriceProbeCfg {
+    fn default() -> Self {
+        PriceProbeCfg { enabled: false, window_ms: 1000, step_ms: 50 }
     }
 }
 
@@ -146,6 +167,7 @@ impl Default for ExecutorCfg {
             sim: SimCfg::default(),
             hold_probe_ms: Vec::new(),
             maker_probe: MakerProbeCfg::default(),
+            price_probe: PriceProbeCfg::default(),
         }
     }
 }
