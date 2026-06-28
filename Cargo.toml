@@ -1,0 +1,12 @@
+[workspace]
+resolver = "2"
+members = ["crates/core", "crates/bus", "crates/processor", "crates/collector-polymarket", "crates/collector-kalshi", "crates/collector-binance", "crates/collector-databento", "crates/collector-cryptospot", "crates/recorder", "crates/executor", "app"]
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+async-trait = "0.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

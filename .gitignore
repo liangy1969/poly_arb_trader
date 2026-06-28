@@ -1,0 +1,34 @@
+# Secrets — never commit (see SETUP_POLYMARKET.md §4)
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*private*.txt
+secrets*
+
+# Deployment configs — contain account key_id + local key paths; keep local.
+# Share scrubbed *.example templates instead if you want to publish the strategy.
+/config
+
+# Collected market data (GBs of JSONL)
+/data
+
+# Rust build artifacts (GBs)
+/target
+
+# Logs / scratch
+*.log
+/scratch
+*.tmp
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+*.swp

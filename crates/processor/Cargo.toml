@@ -1,0 +1,16 @@
+[package]
+name = "arb-processor"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "arb_processor"
+path = "src/lib.rs"
+
+[dependencies]
+arb-core = { path = "../core" }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }

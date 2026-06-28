@@ -1,0 +1,17 @@
+[package]
+name = "arb-recorder"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "arb_recorder"
+path = "src/lib.rs"
+
+[dependencies]
+arb-core = { path = "../core" }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

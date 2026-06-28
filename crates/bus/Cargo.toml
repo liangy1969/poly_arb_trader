@@ -1,0 +1,14 @@
+[package]
+name = "arb-bus"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "arb_bus"
+path = "src/lib.rs"
+
+[dependencies]
+arb-core = { path = "../core" }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }

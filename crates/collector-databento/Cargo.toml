@@ -1,0 +1,20 @@
+[package]
+name = "arb-collector-databento"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+arb-core = { path = "../core" }
+arb-bus = { path = "../bus" }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde = { workspace = true }
+# Databento official Rust client (Live API). Default features include the live client.
+databento = "0.53"
+
+[[bin]]
+name = "databento-probe"
+path = "src/bin/databento-probe.rs"

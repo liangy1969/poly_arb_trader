@@ -1,0 +1,23 @@
+[package]
+name = "arb-collector-binance"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "arb_collector_binance"
+path = "src/lib.rs"
+
+[dependencies]
+arb-core = { path = "../core" }
+arb-bus = { path = "../bus" }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { version = "0.12", features = ["json", "socks"] }
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+tokio-socks = "0.5"
+futures-util = "0.3"
+tracing-subscriber = { workspace = true }

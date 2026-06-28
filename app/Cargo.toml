@@ -1,0 +1,31 @@
+[package]
+name = "arb-app"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "arb_app"
+path = "src/lib.rs"
+
+[[bin]]
+name = "arb-app"
+path = "src/main.rs"
+
+[dependencies]
+arb-core = { path = "../crates/core" }
+arb-bus = { path = "../crates/bus" }
+arb-processor = { path = "../crates/processor" }
+arb-collector-polymarket = { path = "../crates/collector-polymarket" }
+arb-collector-kalshi = { path = "../crates/collector-kalshi" }
+arb-collector-binance = { path = "../crates/collector-binance" }
+arb-collector-databento = { path = "../crates/collector-databento" }
+arb-collector-cryptospot = { path = "../crates/collector-cryptospot" }
+arb-recorder = { path = "../crates/recorder" }
+arb-executor = { path = "../crates/executor" }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = "0.9"

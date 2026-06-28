@@ -1,0 +1,23 @@
+[package]
+name = "arb-executor"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "arb_executor"
+path = "src/lib.rs"
+
+[dependencies]
+arb-core = { path = "../core" }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Live Kalshi venue adapter (venue_kalshi.rs): REST + RSA-PSS request signing.
+reqwest = { version = "0.12", features = ["json"] }
+rsa = { version = "0.9", features = ["pem", "sha2"] }
+sha2 = "0.10"
+rand = "0.8"
+base64 = "0.22"
