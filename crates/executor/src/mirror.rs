@@ -118,22 +118,27 @@ impl ExecBookMirror {
         Some((self.ask_at(instrument, to_ns)? - self.ask_at(instrument, from_ns)?) * 100.0)
     }
 
-    /// Record a trade in the rolling ~2s tape (fed by a non-conflated Block sub so
-    /// sweep bursts aren't collapsed). Lets the probe tell a sweep (volume prints)
-    /// from an MM cancel-and-reprice (no prints) when depth drops.
-    pub fn on_trade(&mut self, instrument: &str, recv_ts_ns: i64, qty: f64) {
-        let h = self.trades.entry(instrument.to_string()).or_default();
-        h.push_back((recv_ts_ns, qty));
-        let cutoff = recv_ts_ns - 2_000 * 1_000_000;
+    /// Record a trade in the rolling ~15s tape, keyed by MARKET (not the traded
+    /// outcome) so a `.NO` probe matches the `.YES`-keyed trade tape, and stamped
+    /// by EXCHANGE time (`exch_ts`) — Kalshi trades are REST-polled ~1-3s late, so
+    /// recv-time would put them outside the probe window. Fed by a non-conflated
+    /// Block sub so sweep bursts aren't collapsed.
+    pub fn on_trade(&mut self, instrument: &str, exch_ts_ns: i64, qty: f64) {
+        let key = market_id_of(instrument).map(str::to_string).unwrap_or_else(|| instrument.to_string());
+        let h = self.trades.entry(key).or_default();
+        h.push_back((exch_ts_ns, qty));
+        let cutoff = exch_ts_ns - 15_000 * 1_000_000;
         while h.front().is_some_and(|&(t, _)| t < cutoff) {
             h.pop_front();
         }
     }
 
-    /// Contracts traded on `instrument` in (from_ns, to_ns] from the rolling tape.
+    /// Contracts traded on `instrument`'s MARKET in (from_ns, to_ns] (exchange
+    /// time). Query after the poll has caught up (delayed volume pass).
     pub fn traded_between(&self, instrument: &str, from_ns: i64, to_ns: i64) -> f64 {
+        let key = market_id_of(instrument).map(str::to_string).unwrap_or_else(|| instrument.to_string());
         self.trades
-            .get(instrument)
+            .get(&key)
             .map(|h| {
                 h.iter().filter(|&&(t, _)| t > from_ns && t <= to_ns).map(|&(_, q)| q).sum()
             })

@@ -88,9 +88,7 @@ impl Module for Executor {
             let mut sub = tsub;
             while let Some(ev) = sub.recv().await {
                 if let Payload::Trade(t) = &ev.payload {
-                    tracing::info!(target: "tradedbg", "TRADEDBG inst={} qty={:.0} px={:.3} dt_ms={}",
-                        t.instrument, t.qty, t.price, (t.recv_ts_ns - t.exch_ts_ns) / 1_000_000);
-                    tmirror.lock().unwrap().on_trade(&t.instrument, t.recv_ts_ns, t.qty);
+                    tmirror.lock().unwrap().on_trade(&t.instrument, t.exch_ts_ns, t.qty);
                 }
             }
         }));
@@ -791,7 +789,10 @@ async fn price_sampler(
     ladder: Vec<u64>,
     step_ms: u64,
 ) {
+    let window_ms = *ladder.last().unwrap_or(&1000) as i64;
+    let vol_delay_ms: i64 = 5000; // wait for the ~3s REST trade poll + latency to catch up
     let mut probes: Vec<(PxProbe, Vec<u64>)> = Vec::new();
+    let mut vol_q: Vec<(PxProbe, i64)> = Vec::new(); // completed probes awaiting the delayed volume pass
     let mut tick = tokio::time::interval(Duration::from_millis(10));
     loop {
         tokio::select! {
@@ -801,21 +802,16 @@ async fn price_sampler(
             },
             _ = tick.tick() => {
                 let now = now_ns();
+                // ── price + depth pass (real-time) ──
                 for (probe, pending) in probes.iter_mut() {
                     pending.retain(|&h| {
                         if now < probe.t0_ns + h as i64 * MS {
                             return true; // offset not reached yet
                         }
-                        // Snapshot top + full ladder under one lock. Depth lets us
-                        // tell an MM reprice (levels shift, depth replenished) from a
-                        // sweep (depth consumed as levels are eaten).
+                        // Top + ladder depth under one lock. Depth tells an MM reprice
+                        // (levels shift, depth replenished) from a sweep (depth eaten).
                         let snap = {
                             let m = mirror.lock().unwrap();
-                            // Contracts traded in the step ending at this offset —
-                            // volume here means a sweep; none means an MM reprice.
-                            let lo = probe.t0_ns + (h as i64 - step_ms as i64) * MS;
-                            let hi = probe.t0_ns + h as i64 * MS;
-                            let tvol = m.traded_between(&probe.inst, lo, hi);
                             m.top(&probe.inst).map(|b| {
                                 let (bdep, adep, nb, na) = match m.depth(&probe.inst) {
                                     Some(d) => (
@@ -826,24 +822,50 @@ async fn price_sampler(
                                     ),
                                     None => (0.0, 0.0, 0, 0),
                                 };
-                                (b, bdep, adep, nb, na, tvol)
+                                (b, bdep, adep, nb, na)
                             })
                         };
-                        if let Some((b, bdep, adep, nb, na, tvol)) = snap {
+                        if let Some((b, bdep, adep, nb, na)) = snap {
                             let mid = 0.5 * (b.best_bid + b.best_ask);
                             tracing::info!(
                                 target: "pxprobe",
                                 "PXPROBE trade={} inst={} t_ms={h} bid={:.3} ask={:.3} mid={:.3} \
-                                 dmid_c={:.2} dask_c={:.2} bsz={:.0} asz={:.0} bdep={:.0}({}) adep={:.0}({}) tvol={:.0}",
+                                 dmid_c={:.2} dask_c={:.2} bsz={:.0} asz={:.0} bdep={:.0}({}) adep={:.0}({})",
                                 probe.trade_id, probe.inst, b.best_bid, b.best_ask, mid,
                                 (mid - probe.ref_mid) * 100.0, (b.best_ask - probe.ref_ask) * 100.0,
-                                b.bid_sz, b.ask_sz, bdep, nb, adep, na, tvol,
+                                b.bid_sz, b.ask_sz, bdep, nb, adep, na,
                             );
                         }
                         false // sampled → drop this offset
                     });
                 }
-                probes.retain(|(_, pending)| !pending.is_empty());
+                // completed price-passes → queue for the delayed volume pass
+                let mut i = 0;
+                while i < probes.len() {
+                    if probes[i].1.is_empty() {
+                        let (probe, _) = probes.remove(i);
+                        let fire = probe.t0_ns + (window_ms + vol_delay_ms) * MS;
+                        vol_q.push((probe, fire));
+                    } else {
+                        i += 1;
+                    }
+                }
+                // ── delayed volume pass: trades are REST-polled ~1-3s late, so wait,
+                // then attribute by exchange time. tvol>0 at a depth drop = a sweep;
+                // tvol~0 = an MM cancel-and-reprice. One PXVOL line per offset. ──
+                vol_q.retain(|(probe, fire)| {
+                    if now < *fire {
+                        return true;
+                    }
+                    let m = mirror.lock().unwrap();
+                    for &h in ladder.iter() {
+                        let lo = probe.t0_ns + (h as i64 - step_ms as i64) * MS;
+                        let hi = probe.t0_ns + h as i64 * MS;
+                        let tvol = m.traded_between(&probe.inst, lo, hi);
+                        tracing::info!(target: "pxprobe", "PXVOL trade={} t_ms={h} tvol={:.0}", probe.trade_id, tvol);
+                    }
+                    false // logged → drop
+                });
             }
         }
     }
