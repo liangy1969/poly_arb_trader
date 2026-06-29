@@ -78,6 +78,21 @@ impl Module for Executor {
             }
         }));
 
+        // Trade-tape task: a separate BLOCK subscription (NOT conflated, so trade
+        // bursts/sweeps aren't collapsed) feeds the mirror's rolling trade tape.
+        // The price probe reads it to tell a sweep (volume prints) from an MM
+        // cancel-and-reprice (no prints) when depth drops.
+        let tsub = bus.subscribe(&format!("market.{}.#", spec.prefix), 8192, Policy::Block);
+        let tmirror = mirror.clone();
+        self.handles.push(tokio::spawn(async move {
+            let mut sub = tsub;
+            while let Some(ev) = sub.recv().await {
+                if let Payload::Trade(t) = &ev.payload {
+                    tmirror.lock().unwrap().on_trade(&t.instrument, t.recv_ts_ns, t.qty);
+                }
+            }
+        }));
+
         // Trade task: signals + settlement + the state machine.
         let sigsub = bus.subscribe("signal.#", 256, Policy::Block);
         let catsub = bus.subscribe(&format!("market.{}.catalog", spec.prefix), 256, Policy::Block);
@@ -137,7 +152,7 @@ impl Module for Executor {
             let m = mirror.clone();
             let step = self.cfg.price_probe.step_ms.max(1);
             let ladder: Vec<u64> = (0..=self.cfg.price_probe.window_ms).step_by(step as usize).collect();
-            self.handles.push(tokio::spawn(price_sampler(m, rx, ladder)));
+            self.handles.push(tokio::spawn(price_sampler(m, rx, ladder, step)));
             Some(tx)
         } else {
             None
@@ -772,6 +787,7 @@ async fn price_sampler(
     mirror: Arc<Mutex<ExecBookMirror>>,
     mut rx: tokio::sync::mpsc::UnboundedReceiver<PxProbe>,
     ladder: Vec<u64>,
+    step_ms: u64,
 ) {
     let mut probes: Vec<(PxProbe, Vec<u64>)> = Vec::new();
     let mut tick = tokio::time::interval(Duration::from_millis(10));
@@ -793,6 +809,11 @@ async fn price_sampler(
                         // sweep (depth consumed as levels are eaten).
                         let snap = {
                             let m = mirror.lock().unwrap();
+                            // Contracts traded in the step ending at this offset —
+                            // volume here means a sweep; none means an MM reprice.
+                            let lo = probe.t0_ns + (h as i64 - step_ms as i64) * MS;
+                            let hi = probe.t0_ns + h as i64 * MS;
+                            let tvol = m.traded_between(&probe.inst, lo, hi);
                             m.top(&probe.inst).map(|b| {
                                 let (bdep, adep, nb, na) = match m.depth(&probe.inst) {
                                     Some(d) => (
@@ -803,18 +824,18 @@ async fn price_sampler(
                                     ),
                                     None => (0.0, 0.0, 0, 0),
                                 };
-                                (b, bdep, adep, nb, na)
+                                (b, bdep, adep, nb, na, tvol)
                             })
                         };
-                        if let Some((b, bdep, adep, nb, na)) = snap {
+                        if let Some((b, bdep, adep, nb, na, tvol)) = snap {
                             let mid = 0.5 * (b.best_bid + b.best_ask);
                             tracing::info!(
                                 target: "pxprobe",
                                 "PXPROBE trade={} inst={} t_ms={h} bid={:.3} ask={:.3} mid={:.3} \
-                                 dmid_c={:.2} dask_c={:.2} bsz={:.0} asz={:.0} bdep={:.0}({}) adep={:.0}({})",
+                                 dmid_c={:.2} dask_c={:.2} bsz={:.0} asz={:.0} bdep={:.0}({}) adep={:.0}({}) tvol={:.0}",
                                 probe.trade_id, probe.inst, b.best_bid, b.best_ask, mid,
                                 (mid - probe.ref_mid) * 100.0, (b.best_ask - probe.ref_ask) * 100.0,
-                                b.bid_sz, b.ask_sz, bdep, nb, adep, na,
+                                b.bid_sz, b.ask_sz, bdep, nb, adep, na, tvol,
                             );
                         }
                         false // sampled → drop this offset

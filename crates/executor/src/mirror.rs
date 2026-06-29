@@ -33,6 +33,7 @@ pub struct ExecBookMirror {
     meta: HashMap<String, MarketMetaLite>,   // cid -> lifecycle meta
     winners: HashMap<String, String>,        // cid -> winning instrument (resolved)
     hist: HashMap<String, VecDeque<(i64, f64)>>, // instrument -> recent (recv_ts, best_ask), ~2s
+    trades: HashMap<String, VecDeque<(i64, f64)>>, // instrument -> recent (recv_ts, qty), ~2s
 }
 
 impl ExecBookMirror {
@@ -115,6 +116,28 @@ impl ExecBookMirror {
     /// the pre-signal Kalshi move.
     pub fn ask_move_c(&self, instrument: &str, from_ns: i64, to_ns: i64) -> Option<f64> {
         Some((self.ask_at(instrument, to_ns)? - self.ask_at(instrument, from_ns)?) * 100.0)
+    }
+
+    /// Record a trade in the rolling ~2s tape (fed by a non-conflated Block sub so
+    /// sweep bursts aren't collapsed). Lets the probe tell a sweep (volume prints)
+    /// from an MM cancel-and-reprice (no prints) when depth drops.
+    pub fn on_trade(&mut self, instrument: &str, recv_ts_ns: i64, qty: f64) {
+        let h = self.trades.entry(instrument.to_string()).or_default();
+        h.push_back((recv_ts_ns, qty));
+        let cutoff = recv_ts_ns - 2_000 * 1_000_000;
+        while h.front().is_some_and(|&(t, _)| t < cutoff) {
+            h.pop_front();
+        }
+    }
+
+    /// Contracts traded on `instrument` in (from_ns, to_ns] from the rolling tape.
+    pub fn traded_between(&self, instrument: &str, from_ns: i64, to_ns: i64) -> f64 {
+        self.trades
+            .get(instrument)
+            .map(|h| {
+                h.iter().filter(|&&(t, _)| t > from_ns && t <= to_ns).map(|&(_, q)| q).sum()
+            })
+            .unwrap_or(0.0)
     }
 
     pub fn winner_of(&self, instrument: &str) -> Option<String> {
