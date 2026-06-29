@@ -788,14 +788,33 @@ async fn price_sampler(
                         if now < probe.t0_ns + h as i64 * MS {
                             return true; // offset not reached yet
                         }
-                        if let Some(b) = mirror.lock().unwrap().top(&probe.inst) {
+                        // Snapshot top + full ladder under one lock. Depth lets us
+                        // tell an MM reprice (levels shift, depth replenished) from a
+                        // sweep (depth consumed as levels are eaten).
+                        let snap = {
+                            let m = mirror.lock().unwrap();
+                            m.top(&probe.inst).map(|b| {
+                                let (bdep, adep, nb, na) = match m.depth(&probe.inst) {
+                                    Some(d) => (
+                                        d.bids.iter().map(|&(_, s)| s).sum::<f64>(),
+                                        d.asks.iter().map(|&(_, s)| s).sum::<f64>(),
+                                        d.bids.len(),
+                                        d.asks.len(),
+                                    ),
+                                    None => (0.0, 0.0, 0, 0),
+                                };
+                                (b, bdep, adep, nb, na)
+                            })
+                        };
+                        if let Some((b, bdep, adep, nb, na)) = snap {
                             let mid = 0.5 * (b.best_bid + b.best_ask);
                             tracing::info!(
                                 target: "pxprobe",
                                 "PXPROBE trade={} inst={} t_ms={h} bid={:.3} ask={:.3} mid={:.3} \
-                                 dmid_c={:.2} dask_c={:.2}",
+                                 dmid_c={:.2} dask_c={:.2} bsz={:.0} asz={:.0} bdep={:.0}({}) adep={:.0}({})",
                                 probe.trade_id, probe.inst, b.best_bid, b.best_ask, mid,
                                 (mid - probe.ref_mid) * 100.0, (b.best_ask - probe.ref_ask) * 100.0,
+                                b.bid_sz, b.ask_sz, bdep, nb, adep, na,
                             );
                         }
                         false // sampled → drop this offset
