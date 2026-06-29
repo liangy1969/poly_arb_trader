@@ -88,6 +88,8 @@ impl Module for Executor {
             let mut sub = tsub;
             while let Some(ev) = sub.recv().await {
                 if let Payload::Trade(t) = &ev.payload {
+                    tracing::info!(target: "tradedbg", "TRADEDBG inst={} qty={:.0} px={:.3} dt_ms={}",
+                        t.instrument, t.qty, t.price, (t.recv_ts_ns - t.exch_ts_ns) / 1_000_000);
                     tmirror.lock().unwrap().on_trade(&t.instrument, t.recv_ts_ns, t.qty);
                 }
             }
