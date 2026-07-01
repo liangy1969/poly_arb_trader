@@ -38,6 +38,23 @@ pub trait TradingVenue: Send + Sync {
     /// Returns their join handles for the caller to manage.
     fn start(&self, fills: FillSender) -> Vec<JoinHandle<()>>;
     fn name(&self) -> &'static str;
+
+    // ── Maker-exit primitives (default: unsupported) ──
+    /// Place a resting (GTC, post-only) maker limit order at `intent.price`.
+    /// Returns the venue `order_id`, or an error (e.g. rejected because it would
+    /// cross). Only the live adapters implement this.
+    async fn place_resting(&self, _intent: &OrderIntent) -> Result<String, String> {
+        Err("venue does not support resting maker orders".into())
+    }
+    /// Cancel a resting order; returns the contracts filled before the cancel took
+    /// effect (so a maker exit never loses a last-moment fill on cancel).
+    async fn cancel_order(&self, _order_id: &str) -> Result<f64, String> {
+        Err("venue does not support cancel".into())
+    }
+    /// Contracts filled so far on a resting order (poll for maker-exit fills).
+    async fn order_fill_count(&self, _order_id: &str) -> Result<f64, String> {
+        Err("venue does not support order status".into())
+    }
 }
 
 /// Taker fee in USDC, Polymarket's current formula (docs.polymarket.com/trading/

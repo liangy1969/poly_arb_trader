@@ -141,6 +141,32 @@ struct OrderRespV2 {
     average_fee_paid: String,
 }
 
+/// Pull `order_id` from a create/cancel response, tolerating a `{order:{...}}`
+/// wrapper vs a flat body.
+fn extract_order_id(v: &serde_json::Value) -> Option<String> {
+    let obj = v.get("order").unwrap_or(v);
+    obj.get("order_id").and_then(|x| x.as_str()).map(String::from)
+}
+
+/// Contracts filled from a create/cancel/get response — tolerant of the wrapper,
+/// `fill_count` vs `fill_count_fp`, and string vs numeric fixed-point.
+fn extract_fill_count(v: &serde_json::Value) -> f64 {
+    let obj = v.get("order").unwrap_or(v);
+    for k in ["fill_count", "fill_count_fp"] {
+        if let Some(x) = obj.get(k) {
+            if let Some(s) = x.as_str() {
+                if let Ok(f) = s.parse::<f64>() {
+                    return f;
+                }
+            }
+            if let Some(f) = x.as_f64() {
+                return f;
+            }
+        }
+    }
+    0.0
+}
+
 #[async_trait]
 impl TradingVenue for KalshiVenue {
     async fn submit(&self, intent: &OrderIntent) -> VenueOutcome {
@@ -230,6 +256,94 @@ impl TradingVenue for KalshiVenue {
             ts_ns: now_ns(),
         };
         VenueOutcome::Acked { order_id: parsed.order_id, fills: vec![fill] }
+    }
+
+    /// Place a resting GTC **post-only** maker order at `intent.price` (rejected by
+    /// Kalshi if it would cross). Returns the venue order_id.
+    async fn place_resting(&self, intent: &OrderIntent) -> Result<String, String> {
+        let ko = map_order(intent);
+        let count = intent.size.floor().max(0.0) as i64;
+        if count < 1 {
+            return Err(format!("size {:.2} < 1 contract", intent.size));
+        }
+        let Some(ticker) = market_id_of(&intent.instrument) else {
+            return Err(format!("no ticker in {}", intent.instrument));
+        };
+        let body = serde_json::json!({
+            "ticker": ticker,
+            "client_order_id": intent.client_id,
+            "side": ko.side,
+            "count": format!("{count}.00"),
+            "price": format!("{:.2}", ko.cents as f64 / 100.0),
+            "time_in_force": "good_till_canceled",
+            "post_only": true,
+            "self_trade_prevention_type": "maker",
+        });
+        let ts_ms = now_ns() / 1_000_000;
+        let (ts, sig) = self.signer.sign("POST", ORDERS_PATH, ts_ms).map_err(|e| format!("sign: {e}"))?;
+        let url = format!("{}/portfolio/events/orders", self.base);
+        let resp = self
+            .http
+            .post(&url)
+            .header("KALSHI-ACCESS-KEY", self.signer.key_id.as_str())
+            .header("KALSHI-ACCESS-TIMESTAMP", ts)
+            .header("KALSHI-ACCESS-SIGNATURE", sig)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("http: {e}"))?;
+        if !resp.status().is_success() {
+            let code = resp.status();
+            return Err(format!("kalshi post-only {code}: {}", resp.text().await.unwrap_or_default()));
+        }
+        let v: serde_json::Value = resp.json().await.map_err(|e| format!("parse: {e}"))?;
+        extract_order_id(&v).ok_or_else(|| "no order_id in resting response".to_string())
+    }
+
+    /// Cancel a resting order; returns contracts filled before cancel took effect.
+    async fn cancel_order(&self, order_id: &str) -> Result<f64, String> {
+        let path = format!("{ORDERS_PATH}/{order_id}");
+        let ts_ms = now_ns() / 1_000_000;
+        let (ts, sig) = self.signer.sign("DELETE", &path, ts_ms).map_err(|e| format!("sign: {e}"))?;
+        let url = format!("{}/portfolio/events/orders/{order_id}", self.base);
+        let resp = self
+            .http
+            .delete(&url)
+            .header("KALSHI-ACCESS-KEY", self.signer.key_id.as_str())
+            .header("KALSHI-ACCESS-TIMESTAMP", ts)
+            .header("KALSHI-ACCESS-SIGNATURE", sig)
+            .send()
+            .await
+            .map_err(|e| format!("http: {e}"))?;
+        if !resp.status().is_success() {
+            let code = resp.status();
+            return Err(format!("kalshi cancel {code}: {}", resp.text().await.unwrap_or_default()));
+        }
+        let v: serde_json::Value = resp.json().await.map_err(|e| format!("parse: {e}"))?;
+        Ok(extract_fill_count(&v))
+    }
+
+    /// Poll contracts filled so far on a resting order.
+    async fn order_fill_count(&self, order_id: &str) -> Result<f64, String> {
+        let path = format!("/trade-api/v2/portfolio/orders/{order_id}");
+        let ts_ms = now_ns() / 1_000_000;
+        let (ts, sig) = self.signer.sign("GET", &path, ts_ms).map_err(|e| format!("sign: {e}"))?;
+        let url = format!("{}/portfolio/orders/{order_id}", self.base);
+        let resp = self
+            .http
+            .get(&url)
+            .header("KALSHI-ACCESS-KEY", self.signer.key_id.as_str())
+            .header("KALSHI-ACCESS-TIMESTAMP", ts)
+            .header("KALSHI-ACCESS-SIGNATURE", sig)
+            .send()
+            .await
+            .map_err(|e| format!("http: {e}"))?;
+        if !resp.status().is_success() {
+            let code = resp.status();
+            return Err(format!("kalshi get-order {code}: {}", resp.text().await.unwrap_or_default()));
+        }
+        let v: serde_json::Value = resp.json().await.map_err(|e| format!("parse: {e}"))?;
+        Ok(extract_fill_count(&v))
     }
 
     fn start(&self, fills: FillSender) -> Vec<JoinHandle<()>> {

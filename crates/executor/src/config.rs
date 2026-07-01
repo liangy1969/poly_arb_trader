@@ -128,6 +128,8 @@ pub struct ExitCfg {
 pub struct RiskCfg {
     pub yes_bucket: (f64, f64),
     pub min_tte_ms: i64,
+    /// Only trade when TTE <= this (ms). i64::MAX = no cap. Near-settle gate.
+    pub max_tte_ms: i64,
     pub max_order_notional: f64,
     pub max_trades_per_min: u32,
     pub cooldown_ms: u64,
@@ -222,6 +224,7 @@ impl Default for RiskCfg {
         RiskCfg {
             yes_bucket: (0.05, 0.95),
             min_tte_ms: 15000,
+            max_tte_ms: i64::MAX,
             max_order_notional: 25.0,
             max_trades_per_min: 6,
             cooldown_ms: 2000,

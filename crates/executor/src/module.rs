@@ -27,7 +27,8 @@ use crate::mirror::{ExecBookMirror, MirrorSource};
 use crate::position::{PosStatus, PositionManager};
 use crate::risk::RiskGate;
 use crate::types::{
-    BookSource, BookTop, Fill, IntentKind, MarketParams, OrderIntent, TradePlan, VenueOutcome, MS,
+    BookSource, BookTop, Fill, FillStatus, IntentKind, MarketParams, OrderIntent, TradePlan,
+    VenueOutcome, MS,
 };
 use crate::venue::{SimVenue, TradingVenue};
 use crate::venue_spec::{self, traded_instrument};
@@ -614,42 +615,11 @@ impl Engine {
             }
         }
         let mut exit = LegSummary::default();
-        let mut exit_ref_bid = 0.0;
-        let mut k = 0u32;
-        loop {
-            if self.pm.qty(&inst) <= EPS {
-                break;
-            }
-            if now_ns() >= plan.exit_deadline_ns {
-                break; // → PendingResolution
-            }
-            let held = self.pm.qty(&inst);
-            let Some(book) = self.top(&inst) else { break };
-            if k == 0 {
-                exit_ref_bid = book.best_bid;
-            }
-            let floor = (book.best_bid - k as f64 * self.cfg.exit.step_c)
-                .max(book.best_bid - self.cfg.exit.max_slip_c)
-                .max(plan.params.tick_size);
-            let intent = self.intent(&plan, "X", k, Side::Sell, floor, held);
-            let venue = self.venue.clone();
-            match venue.submit(&intent).await {
-                VenueOutcome::Acked { fills, .. } => {
-                    if !fills.is_empty() {
-                        if self.ingest_fills(&fills, &mut exit).is_err() {
-                            return self.abort_kill(&plan, &inst);
-                        }
-                    }
-                }
-                VenueOutcome::Rejected(r) => {
-                    self.report(&plan.trade_id, &inst, "Reject", &r);
-                }
-            }
-            k += 1;
-            if k >= self.cfg.exit.max_attempts {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(self.cfg.exit.retry_interval_ms)).await;
+        let mut exit_ref_bid = self.top(&inst).map(|b| b.best_bid).unwrap_or(0.0);
+        if self.cfg.exit.mode == "maker" {
+            self.maker_exit(&plan, &inst, &mut exit).await;
+        } else {
+            self.cross_exit(&plan, &inst, &mut exit, &mut exit_ref_bid).await;
         }
 
         // ── terminal ──
@@ -689,6 +659,138 @@ impl Engine {
             kind: IntentKind::TakeNow,
             params: plan.params,
             expiry_ns: plan.expiry_ns,
+        }
+    }
+
+    /// Taker cross exit (§6.2): a deepening IOC cross ladder into the bid.
+    async fn cross_exit(&mut self, plan: &TradePlan, inst: &str, exit: &mut LegSummary, exit_ref_bid: &mut f64) {
+        let mut k = 0u32;
+        loop {
+            if self.pm.qty(inst) <= EPS {
+                break;
+            }
+            if now_ns() >= plan.exit_deadline_ns {
+                break; // → PendingResolution
+            }
+            let held = self.pm.qty(inst);
+            let Some(book) = self.top(inst) else { break };
+            if k == 0 {
+                *exit_ref_bid = book.best_bid;
+            }
+            let floor = (book.best_bid - k as f64 * self.cfg.exit.step_c)
+                .max(book.best_bid - self.cfg.exit.max_slip_c)
+                .max(plan.params.tick_size);
+            let intent = self.intent(plan, "X", k, Side::Sell, floor, held);
+            let venue = self.venue.clone();
+            match venue.submit(&intent).await {
+                VenueOutcome::Acked { fills, .. } => {
+                    if !fills.is_empty() && self.ingest_fills(&fills, exit).is_err() {
+                        self.report(&plan.trade_id, inst, "Reject", "exit fill-apply error");
+                        break;
+                    }
+                }
+                VenueOutcome::Rejected(r) => self.report(&plan.trade_id, inst, "Reject", &r),
+            }
+            k += 1;
+            if k >= self.cfg.exit.max_attempts {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(self.cfg.exit.retry_interval_ms)).await;
+        }
+    }
+
+    /// Maker exit (§6): rest a post-only SELL at the best ask, re-post when the ask
+    /// moves, poll for fills, and taker-cross the residual at the exit deadline.
+    /// Maker fills are fee-free at the posted price.
+    async fn maker_exit(&mut self, plan: &TradePlan, inst: &str, exit: &mut LegSummary) {
+        let venue = self.venue.clone();
+        let mut order_id: Option<String> = None;
+        let mut posted_ask = -1.0f64; // traded-token price we're resting at
+        let mut on_order = 0.0f64; // fills already ingested for the current order
+        let mut seq = 0u64;
+        loop {
+            if self.pm.qty(inst) <= EPS {
+                break; // fully exited
+            }
+            // ── deadline: cancel + cross the residual as taker (stay flat by settle) ──
+            if now_ns() >= plan.exit_deadline_ns {
+                if let Some(id) = order_id.take() {
+                    if let Ok(fc) = venue.cancel_order(&id).await {
+                        self.maybe_ingest_maker(plan, inst, exit, &id, &mut seq, fc - on_order, posted_ask);
+                    }
+                }
+                if self.pm.qty(inst) > EPS {
+                    self.report(&plan.trade_id, inst, "Exiting", "maker deadline -> taker cross");
+                    let mut rb = 0.0;
+                    self.cross_exit(plan, inst, exit, &mut rb).await;
+                }
+                break;
+            }
+            let Some(book) = self.top(inst) else {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                continue;
+            };
+            let ask = book.best_ask;
+            let need_new = match &order_id {
+                Some(_) => (ask - posted_ask).abs() > EPS,
+                None => true,
+            };
+            if need_new {
+                // cancel the stale order (catch any last-moment fill), then re-post at the new ask
+                if let Some(id) = order_id.take() {
+                    if let Ok(fc) = venue.cancel_order(&id).await {
+                        self.maybe_ingest_maker(plan, inst, exit, &id, &mut seq, fc - on_order, posted_ask);
+                    }
+                }
+                on_order = 0.0;
+                let held = self.pm.qty(inst);
+                if held <= EPS {
+                    break;
+                }
+                let intent = self.intent(plan, "X", 0, Side::Sell, ask, held);
+                match venue.place_resting(&intent).await {
+                    Ok(id) => {
+                        self.report(&plan.trade_id, inst, "Exiting", &format!("maker rest {held:.0}@{ask:.3}"));
+                        order_id = Some(id);
+                        posted_ask = ask;
+                    }
+                    Err(e) => self.report(&plan.trade_id, inst, "Reject", &format!("maker post: {e}")),
+                }
+            } else if let Some(id) = order_id.clone() {
+                // ask unchanged: poll the resting order for fills
+                if let Ok(fc) = venue.order_fill_count(&id).await {
+                    let delta = fc - on_order;
+                    if delta > EPS {
+                        self.maybe_ingest_maker(plan, inst, exit, &id, &mut seq, delta, posted_ask);
+                        on_order = fc;
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
+    /// Record a maker-fill delta (fee-free, at the posted price) into the exit leg
+    /// + position, with a unique id so re-polls never double-count.
+    fn maybe_ingest_maker(&mut self, plan: &TradePlan, inst: &str, exit: &mut LegSummary, order_id: &str, seq: &mut u64, qty: f64, px: f64) {
+        if qty <= EPS {
+            return;
+        }
+        *seq += 1;
+        let f = Fill {
+            venue_trade_id: format!("{order_id}-mk{}", *seq),
+            order_id: order_id.to_string(),
+            client_id: format!("{}:X:mk{}", plan.trade_id, *seq),
+            instrument: inst.to_string(),
+            status: FillStatus::Confirmed,
+            side: Side::Sell,
+            qty,
+            px,
+            fee: 0.0, // maker: fee-free
+            ts_ns: now_ns(),
+        };
+        if self.ingest_fills(&[f], exit).is_err() {
+            self.report(&plan.trade_id, inst, "Reject", "maker fill-apply error");
         }
     }
 

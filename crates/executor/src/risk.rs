@@ -75,10 +75,15 @@ impl RiskGate {
         if !(price.is_finite() && price >= self.cfg.yes_bucket.0 && price <= self.cfg.yes_bucket.1) {
             return Err(format!("ask {price:.3} outside bucket {:?}", self.cfg.yes_bucket));
         }
-        // 5 — time to expiry (a position must never be designed to straddle resolution).
+        // 5 — time to expiry (min: never straddle resolution; max: near-settle gate).
         match tte_ms {
-            Some(t) if t >= self.cfg.min_tte_ms => {}
-            Some(t) => return Err(format!("tte {t}ms < min {}ms", self.cfg.min_tte_ms)),
+            Some(t) if t < self.cfg.min_tte_ms => {
+                return Err(format!("tte {t}ms < min {}ms", self.cfg.min_tte_ms))
+            }
+            Some(t) if t > self.cfg.max_tte_ms => {
+                return Err(format!("tte {t}ms > max {}ms", self.cfg.max_tte_ms))
+            }
+            Some(_) => {}
             None => return Err("no expiry meta".into()),
         }
         // 6 — signal not stale by queueing.
