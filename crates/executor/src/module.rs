@@ -34,6 +34,9 @@ use crate::venue::{SimVenue, TradingVenue};
 use crate::venue_spec::{self, traded_instrument};
 
 const EPS: f64 = 1e-6;
+/// Consecutive post-only rejections in the maker exit before we abandon resting
+/// and fall through to the taker cross (bounds the API spew if a post keeps failing).
+const MAKER_POST_FAIL_LIMIT: u32 = 5;
 
 pub struct Executor {
     cfg: ExecutorCfg,
@@ -619,7 +622,7 @@ impl Engine {
         if self.cfg.exit.mode == "maker" {
             self.maker_exit(&plan, &inst, &mut exit).await;
         } else {
-            self.cross_exit(&plan, &inst, &mut exit, &mut exit_ref_bid).await;
+            self.cross_exit(&plan, &inst, &mut exit, &mut exit_ref_bid, plan.exit_deadline_ns).await;
         }
 
         // ── terminal ──
@@ -662,14 +665,17 @@ impl Engine {
         }
     }
 
-    /// Taker cross exit (§6.2): a deepening IOC cross ladder into the bid.
-    async fn cross_exit(&mut self, plan: &TradePlan, inst: &str, exit: &mut LegSummary, exit_ref_bid: &mut f64) {
+    /// Taker cross exit (§6.2): a deepening IOC cross ladder into the bid, bounded
+    /// by `deadline_ns`. The primary (mode="cross") path passes the soft
+    /// `exit_deadline_ns`; the maker fallback passes the hard settle `expiry_ns` so
+    /// the ladder actually runs in the deadline→settle buffer instead of no-opping.
+    async fn cross_exit(&mut self, plan: &TradePlan, inst: &str, exit: &mut LegSummary, exit_ref_bid: &mut f64, deadline_ns: i64) {
         let mut k = 0u32;
         loop {
             if self.pm.qty(inst) <= EPS {
                 break;
             }
-            if now_ns() >= plan.exit_deadline_ns {
+            if now_ns() >= deadline_ns {
                 break; // → PendingResolution
             }
             let held = self.pm.qty(inst);
@@ -707,22 +713,28 @@ impl Engine {
         let mut order_id: Option<String> = None;
         let mut posted_ask = -1.0f64; // traded-token price we're resting at
         let mut on_order = 0.0f64; // fills already ingested for the current order
-        let mut seq = 0u64;
+        let mut seq = 0u64; // maker-fill ingest sequence (fill-id uniqueness)
+        let mut post_seq = 0u32; // per-POST counter -> unique client_order_id (Kalshi 409s on dupes)
+        let mut fails = 0u32; // consecutive post-only rejects -> bail to taker
         loop {
             if self.pm.qty(inst) <= EPS {
                 break; // fully exited
             }
-            // ── deadline: cancel + cross the residual as taker (stay flat by settle) ──
-            if now_ns() >= plan.exit_deadline_ns {
+            // ── exit to taker cross when (a) we hit the soft maker deadline, or (b)
+            //    post-only keeps failing. Cross against the HARD settle deadline
+            //    (`expiry_ns`), not the soft maker deadline we're already past — else
+            //    cross_exit would see now >= deadline and no-op, stranding us long. ──
+            if now_ns() >= plan.exit_deadline_ns || fails >= MAKER_POST_FAIL_LIMIT {
                 if let Some(id) = order_id.take() {
                     if let Ok(fc) = venue.cancel_order(&id).await {
                         self.maybe_ingest_maker(plan, inst, exit, &id, &mut seq, fc - on_order, posted_ask);
                     }
                 }
                 if self.pm.qty(inst) > EPS {
-                    self.report(&plan.trade_id, inst, "Exiting", "maker deadline -> taker cross");
+                    let why = if fails >= MAKER_POST_FAIL_LIMIT { "post rejects" } else { "deadline" };
+                    self.report(&plan.trade_id, inst, "Exiting", &format!("maker {why} -> taker cross"));
                     let mut rb = 0.0;
-                    self.cross_exit(plan, inst, exit, &mut rb).await;
+                    self.cross_exit(plan, inst, exit, &mut rb, plan.expiry_ns).await;
                 }
                 break;
             }
@@ -747,14 +759,21 @@ impl Engine {
                 if held <= EPS {
                     break;
                 }
-                let intent = self.intent(plan, "X", 0, Side::Sell, ask, held);
+                // Fresh client_order_id every POST — Kalshi dedups on it and 409s a repeat.
+                // Leg "XM" (maker) stays distinct from the fallback cross's "X" ids.
+                post_seq += 1;
+                let intent = self.intent(plan, "XM", post_seq, Side::Sell, ask, held);
                 match venue.place_resting(&intent).await {
                     Ok(id) => {
                         self.report(&plan.trade_id, inst, "Exiting", &format!("maker rest {held:.0}@{ask:.3}"));
                         order_id = Some(id);
                         posted_ask = ask;
+                        fails = 0;
                     }
-                    Err(e) => self.report(&plan.trade_id, inst, "Reject", &format!("maker post: {e}")),
+                    Err(e) => {
+                        fails += 1;
+                        self.report(&plan.trade_id, inst, "Reject", &format!("maker post: {e}"));
+                    }
                 }
             } else if let Some(id) = order_id.clone() {
                 // ask unchanged: poll the resting order for fills

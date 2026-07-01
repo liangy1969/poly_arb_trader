@@ -114,14 +114,26 @@ struct KalshiOrder {
     cents: i64,         // YES-book price, 1..=99
 }
 
-/// Map (instrument suffix, Side, token price 0..1) -> V2 YES-book (side, cents),
-/// rounding toward marketable on the YES book (bid ceil / ask floor) so it crosses.
-fn map_order(intent: &OrderIntent) -> KalshiOrder {
+/// Map (instrument suffix, Side, token price 0..1) -> V2 YES-book (side, cents).
+///
+/// Rounding depends on order intent:
+///   - `marketable = true` (IOC taker): round TOWARD the cross (bid ceil / ask
+///     floor) so the limit crosses and fills.
+///   - `marketable = false` (post-only maker): round AWAY from the cross (bid
+///     floor / ask ceil) so the order rests and is NEVER rejected as crossing.
+///     Reusing the taker (toward-cross) rounding for a post-only order forces a
+///     "post only cross" rejection — the maker-exit bug this guards against.
+fn map_order(intent: &OrderIntent, marketable: bool) -> KalshiOrder {
     let is_no = intent.instrument.ends_with(".NO");
     let buy = matches!(intent.side, Side::Buy);
     let yes_bid = (!is_no && buy) || (is_no && !buy); // bid = buy YES / sell NO
     let yes_px = if is_no { 1.0 - intent.price } else { intent.price };
-    let cents = if yes_bid { (yes_px * 100.0).ceil() } else { (yes_px * 100.0).floor() };
+    // Snap sub-cent float error (e.g. 1.0-0.68 = 0.319999.. -> 32.0) BEFORE the
+    // directional round, so a clean cent lands exactly on that cent instead of
+    // floor'ing a tick too passive (maker) or ceil'ing a tick too aggressive (taker).
+    let px100 = (yes_px * 100.0 * 1e6).round() / 1e6;
+    // ceil iff (bid AND marketable) OR (ask AND post-only) == (yes_bid == marketable)
+    let cents = if yes_bid == marketable { px100.ceil() } else { px100.floor() };
     KalshiOrder {
         side: if yes_bid { "bid" } else { "ask" },
         cents: (cents as i64).clamp(1, 99),
@@ -173,7 +185,7 @@ impl TradingVenue for KalshiVenue {
         if !matches!(intent.kind, IntentKind::TakeNow) {
             return VenueOutcome::Rejected("kalshi adapter v1 supports TakeNow (IOC) only".into());
         }
-        let ko = map_order(intent);
+        let ko = map_order(intent, true); // IOC taker: round toward the cross
         let count = intent.size.floor().max(0.0) as i64; // integer contracts
         if count < 1 {
             return VenueOutcome::Rejected(format!("size {:.2} < 1 contract", intent.size));
@@ -261,7 +273,7 @@ impl TradingVenue for KalshiVenue {
     /// Place a resting GTC **post-only** maker order at `intent.price` (rejected by
     /// Kalshi if it would cross). Returns the venue order_id.
     async fn place_resting(&self, intent: &OrderIntent) -> Result<String, String> {
-        let ko = map_order(intent);
+        let ko = map_order(intent, false); // post-only: round AWAY from the cross so it rests
         let count = intent.size.floor().max(0.0) as i64;
         if count < 1 {
             return Err(format!("size {:.2} < 1 contract", intent.size));
@@ -396,7 +408,7 @@ mod tests {
 
     #[test]
     fn yes_buy_is_bid_ceil() {
-        let k = map_order(&intent("kalshi.KXBTC15M-1.YES", Side::Buy, 0.621, 20.0));
+        let k = map_order(&intent("kalshi.KXBTC15M-1.YES", Side::Buy, 0.621, 20.0), true);
         assert_eq!(k.side, "bid");
         assert_eq!(k.cents, 63, "buy YES rounds up to cross");
     }
@@ -404,14 +416,14 @@ mod tests {
     #[test]
     fn no_buy_is_ask_complement() {
         // buy NO at 0.40 == sell YES at 0.60 -> ask, floor(60)=60
-        let k = map_order(&intent("kalshi.KXBTC15M-1.NO", Side::Buy, 0.40, 20.0));
+        let k = map_order(&intent("kalshi.KXBTC15M-1.NO", Side::Buy, 0.40, 20.0), true);
         assert_eq!(k.side, "ask");
         assert_eq!(k.cents, 60);
     }
 
     #[test]
     fn yes_sell_is_ask_floor() {
-        let k = map_order(&intent("kalshi.KXBTC15M-1.YES", Side::Sell, 0.589, 20.0));
+        let k = map_order(&intent("kalshi.KXBTC15M-1.YES", Side::Sell, 0.589, 20.0), true);
         assert_eq!(k.side, "ask");
         assert_eq!(k.cents, 58, "sell YES rounds down");
     }
@@ -419,14 +431,43 @@ mod tests {
     #[test]
     fn no_sell_is_bid_complement() {
         // sell NO at 0.40 == buy YES at 0.60 -> bid, ceil(60)=60
-        let k = map_order(&intent("kalshi.KXBTC15M-1.NO", Side::Sell, 0.40, 20.0));
+        let k = map_order(&intent("kalshi.KXBTC15M-1.NO", Side::Sell, 0.40, 20.0), true);
         assert_eq!(k.side, "bid");
         assert_eq!(k.cents, 60);
     }
 
     #[test]
     fn clamps_into_1_99() {
-        assert_eq!(map_order(&intent("kalshi.X.YES", Side::Buy, 0.005, 5.0)).cents, 1);
-        assert_eq!(map_order(&intent("kalshi.X.YES", Side::Sell, 0.999, 5.0)).cents, 99);
+        assert_eq!(map_order(&intent("kalshi.X.YES", Side::Buy, 0.005, 5.0), true).cents, 1);
+        assert_eq!(map_order(&intent("kalshi.X.YES", Side::Sell, 0.999, 5.0), true).cents, 99);
+    }
+
+    // ── post-only (maker) rounds AWAY from the cross so it never crosses ──
+
+    #[test]
+    fn post_only_no_sell_is_bid_floor() {
+        // sell NO at 0.685 (maker exit) == buy YES at 0.315 -> bid.
+        // taker would ceil(31.5)=32 and could cross; post-only floors to 31 (passive).
+        let k = map_order(&intent("kalshi.KXBTC15M-1.NO", Side::Sell, 0.685, 20.0), false);
+        assert_eq!(k.side, "bid");
+        assert_eq!(k.cents, 31, "post-only bid floors — never crosses");
+        // the taker mapping of the same intent WOULD round up into a cross
+        assert_eq!(map_order(&intent("kalshi.KXBTC15M-1.NO", Side::Sell, 0.685, 20.0), true).cents, 32);
+    }
+
+    #[test]
+    fn post_only_yes_sell_is_ask_ceil() {
+        // sell YES at 0.582 -> ask. taker floors to 58 (crosses down); post-only ceils to 59.
+        let k = map_order(&intent("kalshi.KXBTC15M-1.YES", Side::Sell, 0.582, 20.0), false);
+        assert_eq!(k.side, "ask");
+        assert_eq!(k.cents, 59, "post-only ask ceils — never crosses");
+    }
+
+    #[test]
+    fn post_only_integer_cent_is_at_touch() {
+        // clean cents: post-only lands exactly at the touch (joins the queue, rests).
+        let k = map_order(&intent("kalshi.KXBTC15M-1.NO", Side::Sell, 0.68, 20.0), false);
+        assert_eq!(k.side, "bid");
+        assert_eq!(k.cents, 32, "1-0.68=0.32 -> 32c exactly, at the passive touch");
     }
 }
