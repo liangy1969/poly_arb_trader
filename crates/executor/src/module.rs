@@ -9,6 +9,8 @@
 //! owner — no locks). Order pricing/sizing read a fresh `BookTop` from the mirror
 //! at submit time; the venue is abstracted by `TradingVenue` (sim in v1).
 
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -30,13 +32,153 @@ use crate::types::{
     BookSource, BookTop, Fill, FillStatus, IntentKind, MarketParams, OrderIntent, TradePlan,
     VenueOutcome, MS,
 };
-use crate::venue::{SimVenue, TradingVenue};
-use crate::venue_spec::{self, traded_instrument};
+use crate::venue::{CancelOutcome, FillSender, SimVenue, TradingVenue};
+use crate::venue_spec::{self, complement, market_id_of, traded_instrument};
 
 const EPS: f64 = 1e-6;
-/// Consecutive post-only rejections in the maker exit before we abandon resting
-/// and fall through to the taker cross (bounds the API spew if a post keeps failing).
-const MAKER_POST_FAIL_LIMIT: u32 = 5;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Decoupled exit (exit.mode = "reconcile") — per-market state machine + slot.
+//
+// Design (2026-07-02, after the oversell incident): the ENTRY path stays
+// latency-critical and does zero venue reads; a per-market EXIT RECONCILER task
+// owns position truth (authoritative venue polls) and all close orders. A close
+// only ever BUYS the complement token (buy NO to close long YES) — a buy
+// structurally cannot oversell; worst case is an over-hedge into a matched pair
+// (~breakeven at settle), never a naked short.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Per-market trade lifecycle. Transitions have a SINGLE writer each: the entry
+/// path drives Idle/Rest→Submitted→Filled; the reconciler drives Filled→Rest
+/// (after `transit_ms`) and Rest→Idle (confirmed flat).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum TradeState {
+    /// Flat, no cycle.
+    Idle,
+    /// Entry in flight (IOC outcome unknown) — reconciler frozen.
+    Submitted { since_ns: i64 },
+    /// Entry filled; reprice + read-replication lag settling — reconciler frozen.
+    Filled { fill_ns: i64 },
+    /// Steady state — reconciler may manage close orders (subject to the hold).
+    Rest,
+}
+
+/// Our one resting close order on a market (the reconciler's).
+#[derive(Clone, Debug)]
+struct RestingClose {
+    order_id: String,
+    /// Token the close BUYS (the complement of the held side).
+    instrument: String,
+    px: f64,
+    count: f64,
+}
+
+/// Shared per-market slot: the entry path (engine task) and the market's exit
+/// reconciler coordinate through this. INVARIANT: a resting close may only exist
+/// with the slot's knowledge — a reference is dropped ONLY once the venue
+/// confirms the order is off the book (Canceled/Gone). Lock is held for field
+/// access only, never across an await.
+struct MarketSlot {
+    state: TradeState,
+    /// In-memory net estimate (+YES/−NO): entry fills apply immediately; the
+    /// reconciler's authoritative polls refresh it. Used for the entry exposure
+    /// cap only — close sizing always uses the fresh authoritative poll.
+    net_est: f64,
+    hold_until_ns: i64,
+    resting: Option<RestingClose>,
+    reconciler_alive: bool,
+    /// YES-side instrument of this market (complement() gives the other side).
+    inst_yes: String,
+    params: MarketParams,
+    expiry_ns: i64,
+    trade_id: String,
+}
+
+impl MarketSlot {
+    fn new_idle(instrument: &str, params: MarketParams, expiry_ns: i64) -> Self {
+        MarketSlot {
+            state: TradeState::Idle,
+            net_est: 0.0,
+            hold_until_ns: 0,
+            resting: None,
+            reconciler_alive: false,
+            inst_yes: yes_side_of(instrument),
+            params,
+            expiry_ns,
+            trade_id: String::new(),
+        }
+    }
+}
+
+type Slots = Arc<Mutex<HashMap<String, MarketSlot>>>;
+
+/// Reconciler timing knobs (from `ExitCfg`), all pre-converted.
+#[derive(Clone, Copy)]
+struct ReconCfg {
+    cadence: Duration,
+    transit_ns: i64,
+    submitted_timeout_ns: i64,
+    settle_wait: Duration,
+}
+
+fn recon_cfg(e: &crate::config::ExitCfg) -> ReconCfg {
+    ReconCfg {
+        cadence: Duration::from_millis(e.cadence_ms.max(50)),
+        transit_ns: e.transit_ms as i64 * MS,
+        submitted_timeout_ns: e.submitted_timeout_ms as i64 * MS,
+        settle_wait: Duration::from_millis(e.settle_wait_ms),
+    }
+}
+
+/// The YES-side token of an instrument's market (identity if already YES-side).
+fn yes_side_of(instrument: &str) -> String {
+    if let Some(spec) = venue_spec::venue_of(instrument) {
+        if instrument.ends_with(&format!(".{}", spec.yes_label)) {
+            return instrument.to_string();
+        }
+    }
+    complement(instrument)
+}
+
+/// Entry gate against the market's state machine: reject while an entry is in
+/// flight or within the Filled→Rest transit window; stale Submitted (entry task
+/// died) falls through so the market can't deadlock.
+fn entry_gate(state: TradeState, now_ns_: i64, rc: &ReconCfg) -> Result<(), &'static str> {
+    match state {
+        TradeState::Submitted { since_ns } if now_ns_ - since_ns <= rc.submitted_timeout_ns => {
+            Err("entry in flight")
+        }
+        TradeState::Filled { fill_ns } if now_ns_ - fill_ns < rc.transit_ns => {
+            Err("entry transit gate")
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Per-market exposure cap: reject entries that GROW |net| past the cap;
+/// always allow entries that reduce it (an opposite-direction entry nets out).
+fn exposure_ok(net_est: f64, dir_sign: f64, size: f64, cap: f64) -> bool {
+    let after = net_est + dir_sign * size;
+    after.abs() <= cap + EPS || after.abs() <= net_est.abs() + EPS
+}
+
+/// A close order BUYS the complement token at `close_px`; economically that is a
+/// SELL of the held token at `1 − close_px` (Kalshi auto-nets the pair). Translate
+/// so the long-only PositionManager books the exit + realized P&L directly.
+fn translated_close_fill(held_inst: &str, order_id: &str, seq: u64, qty: f64, close_px: f64) -> Fill {
+    Fill {
+        venue_trade_id: format!("{order_id}-cl{seq}"),
+        order_id: order_id.to_string(),
+        client_id: format!("close:{held_inst}"),
+        instrument: held_inst.to_string(),
+        status: FillStatus::Confirmed,
+        side: Side::Sell,
+        qty,
+        px: 1.0 - close_px,
+        fee: 0.0, // post-only maker fill: fee-free on Kalshi
+        ts_ns: now_ns(),
+    }
+}
 
 pub struct Executor {
     cfg: ExecutorCfg,
@@ -123,8 +265,105 @@ impl Module for Executor {
                 "venue adapter '{other}' not implemented (have: sim, kalshi; polymarket_clob is P2)"
             ),
         };
+        // The removed "maker" exit stranded/oversold positions (2026-07-02
+        // incident) — refuse to start rather than silently fall back.
+        if self.cfg.exit.mode == "maker" {
+            anyhow::bail!(
+                "exit.mode 'maker' was removed after the 2026-07-02 oversell incident; use 'reconcile'"
+            );
+        }
+
         let (fill_tx, fill_rx) = tokio::sync::mpsc::unbounded_channel();
-        self.handles.extend(venue.start(fill_tx));
+        self.handles.extend(venue.start(fill_tx.clone()));
+
+        let slots: Slots = Arc::new(Mutex::new(HashMap::new()));
+        let entries_halted = Arc::new(AtomicBool::new(false));
+
+        // Real-balance kill switch: poll the venue's ACTUAL balance (never the
+        // executor's self-reported P&L — that hid the incident's losses) and
+        // latch a halt on new entries below the floor. Exits keep flattening.
+        if self.cfg.risk.min_balance_usd > 0.0 {
+            let v = venue.clone();
+            let halted = entries_halted.clone();
+            let floor = self.cfg.risk.min_balance_usd;
+            self.handles.push(tokio::spawn(async move {
+                let mut tick = tokio::time::interval(Duration::from_secs(60));
+                loop {
+                    tick.tick().await;
+                    match v.balance().await {
+                        Ok(b) if b < floor => {
+                            if !halted.swap(true, Ordering::SeqCst) {
+                                tracing::error!(
+                                    target: "executor",
+                                    "REAL-BALANCE KILL: ${b:.2} < floor ${floor:.2} — new entries halted (exits keep flattening)"
+                                );
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(e) => tracing::warn!(target: "executor", "balance poll: {e}"),
+                    }
+                }
+            }));
+        }
+
+        // Crash recovery (reconcile mode): anything still open at the venue gets
+        // a reconciler immediately — a restart must never orphan a position.
+        if self.cfg.exit.mode == "reconcile" {
+            let v = venue.clone();
+            let m = mirror.clone();
+            let sl = slots.clone();
+            let ftx = fill_tx.clone();
+            let rc = recon_cfg(&self.cfg.exit);
+            let fallback = MarketParams {
+                min_order_size: self.cfg.sim.min_order_size,
+                tick_size: self.cfg.sim.tick_size,
+                fee_rate: self.cfg.sim.fee_rate,
+            };
+            let prefix = spec.prefix;
+            let yes_label = spec.yes_label;
+            self.handles.push(tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(3)).await; // let the mirror warm
+                match v.open_positions().await {
+                    Ok(list) => {
+                        for (mid, net) in list {
+                            tracing::warn!(
+                                target: "exit",
+                                "recovered open position {mid} net={net:+.1} — spawning reconciler"
+                            );
+                            {
+                                let mut g = sl.lock().unwrap();
+                                let s = g.entry(mid.clone()).or_insert_with(|| {
+                                    MarketSlot::new_idle(
+                                        &format!("{prefix}.{mid}.{yes_label}"),
+                                        fallback,
+                                        i64::MAX,
+                                    )
+                                });
+                                if s.reconciler_alive {
+                                    continue; // an entry already spawned one
+                                }
+                                s.state = TradeState::Rest;
+                                s.net_est = net;
+                                s.hold_until_ns = 0; // recovered: close ASAP
+                                s.reconciler_alive = true;
+                                s.trade_id = format!("recovered-{mid}");
+                            }
+                            tokio::spawn(exit_reconciler(
+                                mid,
+                                sl.clone(),
+                                v.clone(),
+                                m.clone(),
+                                ftx.clone(),
+                                rc,
+                            ));
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(target: "exit", "startup position sweep: {e} (no crash recovery)")
+                    }
+                }
+            }));
+        }
 
         // Hold-period study sampler (optional): shadow-samples each entry's
         // realized exit at a ladder of hold offsets. Pure observation — doesn't
@@ -173,6 +412,9 @@ impl Module for Executor {
             hold_tx,
             maker_tx,
             px_tx,
+            slots,
+            fill_tx,
+            entries_halted,
         };
         self.handles.push(tokio::spawn(async move {
             let mut sigsub = sigsub;
@@ -198,10 +440,15 @@ impl Module for Executor {
                             engine.on_catalog(m.status, &m.instrument, m.winner.as_deref());
                         }
                     }
-                    // Async fills from the venue (liquidations, and live fills later).
+                    // Async fills: sim liquidations + reconciler close fills
+                    // (routed by the "close:" client_id prefix).
                     fill = fill_rx.recv() => {
                         let Some(f) = fill else { break };
-                        engine.on_liquidation_fill(&f);
+                        if f.client_id.starts_with("close:") {
+                            engine.on_close_fill(&f);
+                        } else {
+                            engine.on_liquidation_fill(&f);
+                        }
                     }
                 }
             }
@@ -236,6 +483,13 @@ struct Engine {
     maker_tx: Option<tokio::sync::mpsc::UnboundedSender<MakerProbe>>,
     /// Post-signal price-trajectory probe (None = off).
     px_tx: Option<tokio::sync::mpsc::UnboundedSender<PxProbe>>,
+    /// Per-market trade-lifecycle slots shared with the exit reconcilers.
+    slots: Slots,
+    /// Sender the reconcilers push translated close fills through (same channel
+    /// as the venue's async fills; routed by the "close:" client_id prefix).
+    fill_tx: FillSender,
+    /// Latched by the real-balance watchdog: halt NEW entries (exits keep running).
+    entries_halted: Arc<AtomicBool>,
 }
 
 /// One entry registered with the hold-period sampler: it samples the realized
@@ -411,6 +665,12 @@ impl Engine {
         let instrument = traded_instrument(&s.target, s.direction);
         let trade_id = format!("{}-{}", s.strategy, s.ts_ns);
 
+        // Real-balance kill switch (latched by the watchdog): no new entries.
+        if self.entries_halted.load(Ordering::SeqCst) {
+            self.report(&trade_id, &instrument, "Rejected", "real-balance kill switch");
+            return;
+        }
+
         // Traded-token book + tte from the mirror.
         let Some(book) = self.top(&instrument) else {
             self.report(&trade_id, &instrument, "Rejected", "no book in mirror");
@@ -433,18 +693,12 @@ impl Engine {
             self.report(&trade_id, &instrument, "Rejected", &reason);
             return;
         }
-        // One-trade gate (§8.4) — the structural one-position guarantee.
-        if !self.pm.try_begin_trade(&trade_id, now) {
-            self.report(&trade_id, &instrument, "Rejected", "active trade / cooldown");
-            return;
-        }
-        self.risk.note_trade(now);
 
         let expiry_ns =
             self.mirror.lock().unwrap().meta_of(&plan_instrument(s)).map(|m| m.expiry_ns).unwrap_or(now);
         let plan = TradePlan {
-            trade_id,
-            instrument,
+            trade_id: trade_id.clone(),
+            instrument: instrument.clone(),
             token_id: String::new(), // sim: not needed; real adapter reads it from catalog meta (P2)
             direction: s.direction,
             size_shares: size,
@@ -456,6 +710,19 @@ impl Engine {
             params,
             expiry_ns,
         };
+
+        // Decoupled path: entry only; the exit reconciler owns the close.
+        if self.cfg.exit.mode == "reconcile" {
+            self.run_entry_reconcile(plan).await;
+            return;
+        }
+
+        // Legacy inline path (cross): one-trade gate + entry→hold→exit.
+        if !self.pm.try_begin_trade(&trade_id, now) {
+            self.report(&trade_id, &instrument, "Rejected", "active trade / cooldown");
+            return;
+        }
+        self.risk.note_trade(now);
         self.run_trade(plan).await;
     }
 
@@ -473,39 +740,7 @@ impl Engine {
     async fn run_trade(&mut self, plan: TradePlan) {
         let inst = plan.instrument.clone();
         self.report(&plan.trade_id, &inst, "Entering", &format!("size={:.2}", plan.size_shares));
-
-        // Post-signal price-trajectory probe: fire BEFORE the entry loop so it
-        // captures the reprice path even if we abandon (no fill). Anchored at the
-        // signal moment; deltas are ¢ vs the signal book.
-        if let Some(tx) = &self.px_tx {
-            if let Some(b) = self.top(&inst) {
-                // Per-trigger metadata: tte + the pre-signal Kalshi ask move + the
-                // trigger. dry_run skips emit_trade, so this is the only record.
-                let (tte, pre) = {
-                    let m = self.mirror.lock().unwrap();
-                    let pre_w = self.cfg.price_probe.pre_window_ms as i64 * MS;
-                    (
-                        m.tte_ms(&inst, now_ns()),
-                        m.ask_move_c(&inst, plan.signal_ts_ns - pre_w, plan.signal_ts_ns),
-                    )
-                };
-                tracing::info!(
-                    target: "pxprobe",
-                    "PXMETA trade={} inst={} tte_ms={} pre_move_c={} signal_ask={:.3} bps={:+.2} yes_px={:.3} tgt_c={:+.1}",
-                    plan.trade_id, inst,
-                    tte.map(|t| t.to_string()).unwrap_or_else(|| "?".into()),
-                    pre.map(|v| format!("{:+.2}", v)).unwrap_or_else(|| "?".into()),
-                    plan.signal_ask, plan.trigger.move_bps, plan.trigger.yes_price, plan.trigger.target_move_c,
-                );
-                let _ = tx.send(PxProbe {
-                    trade_id: plan.trade_id.clone(),
-                    inst: inst.clone(),
-                    t0_ns: plan.signal_ts_ns,
-                    ref_ask: plan.signal_ask,
-                    ref_mid: 0.5 * (b.best_bid + b.best_ask),
-                });
-            }
-        }
+        self.fire_probe(&plan);
 
         // Shadow / dry-run: the probe has fired; place NO order, free the
         // one-trade slot + arm the cooldown, and we're done. No real money.
@@ -516,60 +751,9 @@ impl Engine {
         }
 
         // ── ENTRY: bounded FAK attempt loop (§5) ──
-        let mut entry = LegSummary::default();
-        let mut attempt = 0u32;
-        loop {
-            if now_ns() - plan.signal_ts_ns >= self.cfg.entry.ttl_ms as i64 * MS {
-                self.report(&plan.trade_id, &inst, "Entering", "entry ttl elapsed");
-                break;
-            }
-            let Some(book) = self.top(&inst) else { break };
-            let cap = book.best_ask + self.cfg.entry.chase_c;
-            if cap - plan.signal_ask > self.cfg.entry.max_chase_total_c {
-                self.report(&plan.trade_id, &inst, "Entering", "ask ran past chase cap");
-                break;
-            }
-            let remaining = (plan.size_shares - entry.qty).max(0.0);
-            let intent = self.intent(&plan, "E", attempt, Side::Buy, cap, remaining);
-            let venue = self.venue.clone();
-            match venue.submit(&intent).await {
-                VenueOutcome::Acked { fills, .. } => {
-                    // Chase-tradeoff probe: drift over the taker delay is the
-                    // chase a fill needed. `fill_ask` is the exact fill price (a
-                    // fill) or the post-delay ask re-read (a miss). One line per
-                    // signal's first attempt → fill-rate-vs-chase curve offline.
-                    if attempt == 0 {
-                        let (filled, fill_ask) = match fills.first() {
-                            Some(f) => (true, f.px),
-                            None => (false, self.top(&inst).map(|b| b.best_ask).unwrap_or(f64::NAN)),
-                        };
-                        tracing::info!(
-                            target: "chase",
-                            "CHASE trade={} signal_ask={:.3} fill_ask={:.3} drift_c={:.2} ask_sz={:.1} filled={}",
-                            plan.trade_id, plan.signal_ask, fill_ask,
-                            (fill_ask - plan.signal_ask) * 100.0, book.ask_sz, filled,
-                        );
-                    }
-                    if fills.is_empty() {
-                        // FAK no-cross: retry per loop.
-                    } else {
-                        if self.ingest_fills(&fills, &mut entry).is_err() {
-                            return self.abort_kill(&plan, &inst);
-                        }
-                        break; // partial or full → proceed to HOLDING
-                    }
-                }
-                VenueOutcome::Rejected(r) => {
-                    self.report(&plan.trade_id, &inst, "Reject", &r);
-                    break;
-                }
-            }
-            attempt += 1;
-            if attempt >= self.cfg.entry.max_attempts {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(self.cfg.entry.retry_delay_ms)).await;
-        }
+        let Ok(entry) = self.entry_chase(&plan).await else {
+            return; // kill switch tripped in fill application (abort_kill reported)
+        };
 
         if entry.qty <= EPS {
             // ── ABANDONED: entry never filled; no position ever existed (§5) ──
@@ -623,11 +807,7 @@ impl Engine {
         }
         let mut exit = LegSummary::default();
         let mut exit_ref_bid = self.top(&inst).map(|b| b.best_bid).unwrap_or(0.0);
-        if self.cfg.exit.mode == "maker" {
-            self.maker_exit(&plan, &inst, &mut exit).await;
-        } else {
-            self.cross_exit(&plan, &inst, &mut exit, &mut exit_ref_bid, plan.exit_deadline_ns).await;
-        }
+        self.cross_exit(&plan, &inst, &mut exit, &mut exit_ref_bid, plan.exit_deadline_ns).await;
 
         // ── terminal ──
         let hold_actual_ms = ((exit.last_ts_ns.max(entry.first_ts_ns) - entry.first_ts_ns).max(0) / MS) as u64;
@@ -709,111 +889,310 @@ impl Engine {
         }
     }
 
-    /// Maker exit (§6): rest a post-only SELL at the best ask, re-post when the ask
-    /// moves, poll for fills, and taker-cross the residual at the exit deadline.
-    /// Maker fills are fee-free at the posted price.
-    async fn maker_exit(&mut self, plan: &TradePlan, inst: &str, exit: &mut LegSummary) {
-        let venue = self.venue.clone();
-        let mut order_id: Option<String> = None;
-        let mut posted_ask = -1.0f64; // traded-token price we're resting at
-        let mut on_order = 0.0f64; // fills already ingested for the current order
-        let mut seq = 0u64; // maker-fill ingest sequence (fill-id uniqueness)
-        let mut post_seq = 0u32; // per-POST counter -> unique client_order_id (Kalshi 409s on dupes)
-        let mut fails = 0u32; // consecutive post-only rejects -> bail to taker
-        loop {
-            if self.pm.qty(inst) <= EPS {
-                break; // fully exited
+    /// Fire the post-signal price-trajectory probe (PXMETA + trajectory ladder),
+    /// anchored at the signal moment. Fires whether or not the entry fills.
+    fn fire_probe(&mut self, plan: &TradePlan) {
+        let inst = plan.instrument.clone();
+        if let Some(tx) = &self.px_tx {
+            if let Some(b) = self.top(&inst) {
+                // Per-trigger metadata: tte + the pre-signal Kalshi ask move + the
+                // trigger. dry_run skips emit_trade, so this is the only record.
+                let (tte, pre) = {
+                    let m = self.mirror.lock().unwrap();
+                    let pre_w = self.cfg.price_probe.pre_window_ms as i64 * MS;
+                    (
+                        m.tte_ms(&inst, now_ns()),
+                        m.ask_move_c(&inst, plan.signal_ts_ns - pre_w, plan.signal_ts_ns),
+                    )
+                };
+                tracing::info!(
+                    target: "pxprobe",
+                    "PXMETA trade={} inst={} tte_ms={} pre_move_c={} signal_ask={:.3} bps={:+.2} yes_px={:.3} tgt_c={:+.1}",
+                    plan.trade_id, inst,
+                    tte.map(|t| t.to_string()).unwrap_or_else(|| "?".into()),
+                    pre.map(|v| format!("{:+.2}", v)).unwrap_or_else(|| "?".into()),
+                    plan.signal_ask, plan.trigger.move_bps, plan.trigger.yes_price, plan.trigger.target_move_c,
+                );
+                let _ = tx.send(PxProbe {
+                    trade_id: plan.trade_id.clone(),
+                    inst: inst.clone(),
+                    t0_ns: plan.signal_ts_ns,
+                    ref_ask: plan.signal_ask,
+                    ref_mid: 0.5 * (b.best_bid + b.best_ask),
+                });
             }
-            // ── exit to taker cross when (a) we hit the soft maker deadline, or (b)
-            //    post-only keeps failing. Cross against the HARD settle deadline
-            //    (`expiry_ns`), not the soft maker deadline we're already past — else
-            //    cross_exit would see now >= deadline and no-op, stranding us long. ──
-            if now_ns() >= plan.exit_deadline_ns || fails >= MAKER_POST_FAIL_LIMIT {
-                if let Some(id) = order_id.take() {
-                    if let Ok(fc) = venue.cancel_order(&id).await {
-                        self.maybe_ingest_maker(plan, inst, exit, &id, &mut seq, fc - on_order, posted_ask);
-                    }
-                }
-                if self.pm.qty(inst) > EPS {
-                    let why = if fails >= MAKER_POST_FAIL_LIMIT { "post rejects" } else { "deadline" };
-                    self.report(&plan.trade_id, inst, "Exiting", &format!("maker {why} -> taker cross"));
-                    let mut rb = 0.0;
-                    self.cross_exit(plan, inst, exit, &mut rb, plan.expiry_ns).await;
-                }
-                break;
-            }
-            let Some(book) = self.top(inst) else {
-                tokio::time::sleep(Duration::from_millis(200)).await;
-                continue;
-            };
-            let ask = book.best_ask;
-            let need_new = match &order_id {
-                Some(_) => (ask - posted_ask).abs() > EPS,
-                None => true,
-            };
-            if need_new {
-                // cancel the stale order (catch any last-moment fill), then re-post at the new ask
-                if let Some(id) = order_id.take() {
-                    if let Ok(fc) = venue.cancel_order(&id).await {
-                        self.maybe_ingest_maker(plan, inst, exit, &id, &mut seq, fc - on_order, posted_ask);
-                    }
-                }
-                on_order = 0.0;
-                let held = self.pm.qty(inst);
-                if held <= EPS {
-                    break;
-                }
-                // Fresh client_order_id every POST — Kalshi dedups on it and 409s a repeat.
-                // Leg "XM" (maker) stays distinct from the fallback cross's "X" ids.
-                post_seq += 1;
-                let intent = self.intent(plan, "XM", post_seq, Side::Sell, ask, held);
-                match venue.place_resting(&intent).await {
-                    Ok(id) => {
-                        self.report(&plan.trade_id, inst, "Exiting", &format!("maker rest {held:.0}@{ask:.3}"));
-                        order_id = Some(id);
-                        posted_ask = ask;
-                        fails = 0;
-                    }
-                    Err(e) => {
-                        fails += 1;
-                        self.report(&plan.trade_id, inst, "Reject", &format!("maker post: {e}"));
-                    }
-                }
-            } else if let Some(id) = order_id.clone() {
-                // ask unchanged: poll the resting order for fills
-                if let Ok(fc) = venue.order_fill_count(&id).await {
-                    let delta = fc - on_order;
-                    if delta > EPS {
-                        self.maybe_ingest_maker(plan, inst, exit, &id, &mut seq, delta, posted_ask);
-                        on_order = fc;
-                    }
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(200)).await;
         }
     }
 
-    /// Record a maker-fill delta (fee-free, at the posted price) into the exit leg
-    /// + position, with a unique id so re-polls never double-count.
-    fn maybe_ingest_maker(&mut self, plan: &TradePlan, inst: &str, exit: &mut LegSummary, order_id: &str, seq: &mut u64, qty: f64, px: f64) {
-        if qty <= EPS {
+    /// Bounded FAK entry attempt loop (§5), shared by both exit modes. Returns
+    /// the entry leg (possibly empty = no fill), or Err(()) after a kill-switch
+    /// trip (fill application violated the long-only invariant; already reported).
+    async fn entry_chase(&mut self, plan: &TradePlan) -> Result<LegSummary, ()> {
+        let inst = plan.instrument.clone();
+        let mut entry = LegSummary::default();
+        let mut attempt = 0u32;
+        loop {
+            if now_ns() - plan.signal_ts_ns >= self.cfg.entry.ttl_ms as i64 * MS {
+                self.report(&plan.trade_id, &inst, "Entering", "entry ttl elapsed");
+                break;
+            }
+            let Some(book) = self.top(&inst) else { break };
+            let cap = book.best_ask + self.cfg.entry.chase_c;
+            if cap - plan.signal_ask > self.cfg.entry.max_chase_total_c {
+                self.report(&plan.trade_id, &inst, "Entering", "ask ran past chase cap");
+                break;
+            }
+            let remaining = (plan.size_shares - entry.qty).max(0.0);
+            let intent = self.intent(plan, "E", attempt, Side::Buy, cap, remaining);
+            let venue = self.venue.clone();
+            match venue.submit(&intent).await {
+                VenueOutcome::Acked { fills, .. } => {
+                    // Chase-tradeoff probe: drift over the taker delay is the
+                    // chase a fill needed. `fill_ask` is the exact fill price (a
+                    // fill) or the post-delay ask re-read (a miss). One line per
+                    // signal's first attempt → fill-rate-vs-chase curve offline.
+                    if attempt == 0 {
+                        let (filled, fill_ask) = match fills.first() {
+                            Some(f) => (true, f.px),
+                            None => (false, self.top(&inst).map(|b| b.best_ask).unwrap_or(f64::NAN)),
+                        };
+                        tracing::info!(
+                            target: "chase",
+                            "CHASE trade={} signal_ask={:.3} fill_ask={:.3} drift_c={:.2} ask_sz={:.1} filled={}",
+                            plan.trade_id, plan.signal_ask, fill_ask,
+                            (fill_ask - plan.signal_ask) * 100.0, book.ask_sz, filled,
+                        );
+                    }
+                    if fills.is_empty() {
+                        // FAK no-cross: retry per loop.
+                    } else {
+                        if self.ingest_fills(&fills, &mut entry).is_err() {
+                            self.abort_kill(plan, &inst);
+                            return Err(());
+                        }
+                        break; // partial or full → proceed
+                    }
+                }
+                VenueOutcome::Rejected(r) => {
+                    self.report(&plan.trade_id, &inst, "Reject", &r);
+                    break;
+                }
+            }
+            attempt += 1;
+            if attempt >= self.cfg.entry.max_attempts {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(self.cfg.entry.retry_delay_ms)).await;
+        }
+        Ok(entry)
+    }
+
+    /// Decoupled entry (exit.mode = "reconcile"): gate on the per-market state
+    /// machine + exposure cap, cancel our resting close (self-cross guard), fire
+    /// the taker entry, then hand the position to the market's exit reconciler.
+    /// NO hold/exit here — the reconciler owns the close.
+    async fn run_entry_reconcile(&mut self, plan: TradePlan) {
+        let now = now_ns();
+        let inst = plan.instrument.clone();
+        let Some(mid) = market_id_of(&inst).map(str::to_string) else {
+            self.report(&plan.trade_id, &inst, "Rejected", "no market id");
+            return;
+        };
+        // Exposure sign of BUYING this token: YES-side +1, NO-side −1.
+        let dir_sign = if inst == yes_side_of(&inst) { 1.0 } else { -1.0 };
+        let rc = recon_cfg(&self.cfg.exit);
+
+        // Global entry spacing (cooldown): begin/end brackets the ENTRY only.
+        if !self.pm.try_begin_trade(&plan.trade_id, now) {
+            self.report(&plan.trade_id, &inst, "Rejected", "cooldown");
             return;
         }
-        *seq += 1;
-        let f = Fill {
-            venue_trade_id: format!("{order_id}-mk{}", *seq),
-            order_id: order_id.to_string(),
-            client_id: format!("{}:X:mk{}", plan.trade_id, *seq),
-            instrument: inst.to_string(),
-            status: FillStatus::Confirmed,
-            side: Side::Sell,
-            qty,
-            px,
-            fee: 0.0, // maker: fee-free
-            ts_ns: now_ns(),
+
+        // ── claim the market slot: state machine + exposure cap (in-memory) ──
+        let claim: Result<Option<RestingClose>, &'static str> = {
+            let mut g = self.slots.lock().unwrap();
+            let s = g
+                .entry(mid.clone())
+                .or_insert_with(|| MarketSlot::new_idle(&inst, plan.params, plan.expiry_ns));
+            match entry_gate(s.state, now, &rc) {
+                Err(r) => Err(r),
+                Ok(()) => {
+                    if !exposure_ok(
+                        s.net_est,
+                        dir_sign,
+                        plan.size_shares,
+                        self.cfg.risk.max_net_per_market,
+                    ) {
+                        Err("exposure cap")
+                    } else {
+                        s.state = TradeState::Submitted { since_ns: now };
+                        s.inst_yes = yes_side_of(&inst);
+                        s.params = plan.params;
+                        s.expiry_ns = plan.expiry_ns;
+                        s.trade_id = plan.trade_id.clone();
+                        Ok(s.resting.take())
+                    }
+                }
+            }
         };
-        if self.ingest_fills(&[f], exit).is_err() {
-            self.report(&plan.trade_id, inst, "Reject", "maker fill-apply error");
+        let resting = match claim {
+            Err(r) => {
+                self.report(&plan.trade_id, &inst, "Rejected", r);
+                self.pm.end_trade(now, 0); // free the slot; no cooldown burn on a reject
+                return;
+            }
+            Ok(r) => r,
+        };
+        self.risk.note_trade(now);
+
+        // ── cancel our resting close BEFORE the taker (self-cross guard) ──
+        if let Some(r) = resting {
+            match self.venue.clone().cancel_order(&r.order_id).await {
+                Ok(CancelOutcome::Canceled { reduced_by }) => {
+                    let filled = (r.count - reduced_by).max(0.0);
+                    if filled > EPS {
+                        // Last-moment close fill: account it before entering.
+                        let held_inst = complement(&r.instrument);
+                        let f = translated_close_fill(&held_inst, &r.order_id, 0, filled, r.px);
+                        self.on_close_fill(&f);
+                        let mut g = self.slots.lock().unwrap();
+                        if let Some(s) = g.get_mut(&mid) {
+                            s.net_est -= s.net_est.signum() * filled;
+                        }
+                    }
+                }
+                Ok(CancelOutcome::Gone) => {
+                    tracing::warn!(
+                        target: "exit",
+                        "[{mid}] resting close already terminal at entry; position poll reconciles"
+                    );
+                }
+                Err(e) => {
+                    // Order state UNKNOWN — restore the reference and abort the
+                    // entry rather than risk an orphan (the incident's bug).
+                    self.report(
+                        &plan.trade_id,
+                        &inst,
+                        "Rejected",
+                        &format!("cancel resting close failed: {e}"),
+                    );
+                    let mut g = self.slots.lock().unwrap();
+                    if let Some(s) = g.get_mut(&mid) {
+                        s.resting = Some(r);
+                        s.state = TradeState::Rest;
+                    }
+                    self.pm.end_trade(now, 0);
+                    return;
+                }
+            }
+        }
+
+        // ── probe + dry-run + taker entry ──
+        self.report(&plan.trade_id, &inst, "Entering", &format!("size={:.2}", plan.size_shares));
+        self.fire_probe(&plan);
+        if self.cfg.dry_run {
+            self.report(&plan.trade_id, &inst, "Shadow", "dry_run: probe only, no order");
+            self.release_submitted(&mid);
+            self.pm.end_trade(now_ns(), self.cfg.risk.cooldown_ms);
+            return;
+        }
+        let entry = match self.entry_chase(&plan).await {
+            Ok(e) => e,
+            Err(()) => {
+                self.release_submitted(&mid);
+                return; // abort_kill already reported + freed the trade slot
+            }
+        };
+
+        if entry.qty <= EPS {
+            // No fill → release the gate immediately (no needless 1s freeze).
+            self.report(&plan.trade_id, &inst, "Abandoned", "no entry fill");
+            self.emit_trade(&plan, TradeOutcome::Abandoned, &entry, &LegSummary::default(), 0, 0.0);
+            self.release_submitted(&mid);
+            self.pm.end_trade(now_ns(), self.cfg.risk.cooldown_ms);
+            return;
+        }
+
+        // ── Filled → transit state; hand off to the reconciler ──
+        self.emit_position(&inst);
+        self.report(
+            &plan.trade_id,
+            &inst,
+            "Holding",
+            &format!("qty={:.2} @ {:.3} (exit: reconciler)", entry.qty, entry.vwap),
+        );
+        // TradeRecord at entry: PendingResolution = "open — exit decoupled".
+        self.emit_trade(&plan, TradeOutcome::PendingResolution, &entry, &LegSummary::default(), 0, 0.0);
+        let fill_ns = if entry.first_ts_ns > 0 { entry.first_ts_ns } else { now_ns() };
+        let need_spawn = {
+            let mut g = self.slots.lock().unwrap();
+            let s = g.get_mut(&mid).expect("slot claimed above");
+            s.state = TradeState::Filled { fill_ns };
+            s.net_est += dir_sign * entry.qty;
+            // Each fill extends the hold for the whole (merged) position.
+            s.hold_until_ns = s.hold_until_ns.max(fill_ns + plan.hold_ms as i64 * MS);
+            let need = !s.reconciler_alive;
+            if need {
+                s.reconciler_alive = true;
+            }
+            need
+        };
+        if need_spawn {
+            tokio::spawn(exit_reconciler(
+                mid,
+                self.slots.clone(),
+                self.venue.clone(),
+                self.mirror.clone(),
+                self.fill_tx.clone(),
+                rc,
+            ));
+        }
+        self.pm.end_trade(now_ns(), self.cfg.risk.cooldown_ms);
+    }
+
+    /// Release a Submitted claim without a fill: back to Rest if the market still
+    /// holds something (the reconciler resumes), else Idle.
+    fn release_submitted(&mut self, mid: &str) {
+        let mut g = self.slots.lock().unwrap();
+        if let Some(s) = g.get_mut(mid) {
+            s.state = if s.net_est.abs() > EPS { TradeState::Rest } else { TradeState::Idle };
+        }
+    }
+
+    /// Apply a translated close fill from a reconciler (or the entry path's
+    /// pre-entry cancel): a fee-free SELL of the held token at `1 − close_px`.
+    /// Clamped to held — the venue's authoritative position drives order sizing,
+    /// so a clamp here is an accounting-race artifact, not a phantom trade.
+    fn on_close_fill(&mut self, f: &Fill) {
+        let Some(clamped) = clamp_liquidation(self.pm.qty(&f.instrument), f) else {
+            self.report("close", &f.instrument, "Skip", "close fill on already-flat PM (accounting)");
+            return;
+        };
+        match self.pm.apply_fill(&clamped) {
+            Ok(()) => {
+                let held = self.pm.qty(&f.instrument);
+                self.report(
+                    "close",
+                    &f.instrument,
+                    "Exiting",
+                    &format!("close fill {:.0} @ {:.3} (held {:.0})", clamped.qty, clamped.px, held),
+                );
+                if held <= EPS {
+                    let realized =
+                        self.pm.position(&f.instrument).map(|p| p.realized_pnl).unwrap_or(0.0);
+                    tracing::info!(
+                        target: "executor",
+                        "*** CLOSE {} flat *** realized_total={realized:.4}",
+                        f.instrument
+                    );
+                    self.report("close", &f.instrument, "Closed", &format!("flat; realized_total={realized:.4}"));
+                }
+                self.emit_position(&f.instrument);
+            }
+            Err(e) => {
+                self.report("close", &f.instrument, "Halt", &format!("close fill: {e}"));
+                self.risk.trip("close fill long-only violation");
+            }
         }
     }
 
@@ -851,6 +1230,273 @@ fn plan_instrument(s: &TradeSignal) -> String {
 async fn sleep_until(ts_ns: i64) {
     let dur = (ts_ns - now_ns()).max(0) as u64;
     tokio::time::sleep(Duration::from_nanos(dur)).await;
+}
+
+/// Cancel a resting close and account its fills authoritatively (`reduced_by`
+/// from the engine-synchronous cancel response; `Gone` resolved via the status
+/// endpoint after the read replica settles). Returns Ok(filled) ⇒ the order is
+/// confirmed OFF the book (caller may drop its reference); Err(()) ⇒ transport
+/// failure, order state UNKNOWN — the caller MUST keep the reference and retry.
+/// Dropping an unconfirmed reference is the incident's orphan bug.
+async fn cancel_and_account(
+    venue: &Arc<dyn TradingVenue>,
+    r: &RestingClose,
+    trade_id: &str,
+    seq: &mut u64,
+    fills: &FillSender,
+    settle_wait: Duration,
+) -> Result<f64, ()> {
+    let filled = match venue.cancel_order(&r.order_id).await {
+        Ok(CancelOutcome::Canceled { reduced_by }) => (r.count - reduced_by).max(0.0),
+        Ok(CancelOutcome::Gone) => {
+            // Terminal (fully filled or already canceled). Give the query replica
+            // its ~150ms, then read the definitive fill count.
+            tokio::time::sleep(settle_wait).await;
+            match venue.order_fill_count(&r.order_id).await {
+                Ok(Some(fc)) => fc.min(r.count),
+                Ok(None) => {
+                    tracing::warn!(
+                        target: "exit",
+                        "[{trade_id}] close {} terminal but not visible; fills unknown (position poll heals sizing)",
+                        r.order_id
+                    );
+                    0.0
+                }
+                Err(e) => {
+                    tracing::warn!(target: "exit", "[{trade_id}] close {} status: {e}", r.order_id);
+                    0.0
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: "exit",
+                "[{trade_id}] cancel {} FAILED: {e} — order state unknown, keeping reference",
+                r.order_id
+            );
+            return Err(());
+        }
+    };
+    if filled > EPS {
+        *seq += 1;
+        let held_inst = complement(&r.instrument);
+        let _ = fills.send(translated_close_fill(&held_inst, &r.order_id, *seq, filled, r.px));
+        tracing::info!(
+            target: "exit",
+            "[{trade_id}] close fill {filled:.0} @ {:.3} (cancel accounting)",
+            r.px
+        );
+    }
+    Ok(filled)
+}
+
+/// Per-market exit reconciler (exit.mode = "reconcile") — the independent loop
+/// that owns position truth and all close orders for one market:
+///
+///   1. state gate: frozen during Submitted/Filled (promotes Filled→Rest after
+///      `transit_ms` > the venue's read-replication lag, so the first post-gate
+///      poll reliably includes the entry's fill; force-promotes a stuck Submitted)
+///   2. AUTHORITATIVE position poll (venue records, never internal accounting)
+///   3. flat → cancel any resting close, park (Rest→Idle, task ends)
+///   4. past the hold → desired close = BUY |net| of the complement at its best
+///      bid (post-only; joins the held side's away queue — never crosses)
+///   5. resting order matches desired → leave it; else cancel (fills learned
+///      exactly from `reduced_by`) and RE-POLL before re-posting — the
+///      anti-oversell recheck: a fill during the cancel changes the size
+///
+/// Maker-only by design: no taker fallback. If the close never fills the
+/// position rides to settlement (accepted trade-off; cap is 1 net contract).
+async fn exit_reconciler(
+    market_id: String,
+    slots: Slots,
+    venue: Arc<dyn TradingVenue>,
+    mirror: Arc<Mutex<ExecBookMirror>>,
+    fills: FillSender,
+    rc: ReconCfg,
+) {
+    tracing::info!(target: "exit", "[{market_id}] reconciler up");
+    let mut close_seq: u64 = 0;
+    loop {
+        tokio::time::sleep(rc.cadence).await;
+        let now = now_ns();
+
+        // ── 1. state gate (promote the transitions this task owns) ──
+        let (params, expiry_ns, trade_id, hold_until, resting) = {
+            let mut g = slots.lock().unwrap();
+            let Some(s) = g.get_mut(&market_id) else { break };
+            match s.state {
+                TradeState::Submitted { since_ns } => {
+                    if now - since_ns > rc.submitted_timeout_ns {
+                        tracing::warn!(
+                            target: "exit",
+                            "[{market_id}] Submitted stuck {}ms — force → Rest (healing from venue position)",
+                            (now - since_ns) / MS
+                        );
+                        s.state = TradeState::Rest;
+                    } else {
+                        continue; // frozen: entry in flight
+                    }
+                }
+                TradeState::Filled { fill_ns } => {
+                    if now - fill_ns >= rc.transit_ns {
+                        s.state = TradeState::Rest;
+                    } else {
+                        continue; // frozen: transit window
+                    }
+                }
+                TradeState::Idle | TradeState::Rest => {}
+            }
+            (s.params, s.expiry_ns, s.trade_id.clone(), s.hold_until_ns, s.resting.clone())
+        };
+
+        // ── 2. authoritative position ──
+        let net = match venue.market_position(&market_id).await {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::warn!(target: "exit", "[{market_id}] position poll: {e}");
+                continue;
+            }
+        };
+        if let Some(s) = slots.lock().unwrap().get_mut(&market_id) {
+            s.net_est = net;
+        }
+
+        // ── 3. flat → clean up + park ──
+        if net.abs() < EPS {
+            if let Some(r) = &resting {
+                if cancel_and_account(&venue, r, &trade_id, &mut close_seq, &fills, rc.settle_wait)
+                    .await
+                    .is_err()
+                {
+                    continue; // cancel unconfirmed: keep the reference, retry next cycle
+                }
+                if let Some(s) = slots.lock().unwrap().get_mut(&market_id) {
+                    s.resting = None;
+                }
+            }
+            let mut g = slots.lock().unwrap();
+            if let Some(s) = g.get_mut(&market_id) {
+                // Re-check under the lock: an entry may have claimed the slot
+                // while we were polling — if so, stay alive and frozen.
+                if matches!(s.state, TradeState::Rest | TradeState::Idle) && s.resting.is_none() {
+                    s.state = TradeState::Idle;
+                    s.reconciler_alive = false;
+                    tracing::info!(target: "exit", "[{market_id}] flat → Idle; reconciler parked");
+                    break;
+                }
+            }
+            continue;
+        }
+
+        // ── 4. hold: capture the reprice before starting to close ──
+        if now < hold_until {
+            continue;
+        }
+
+        // Desired close: BUY the complement of the held side at its best bid.
+        let inst_yes = {
+            let g = slots.lock().unwrap();
+            match g.get(&market_id) {
+                Some(s) => s.inst_yes.clone(),
+                None => break,
+            }
+        };
+        let held_inst = if net > 0.0 { inst_yes.clone() } else { complement(&inst_yes) };
+        let close_inst = complement(&held_inst);
+        let Some(top) = mirror.lock().unwrap().top(&close_inst) else { continue };
+        if top.best_bid <= 0.0 {
+            continue;
+        }
+        let want_px = top.best_bid;
+        let want_count = net.abs().floor();
+        if want_count < 1.0 {
+            continue; // sub-contract residual can't be closed by order; settles
+        }
+
+        // ── 5. compare with the resting order ──
+        if let Some(r) = &resting {
+            if r.instrument == close_inst
+                && (r.px - want_px).abs() < EPS
+                && (r.count - want_count).abs() < EPS
+            {
+                continue; // matches desired: leave it (queue priority preserved)
+            }
+            // Stale: cancel (learning exact fills from reduced_by), then RE-POLL
+            // before re-posting — the anti-oversell recheck. Recompute next cycle.
+            if cancel_and_account(&venue, r, &trade_id, &mut close_seq, &fills, rc.settle_wait)
+                .await
+                .is_ok()
+            {
+                if let Some(s) = slots.lock().unwrap().get_mut(&market_id) {
+                    s.resting = None;
+                }
+            }
+            continue;
+        }
+
+        // No resting order → post the desired close. Gate re-check first (an
+        // entry may have claimed the slot during our awaits).
+        {
+            let g = slots.lock().unwrap();
+            match g.get(&market_id) {
+                Some(s) if matches!(s.state, TradeState::Rest) => {}
+                _ => continue,
+            }
+        }
+        close_seq += 1;
+        let intent = OrderIntent {
+            client_id: format!("close:{trade_id}:{close_seq}"),
+            instrument: close_inst.clone(),
+            token_id: String::new(),
+            side: Side::Buy,
+            price: want_px,
+            size: want_count,
+            kind: IntentKind::RestUntil { expiry_ns },
+            params,
+            expiry_ns,
+        };
+        match venue.place_resting(&intent).await {
+            Ok(order_id) => {
+                let placed = RestingClose {
+                    order_id: order_id.clone(),
+                    instrument: close_inst.clone(),
+                    px: want_px,
+                    count: want_count,
+                };
+                // Record under the lock ONLY if still in Rest; if an entry raced
+                // us while the POST was in flight, it couldn't have seen this
+                // order — roll it back ourselves (never leave an untracked order).
+                let entry_raced = {
+                    let mut g = slots.lock().unwrap();
+                    match g.get_mut(&market_id) {
+                        Some(s) if matches!(s.state, TradeState::Rest) => {
+                            s.resting = Some(placed.clone());
+                            false
+                        }
+                        _ => true,
+                    }
+                };
+                if entry_raced {
+                    tracing::warn!(
+                        target: "exit",
+                        "[{market_id}] entry raced the close POST — rolling back {order_id}"
+                    );
+                    // Best-effort: on transport failure the next reconcile cycle
+                    // re-discovers via the authoritative position + re-cancel.
+                    let _ = cancel_and_account(
+                        &venue, &placed, &trade_id, &mut close_seq, &fills, rc.settle_wait,
+                    )
+                    .await;
+                } else {
+                    tracing::info!(
+                        target: "exit",
+                        "[{market_id}] close rest: buy {want_count:.0} {close_inst} @ {want_px:.3} (net {net:+.0})"
+                    );
+                }
+            }
+            Err(e) => tracing::warn!(target: "exit", "[{market_id}] close post: {e}"),
+        }
+    }
 }
 
 /// Hold-period study sampler. For each registered entry, at every hold offset it
@@ -1093,7 +1739,69 @@ async fn maker_sampler(
 
 #[cfg(test)]
 mod tests {
-    use super::{clamp_liquidation, maker_outcome};
+    use super::{
+        clamp_liquidation, entry_gate, exposure_ok, maker_outcome, translated_close_fill,
+        yes_side_of, ReconCfg, TradeState,
+    };
+    use std::time::Duration;
+
+    fn rc() -> ReconCfg {
+        ReconCfg {
+            cadence: Duration::from_millis(200),
+            transit_ns: 1_000 * super::MS,
+            submitted_timeout_ns: 3_000 * super::MS,
+            settle_wait: Duration::from_millis(150),
+        }
+    }
+
+    #[test]
+    fn entry_gate_freezes_in_flight_and_transit() {
+        let r = rc();
+        let now = 10_000 * super::MS;
+        // in-flight entry blocks
+        assert!(entry_gate(TradeState::Submitted { since_ns: now - 100 * super::MS }, now, &r).is_err());
+        // stale Submitted (entry task died) falls through — no deadlock
+        assert!(entry_gate(TradeState::Submitted { since_ns: now - 5_000 * super::MS }, now, &r).is_ok());
+        // inside the 1s Filled→Rest transit blocks
+        assert!(entry_gate(TradeState::Filled { fill_ns: now - 500 * super::MS }, now, &r).is_err());
+        // past the transit allows
+        assert!(entry_gate(TradeState::Filled { fill_ns: now - 1_500 * super::MS }, now, &r).is_ok());
+        assert!(entry_gate(TradeState::Rest, now, &r).is_ok());
+        assert!(entry_gate(TradeState::Idle, now, &r).is_ok());
+    }
+
+    #[test]
+    fn exposure_cap_blocks_growth_allows_reduction() {
+        // fresh entry within the cap
+        assert!(exposure_ok(0.0, 1.0, 1.0, 1.0));
+        // stacking past the cap blocked
+        assert!(!exposure_ok(1.0, 1.0, 1.0, 1.0));
+        // opposite-direction entry that REDUCES |net| always allowed (nets to 0)
+        assert!(exposure_ok(1.0, -1.0, 1.0, 1.0));
+        // reducing from beyond the cap is allowed too (recovery)
+        assert!(exposure_ok(-2.0, 1.0, 1.0, 1.0));
+        // overshooting through zero past the cap blocked
+        assert!(!exposure_ok(1.0, -1.0, 3.0, 1.0));
+    }
+
+    #[test]
+    fn close_fill_translates_to_held_side_sell() {
+        // close = buy NO at 0.43 to exit long YES ⇒ sell YES at 0.57, fee-free.
+        let f = translated_close_fill("kalshi.KXBTC15M-1.YES", "ord-1", 2, 1.0, 0.43);
+        assert_eq!(f.instrument, "kalshi.KXBTC15M-1.YES");
+        assert!(matches!(f.side, arb_core::model::Side::Sell));
+        assert!((f.px - 0.57).abs() < 1e-9);
+        assert_eq!(f.fee, 0.0);
+        assert!(f.client_id.starts_with("close:"), "routes via the close: prefix");
+        assert_eq!(f.venue_trade_id, "ord-1-cl2", "unique per accounting event");
+    }
+
+    #[test]
+    fn yes_side_resolves_from_either_token() {
+        assert_eq!(yes_side_of("kalshi.KXBTC15M-1.YES"), "kalshi.KXBTC15M-1.YES");
+        assert_eq!(yes_side_of("kalshi.KXBTC15M-1.NO"), "kalshi.KXBTC15M-1.YES");
+        assert_eq!(yes_side_of("polymarket.0xabc.DOWN"), "polymarket.0xabc.UP");
+    }
     use crate::types::{Fill, FillStatus};
     use arb_core::model::Side;
 

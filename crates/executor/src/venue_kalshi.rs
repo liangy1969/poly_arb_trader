@@ -38,7 +38,7 @@ use arb_core::model::Side;
 use arb_core::now_ns;
 
 use crate::types::{Fill, FillStatus, IntentKind, OrderIntent, VenueOutcome};
-use crate::venue::{fee_usdc, FillSender, TradingVenue};
+use crate::venue::{fee_usdc, CancelOutcome, FillSender, TradingVenue};
 use crate::venue_spec::market_id_of;
 
 // Production: external-api.kalshi.com resolves DIRECTLY to the us-east-2 ELB (Kalshi's
@@ -160,23 +160,37 @@ fn extract_order_id(v: &serde_json::Value) -> Option<String> {
     obj.get("order_id").and_then(|x| x.as_str()).map(String::from)
 }
 
-/// Contracts filled from a create/cancel/get response — tolerant of the wrapper,
-/// `fill_count` vs `fill_count_fp`, and string vs numeric fixed-point.
-fn extract_fill_count(v: &serde_json::Value) -> f64 {
+/// Read one numeric field from a (possibly `{order:{...}}`-wrapped) response,
+/// tolerant of string vs numeric fixed-point encodings. Returns the first of
+/// `keys` present.
+fn extract_num(v: &serde_json::Value, keys: &[&str]) -> Option<f64> {
     let obj = v.get("order").unwrap_or(v);
-    for k in ["fill_count", "fill_count_fp"] {
-        if let Some(x) = obj.get(k) {
+    for k in keys {
+        if let Some(x) = obj.get(*k) {
             if let Some(s) = x.as_str() {
                 if let Ok(f) = s.parse::<f64>() {
-                    return f;
+                    return Some(f);
                 }
             }
             if let Some(f) = x.as_f64() {
-                return f;
+                return Some(f);
             }
         }
     }
-    0.0
+    None
+}
+
+/// Contracts filled from a create/get response — tolerant of the wrapper,
+/// `fill_count` vs `fill_count_fp`, and string vs numeric fixed-point.
+fn extract_fill_count(v: &serde_json::Value) -> f64 {
+    extract_num(v, &["fill_count", "fill_count_fp"]).unwrap_or(0.0)
+}
+
+/// Contracts removed from the book by a cancel (`reduced_by`, live-verified field:
+/// `{"order_id":..., "reduced_by":"1.00", "ts_ms":...}`). `posted − reduced_by`
+/// is the exact fill count at cancel time — authoritative, engine-synchronous.
+fn extract_reduced_by(v: &serde_json::Value) -> Option<f64> {
+    extract_num(v, &["reduced_by", "reduced_by_fp"])
 }
 
 #[async_trait]
@@ -312,8 +326,12 @@ impl TradingVenue for KalshiVenue {
         extract_order_id(&v).ok_or_else(|| "no order_id in resting response".to_string())
     }
 
-    /// Cancel a resting order; returns contracts filled before cancel took effect.
-    async fn cancel_order(&self, order_id: &str) -> Result<f64, String> {
+    /// Cancel a resting order. 200 → `Canceled{reduced_by}` (authoritative fill
+    /// info: `posted − reduced_by` filled). 404 → `Gone` (order terminal: fully
+    /// filled or already canceled) — a distinct outcome the caller MUST handle;
+    /// swallowing it as a generic error is the oversell-incident bug. Other
+    /// statuses/transport failures → `Err` (order state UNKNOWN — do not re-post).
+    async fn cancel_order(&self, order_id: &str) -> Result<CancelOutcome, String> {
         let path = format!("{ORDERS_PATH}/{order_id}");
         let ts_ms = now_ns() / 1_000_000;
         let (ts, sig) = self.signer.sign("DELETE", &path, ts_ms).map_err(|e| format!("sign: {e}"))?;
@@ -327,16 +345,27 @@ impl TradingVenue for KalshiVenue {
             .send()
             .await
             .map_err(|e| format!("http: {e}"))?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(CancelOutcome::Gone);
+        }
         if !resp.status().is_success() {
             let code = resp.status();
             return Err(format!("kalshi cancel {code}: {}", resp.text().await.unwrap_or_default()));
         }
         let v: serde_json::Value = resp.json().await.map_err(|e| format!("parse: {e}"))?;
-        Ok(extract_fill_count(&v))
+        match extract_reduced_by(&v) {
+            Some(r) => Ok(CancelOutcome::Canceled { reduced_by: r }),
+            // 200 without reduced_by: canceled but unparseable — report 0 reduced
+            // (= assume fully filled) so the caller errs toward accounting a fill;
+            // the position poll self-heals any overstatement next cycle.
+            None => Ok(CancelOutcome::Canceled { reduced_by: 0.0 }),
+        }
     }
 
-    /// Poll contracts filled so far on a resting order.
-    async fn order_fill_count(&self, order_id: &str) -> Result<f64, String> {
+    /// Poll contracts filled so far on a resting order. `Ok(None)` = 404: the
+    /// query replica hasn't caught up (fresh orders lag ~70-145ms) or the order
+    /// id is unknown — not an error.
+    async fn order_fill_count(&self, order_id: &str) -> Result<Option<f64>, String> {
         let path = format!("/trade-api/v2/portfolio/orders/{order_id}");
         let ts_ms = now_ns() / 1_000_000;
         let (ts, sig) = self.signer.sign("GET", &path, ts_ms).map_err(|e| format!("sign: {e}"))?;
@@ -350,12 +379,107 @@ impl TradingVenue for KalshiVenue {
             .send()
             .await
             .map_err(|e| format!("http: {e}"))?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
         if !resp.status().is_success() {
             let code = resp.status();
             return Err(format!("kalshi get-order {code}: {}", resp.text().await.unwrap_or_default()));
         }
         let v: serde_json::Value = resp.json().await.map_err(|e| format!("parse: {e}"))?;
-        Ok(extract_fill_count(&v))
+        Ok(Some(extract_fill_count(&v)))
+    }
+
+    /// Signed net position for one market from Kalshi's own records (+long YES /
+    /// −long NO; Kalshi auto-nets, so it's a single signed number). ~5ms from
+    /// us-east-2 on a warm connection; the read side lags fills by ~100ms.
+    async fn market_position(&self, market_id: &str) -> Result<f64, String> {
+        let path = "/trade-api/v2/portfolio/positions";
+        let ts_ms = now_ns() / 1_000_000;
+        let (ts, sig) = self.signer.sign("GET", path, ts_ms).map_err(|e| format!("sign: {e}"))?;
+        let url = format!("{}/portfolio/positions?ticker={market_id}", self.base);
+        let resp = self
+            .http
+            .get(&url)
+            .header("KALSHI-ACCESS-KEY", self.signer.key_id.as_str())
+            .header("KALSHI-ACCESS-TIMESTAMP", ts)
+            .header("KALSHI-ACCESS-SIGNATURE", sig)
+            .send()
+            .await
+            .map_err(|e| format!("http: {e}"))?;
+        if !resp.status().is_success() {
+            let code = resp.status();
+            return Err(format!("kalshi positions {code}: {}", resp.text().await.unwrap_or_default()));
+        }
+        let v: serde_json::Value = resp.json().await.map_err(|e| format!("parse: {e}"))?;
+        let mps = v.get("market_positions").and_then(|x| x.as_array());
+        Ok(mps
+            .and_then(|arr| {
+                arr.iter()
+                    .find(|p| p.get("ticker").and_then(|t| t.as_str()) == Some(market_id))
+                    .and_then(|p| extract_num(p, &["position", "position_fp"]))
+            })
+            .unwrap_or(0.0))
+    }
+
+    /// All nonzero market positions (crash recovery at startup).
+    async fn open_positions(&self) -> Result<Vec<(String, f64)>, String> {
+        let path = "/trade-api/v2/portfolio/positions";
+        let ts_ms = now_ns() / 1_000_000;
+        let (ts, sig) = self.signer.sign("GET", path, ts_ms).map_err(|e| format!("sign: {e}"))?;
+        let url = format!("{}/portfolio/positions", self.base);
+        let resp = self
+            .http
+            .get(&url)
+            .header("KALSHI-ACCESS-KEY", self.signer.key_id.as_str())
+            .header("KALSHI-ACCESS-TIMESTAMP", ts)
+            .header("KALSHI-ACCESS-SIGNATURE", sig)
+            .send()
+            .await
+            .map_err(|e| format!("http: {e}"))?;
+        if !resp.status().is_success() {
+            let code = resp.status();
+            return Err(format!("kalshi positions {code}: {}", resp.text().await.unwrap_or_default()));
+        }
+        let v: serde_json::Value = resp.json().await.map_err(|e| format!("parse: {e}"))?;
+        let mut out = Vec::new();
+        if let Some(arr) = v.get("market_positions").and_then(|x| x.as_array()) {
+            for p in arr {
+                let net = extract_num(p, &["position", "position_fp"]).unwrap_or(0.0);
+                if net.abs() > 1e-9 {
+                    if let Some(t) = p.get("ticker").and_then(|t| t.as_str()) {
+                        out.push((t.to_string(), net));
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Account balance in USD (`balance_dollars`, fallback cents/100).
+    async fn balance(&self) -> Result<f64, String> {
+        let path = "/trade-api/v2/portfolio/balance";
+        let ts_ms = now_ns() / 1_000_000;
+        let (ts, sig) = self.signer.sign("GET", path, ts_ms).map_err(|e| format!("sign: {e}"))?;
+        let url = format!("{}/portfolio/balance", self.base);
+        let resp = self
+            .http
+            .get(&url)
+            .header("KALSHI-ACCESS-KEY", self.signer.key_id.as_str())
+            .header("KALSHI-ACCESS-TIMESTAMP", ts)
+            .header("KALSHI-ACCESS-SIGNATURE", sig)
+            .send()
+            .await
+            .map_err(|e| format!("http: {e}"))?;
+        if !resp.status().is_success() {
+            let code = resp.status();
+            return Err(format!("kalshi balance {code}: {}", resp.text().await.unwrap_or_default()));
+        }
+        let v: serde_json::Value = resp.json().await.map_err(|e| format!("parse: {e}"))?;
+        if let Some(d) = extract_num(&v, &["balance_dollars"]) {
+            return Ok(d);
+        }
+        extract_num(&v, &["balance"]).map(|c| c / 100.0).ok_or_else(|| "no balance field".into())
     }
 
     fn start(&self, fills: FillSender) -> Vec<JoinHandle<()>> {
@@ -469,5 +593,49 @@ mod tests {
         let k = map_order(&intent("kalshi.KXBTC15M-1.NO", Side::Sell, 0.68, 20.0), false);
         assert_eq!(k.side, "bid");
         assert_eq!(k.cents, 32, "1-0.68=0.32 -> 32c exactly, at the passive touch");
+    }
+
+    // ── close (buy-the-opposite) mappings the exit reconciler relies on ──
+
+    #[test]
+    fn post_only_buy_no_joins_yes_ask_side() {
+        // long YES, close = buy NO at NO best bid q → yes-book ASK at 1-q (rests).
+        let k = map_order(&intent("kalshi.KXBTC15M-1.NO", Side::Buy, 0.43, 1.0), false);
+        assert_eq!(k.side, "ask");
+        assert_eq!(k.cents, 57, "buy NO 0.43 == rest yes-ask at 57c");
+    }
+
+    #[test]
+    fn post_only_buy_yes_joins_yes_bid_side() {
+        // long NO, close = buy YES at YES best bid → yes-book BID, floor (away from cross).
+        let k = map_order(&intent("kalshi.KXBTC15M-1.YES", Side::Buy, 0.315, 1.0), false);
+        assert_eq!(k.side, "bid");
+        assert_eq!(k.cents, 31, "post-only bid floors away from the cross");
+    }
+
+    // ── response parsers (fields live-verified 2026-07-02) ──
+
+    #[test]
+    fn parses_reduced_by_from_cancel_response() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"order_id":"254c2227","reduced_by":"1.00","ts_ms":1783013325602}"#,
+        )
+        .unwrap();
+        assert_eq!(extract_reduced_by(&v), Some(1.0));
+        // numeric + wrapped variants tolerated
+        let v2: serde_json::Value = serde_json::from_str(r#"{"order":{"reduced_by":2.0}}"#).unwrap();
+        assert_eq!(extract_reduced_by(&v2), Some(2.0));
+        let v3: serde_json::Value = serde_json::from_str(r#"{"order_id":"x"}"#).unwrap();
+        assert_eq!(extract_reduced_by(&v3), None);
+    }
+
+    #[test]
+    fn parses_signed_position() {
+        // position field is signed: + long YES, − long NO; fp variant is a string.
+        let p: serde_json::Value = serde_json::from_str(r#"{"ticker":"T","position":-3}"#).unwrap();
+        assert_eq!(extract_num(&p, &["position", "position_fp"]), Some(-3.0));
+        let p2: serde_json::Value =
+            serde_json::from_str(r#"{"ticker":"T","position_fp":"1.00"}"#).unwrap();
+        assert_eq!(extract_num(&p2, &["position", "position_fp"]), Some(1.0));
     }
 }

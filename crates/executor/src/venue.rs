@@ -28,6 +28,21 @@ const MS: i64 = 1_000_000;
 /// Async fill stream from a venue to the executor (the §8.6 ingestion path).
 pub type FillSender = tokio::sync::mpsc::UnboundedSender<Fill>;
 
+/// How a cancel resolved. The Kalshi cancel response is **synchronous from the
+/// matching engine** (no read-replica lag) and carries `reduced_by` — the
+/// contracts actually removed from the book — so `posted − reduced_by` is the
+/// exact fill count at the moment of removal. A 404 means the order is already
+/// TERMINAL (fully filled, or previously canceled): treating that as a generic
+/// error and dropping it is precisely the silent-orphan bug behind the 2026-07-02
+/// oversell incident, so it gets its own variant the caller MUST handle.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum CancelOutcome {
+    /// Canceled; `reduced_by` contracts were removed from the book.
+    Canceled { reduced_by: f64 },
+    /// The order no longer exists on the book (fully filled or already gone).
+    Gone,
+}
+
 #[async_trait]
 pub trait TradingVenue: Send + Sync {
     /// Submit one order; returns the immediate FAK result. The venue holds its
@@ -39,21 +54,42 @@ pub trait TradingVenue: Send + Sync {
     fn start(&self, fills: FillSender) -> Vec<JoinHandle<()>>;
     fn name(&self) -> &'static str;
 
-    // ── Maker-exit primitives (default: unsupported) ──
+    // ── Resting-order + reconcile primitives (default: unsupported) ──
     /// Place a resting (GTC, post-only) maker limit order at `intent.price`.
     /// Returns the venue `order_id`, or an error (e.g. rejected because it would
     /// cross). Only the live adapters implement this.
     async fn place_resting(&self, _intent: &OrderIntent) -> Result<String, String> {
         Err("venue does not support resting maker orders".into())
     }
-    /// Cancel a resting order; returns the contracts filled before the cancel took
-    /// effect (so a maker exit never loses a last-moment fill on cancel).
-    async fn cancel_order(&self, _order_id: &str) -> Result<f64, String> {
+    /// Cancel a resting order. `Ok(Canceled{reduced_by})` is authoritative fill
+    /// info (`posted − reduced_by` filled); `Ok(Gone)` means the order is already
+    /// terminal; `Err` is transport/signing only — the order state is UNKNOWN and
+    /// the caller must not assume it's gone.
+    async fn cancel_order(&self, _order_id: &str) -> Result<CancelOutcome, String> {
         Err("venue does not support cancel".into())
     }
-    /// Contracts filled so far on a resting order (poll for maker-exit fills).
-    async fn order_fill_count(&self, _order_id: &str) -> Result<f64, String> {
+    /// Contracts filled so far on a resting order. `Ok(None)` = the order isn't
+    /// visible on the read side (yet) — Kalshi's query replica lags the engine by
+    /// ~70-145ms, so a fresh order 404s here; that is NOT an error.
+    async fn order_fill_count(&self, _order_id: &str) -> Result<Option<f64>, String> {
         Err("venue does not support order status".into())
+    }
+    /// AUTHORITATIVE signed net position for one market (+long YES / −long NO),
+    /// from the venue's own records. The exit reconciler sizes every close off
+    /// this — never off internal accounting (which is what drifted in the
+    /// oversell incident). NOTE: the read side lags fills by ~100ms.
+    async fn market_position(&self, _market_id: &str) -> Result<f64, String> {
+        Err("venue does not support position query".into())
+    }
+    /// All nonzero market positions `(market_id, signed net)` — crash recovery:
+    /// at startup the executor spawns a reconciler for anything still open.
+    async fn open_positions(&self) -> Result<Vec<(String, f64)>, String> {
+        Err("venue does not support position query".into())
+    }
+    /// Account balance in USD — the real-balance kill switch reads this, never
+    /// the executor's self-reported P&L (which hid the incident's losses).
+    async fn balance(&self) -> Result<f64, String> {
+        Err("venue does not support balance query".into())
     }
 }
 

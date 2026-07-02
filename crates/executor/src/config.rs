@@ -113,7 +113,10 @@ pub struct EntryCfg {
 #[derive(Clone, Deserialize)]
 #[serde(default)]
 pub struct ExitCfg {
-    /// "cross" (default, backtest-validated) | "passive" (P3).
+    /// "cross" (default, backtest-validated, inline taker ladder) | "reconcile"
+    /// (decoupled per-market exit loop: authoritative position poll + resting
+    /// buy-the-opposite maker close; live adapters only). NOTE: the old "maker"
+    /// mode was REMOVED after the 2026-07-02 oversell incident.
     pub mode: String,
     pub retry_interval_ms: u64,
     pub step_c: f64,
@@ -121,6 +124,20 @@ pub struct ExitCfg {
     pub deadline_buffer_ms: u64,
     /// Safety cap on exit ladder rungs (sim/live).
     pub max_attempts: u32,
+    // ── reconcile-mode knobs ──
+    /// Exit-loop cycle period. Each cycle = one filtered position poll (~5ms) +
+    /// possibly one cancel/post. Also the natural retry rate limit.
+    pub cadence_ms: u64,
+    /// Filled→Rest transit: how long the exit loop stays frozen after an entry
+    /// fill. MUST exceed the venue's read-replication lag (~145ms measured) so
+    /// the first post-gate position poll includes the entry's fill.
+    pub transit_ms: u64,
+    /// Stuck-state guard: force Submitted→Rest after this long (entry task died
+    /// mid-flight); the reconciler then heals from the authoritative position.
+    pub submitted_timeout_ms: u64,
+    /// After a cancel returns Gone (order terminal), wait this long before the
+    /// order-status read so the query replica has caught up.
+    pub settle_wait_ms: u64,
 }
 
 #[derive(Clone, Deserialize)]
@@ -134,6 +151,14 @@ pub struct RiskCfg {
     pub max_trades_per_min: u32,
     pub cooldown_ms: u64,
     pub stale_ms: i64,
+    /// Reconcile mode: max |net| contracts per market. An entry that would push
+    /// the market's net exposure past this (in its direction) is rejected;
+    /// entries that REDUCE |net| (opposite direction) are always allowed.
+    pub max_net_per_market: f64,
+    /// Real-balance kill switch: poll the venue's actual balance and halt NEW
+    /// entries below this floor (exit loops keep running to flatten). 0 = off.
+    /// Never derived from self-reported P&L — that hid the oversell incident.
+    pub min_balance_usd: f64,
 }
 
 #[derive(Clone, Deserialize)]
@@ -215,6 +240,10 @@ impl Default for ExitCfg {
             max_slip_c: 0.05,
             deadline_buffer_ms: 5000,
             max_attempts: 4,
+            cadence_ms: 200,
+            transit_ms: 1000,
+            submitted_timeout_ms: 3000,
+            settle_wait_ms: 150,
         }
     }
 }
@@ -229,6 +258,8 @@ impl Default for RiskCfg {
             max_trades_per_min: 6,
             cooldown_ms: 2000,
             stale_ms: 1500,
+            max_net_per_market: 1.0,
+            min_balance_usd: 0.0,
         }
     }
 }

@@ -69,6 +69,21 @@ pub fn traded_instrument(target_yes: &str, direction: i8) -> String {
     target_yes.to_string() // unknown orientation: trade the target as-is
 }
 
+/// The other outcome token of the same market (YES↔NO, UP↔DOWN). Works from
+/// EITHER side (unlike `traded_instrument`, which assumes a YES-side input).
+/// The exit reconciler closes a position by BUYING this complement.
+pub fn complement(instrument: &str) -> String {
+    if let Some(spec) = venue_of(instrument) {
+        if let Some(stem) = instrument.strip_suffix(&format!(".{}", spec.yes_label)) {
+            return format!("{stem}.{}", spec.no_label);
+        }
+        if let Some(stem) = instrument.strip_suffix(&format!(".{}", spec.no_label)) {
+            return format!("{stem}.{}", spec.yes_label);
+        }
+    }
+    instrument.to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -101,5 +116,14 @@ mod tests {
         // Kalshi YES/NO
         assert_eq!(traded_instrument("kalshi.KXBTC15M-1.YES", 1), "kalshi.KXBTC15M-1.YES");
         assert_eq!(traded_instrument("kalshi.KXBTC15M-1.YES", -1), "kalshi.KXBTC15M-1.NO");
+    }
+
+    #[test]
+    fn complement_flips_either_side() {
+        assert_eq!(complement("kalshi.KXBTC15M-1.YES"), "kalshi.KXBTC15M-1.NO");
+        assert_eq!(complement("kalshi.KXBTC15M-1.NO"), "kalshi.KXBTC15M-1.YES");
+        assert_eq!(complement("polymarket.0xabc.UP"), "polymarket.0xabc.DOWN");
+        assert_eq!(complement("polymarket.0xabc.DOWN"), "polymarket.0xabc.UP");
+        assert_eq!(complement("binance.usdt_perp.BTCUSDT"), "binance.usdt_perp.BTCUSDT");
     }
 }
