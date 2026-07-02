@@ -593,7 +593,11 @@ impl Engine {
                 fee_rate: plan.params.fee_rate,
             });
         }
-        let exit_due = entry.first_ts_ns + plan.hold_ms as i64 * MS;
+        // Cap the hold at the exit deadline: with min_tte low/zero a trade can enter
+        // near settle, and a full hold_ms would sleep PAST the deadline (even past
+        // settlement), stranding the position. min() makes the hold deadline-aware —
+        // a no-op for normal-TTE trades (hold ends well before the deadline).
+        let exit_due = (entry.first_ts_ns + plan.hold_ms as i64 * MS).min(plan.exit_deadline_ns);
         sleep_until(exit_due).await;
 
         // ── EXITING: cross ladder, deepening only on misses (§6.2) ──
