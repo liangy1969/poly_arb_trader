@@ -937,11 +937,11 @@ impl Engine {
                 break;
             }
             let Some(book) = self.top(&inst) else { break };
+            // No drift-from-signal give-up (removed 2026-07-03): with chase_c ==
+            // max_chase_total_c it degenerated to "abandon on ANY uptick", killing
+            // burst entries pre-flight. The IOC is bounded by the live ask + chase_c
+            // limit, the entry TTL, max_attempts, and sizing — that's the risk cap.
             let cap = book.best_ask + self.cfg.entry.chase_c;
-            if cap - plan.signal_ask > self.cfg.entry.max_chase_total_c {
-                self.report(&plan.trade_id, &inst, "Entering", "ask ran past chase cap");
-                break;
-            }
             let remaining = (plan.size_shares - entry.qty).max(0.0);
             let intent = self.intent(plan, "E", attempt, Side::Buy, cap, remaining);
             let venue = self.venue.clone();
