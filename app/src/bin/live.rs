@@ -26,11 +26,49 @@ use arb_recorder::Recorder;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
-        .init();
+    // Two sinks:
+    //  - stdout (the run log, redirected to /tmp/live-trade.log; truncated per
+    //    relaunch — heartbeats/collector noise, disposable)
+    //  - data/trader-events.log: APPEND-ONLY, survives relaunches. Analysis
+    //    targets only (probes, chase, exit reconciler, trade records, signals) —
+    //    low volume, so it's disk-safe on the small box. Added after per-run log
+    //    truncation destroyed the PXPROBE dataset for a filled live trade.
+    use tracing_subscriber::filter::{EnvFilter, LevelFilter, Targets};
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    use tracing_subscriber::Layer as _;
+    let stdout_layer = tracing_subscriber::fmt::layer().with_filter(
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+    );
+    let _ = std::fs::create_dir_all("data");
+    let events_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("data/trader-events.log");
+    match events_file {
+        Ok(f) => {
+            let events_layer = tracing_subscriber::fmt::layer()
+                .with_writer(std::sync::Arc::new(f))
+                .with_ansi(false)
+                .with_filter(
+                    Targets::new()
+                        .with_target("pxprobe", LevelFilter::INFO)
+                        .with_target("chase", LevelFilter::INFO)
+                        .with_target("exit", LevelFilter::INFO)
+                        .with_target("executor", LevelFilter::INFO)
+                        .with_target("exec", LevelFilter::INFO)
+                        .with_target("signal", LevelFilter::INFO)
+                        .with_target("hold", LevelFilter::INFO)
+                        .with_target("maker", LevelFilter::INFO),
+                );
+            tracing_subscriber::registry().with(stdout_layer).with(events_layer).init();
+            tracing::info!("trader events -> data/trader-events.log (append; survives relaunches)");
+        }
+        Err(e) => {
+            tracing_subscriber::registry().with(stdout_layer).init();
+            tracing::warn!("events log unavailable ({e}); stdout only");
+        }
+    }
 
     let path = std::env::args().nth(1).unwrap_or_else(|| "config/local.yaml".into());
     let cfg = AppConfig::load(&path)?;
