@@ -40,9 +40,12 @@ HID = 32
 EPOCHS = 25
 BATCH = 16384
 LR = 2e-3
-LAMBDA_B = 1.0e-4  # prior weight on (Δb/50)^2  (dollars scale 50)
-LAMBDA_R = 1.0e-3  # prior weight on Δρ^2
-WD = 1e-5
+# MODE=structured (default): logit = z'*exp(u(z',logtau)), BCE + priors + wd.
+# MODE=direct (ablation):    logit = MLP(z',logtau) raw, BCE ONLY (no priors/wd).
+MODE = os.environ.get("MODE", "structured")
+LAMBDA_B = 0.0 if MODE == "direct" else 1.0e-4  # prior on (Δb/50)^2
+LAMBDA_R = 0.0 if MODE == "direct" else 1.0e-3  # prior on Δρ^2
+WD = 0.0 if MODE == "direct" else 1e-5
 P_CLIP = 0.01
 SEED = 7
 VAL_FRAC = 0.10
@@ -84,17 +87,22 @@ def load(data_dir):
 
 
 class Surface(nn.Module):
-    """logit = z' * exp(clamp(u(z', log tau')))  — tiny, frozen-online."""
+    """structured: logit = z' * exp(clamp(u(z', log tau'))) — anchored surface.
+    direct (ablation): logit = MLP(z', log tau') raw — no anchors."""
 
-    def __init__(self):
+    def __init__(self, mode=MODE):
         super().__init__()
+        self.mode = mode
         self.net = nn.Sequential(
             nn.Linear(2, HID), nn.Tanh(), nn.Linear(HID, HID), nn.Tanh(), nn.Linear(HID, 1)
         )
 
     def forward(self, zp, log_tau):
         x = torch.stack([zp, log_tau], dim=-1)
-        u = CLAMP * torch.tanh(self.net(x).squeeze(-1) / CLAMP)
+        raw = self.net(x).squeeze(-1)
+        if self.mode == "direct":
+            return raw
+        u = CLAMP * torch.tanh(raw / CLAMP)
         return zp * torch.exp(u)
 
 
@@ -243,7 +251,7 @@ def main():
         if isinstance(mod, nn.Linear):
             layers.append({"w": mod.weight.tolist(), "b": mod.bias.tolist()})
     export = {
-        "arch": {"hidden": HID, "clamp": CLAMP, "act": "tanh", "logit": "zp*exp(u)"},
+        "arch": {"hidden": HID, "clamp": CLAMP, "act": "tanh", "logit": "raw" if MODE == "direct" else "zp*exp(u)", "mode": MODE},
         "features": "zp=(spot-b)/s/sqrt(tte/900); u_in=[zp, log(tte/900)]",
         "rho_bar": float(rho_bar),
         "b_prior": "strike",
