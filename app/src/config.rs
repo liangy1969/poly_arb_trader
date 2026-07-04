@@ -18,11 +18,18 @@ use arb_recorder::RecorderCfg;
 pub struct RunCfg {
     /// Seconds to run; `0` = until Ctrl-C.
     pub duration_secs: u64,
+    /// Model-training sampler: when non-empty, write 50ms-grid aligned rows
+    /// (perp top + each active Kalshi YES book + tte) to daily CSVs in this
+    /// directory. One clock, both sources — the resolution the REST backfill
+    /// can't provide. Empty = off.
+    pub sample_dir: String,
+    /// Sampler grid period (ms).
+    pub sample_ms: u64,
 }
 
 impl Default for RunCfg {
     fn default() -> Self {
-        RunCfg { duration_secs: 0 }
+        RunCfg { duration_secs: 0, sample_dir: String::new(), sample_ms: 50 }
     }
 }
 

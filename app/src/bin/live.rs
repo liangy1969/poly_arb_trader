@@ -162,6 +162,137 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    // --- 50ms aligned sampler (model-training data, run.sample_dir) ---
+    // One clock, both sources: every sample_ms tick, write a row per active
+    // Kalshi market with the CURRENT perp top + YES book top + tte. This is the
+    // time-aligned high-resolution series the REST backfill cannot provide
+    // (1s spot bars vs trade prints with unknown cross-source clock skew).
+    // Daily-rotated CSVs: <sample_dir>/YYYY-MM-DD.csv (gzip old days via cron).
+    let _sampler = if cfg.run.sample_dir.is_empty() {
+        None
+    } else {
+        let dir = cfg.run.sample_dir.clone();
+        let period = Duration::from_millis(cfg.run.sample_ms.max(10));
+        let mut sub = bus.subscribe("market.#", 8192, Policy::Conflate(key_by_instrument));
+        Some(tokio::spawn(async move {
+            use std::collections::HashMap;
+            use std::io::Write as _;
+            #[derive(Default, Clone, Copy)]
+            struct KTop {
+                ybid: f64,
+                yask: f64,
+                ybsz: f64,
+                yasz: f64,
+                expiry_ns: i64,
+                book_ns: i64,
+            }
+            std::fs::create_dir_all(&dir).ok();
+            let mid_of = |inst: &str| -> Option<String> {
+                inst.strip_prefix("kalshi.")?.rsplit_once('.').map(|(m, _)| m.to_string())
+            };
+            let mut perp: Option<(f64, f64)> = None;
+            let mut books: HashMap<String, KTop> = HashMap::new();
+            let mut expiry: HashMap<String, i64> = HashMap::new();
+            let mut out: Option<(String, std::io::BufWriter<std::fs::File>)> = None;
+            let mut tick = tokio::time::interval(period);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut n_since_flush = 0u32;
+            tracing::info!("sampler up -> {dir} @ {}ms grid", period.as_millis());
+            loop {
+                tokio::select! {
+                    ev = sub.recv() => {
+                        let Some(ev) = ev else { break };
+                        match &ev.payload {
+                            Payload::Book(b) if b.instrument == "binance.usdt_perp.BTCUSDT" => {
+                                if let (Some(&(pb, _)), Some(&(pa, _))) = (b.bids.first(), b.asks.first()) {
+                                    perp = Some((pb, pa));
+                                }
+                            }
+                            Payload::Book(b) if b.instrument.starts_with("kalshi.") && b.instrument.ends_with(".YES") => {
+                                if let Some(mid) = mid_of(&b.instrument) {
+                                    let e = books.entry(mid.clone()).or_default();
+                                    e.ybid = b.bids.first().map(|&(p, _)| p).unwrap_or(0.0);
+                                    e.ybsz = b.bids.first().map(|&(_, s)| s).unwrap_or(0.0);
+                                    e.yask = b.asks.first().map(|&(p, _)| p).unwrap_or(0.0);
+                                    e.yasz = b.asks.first().map(|&(_, s)| s).unwrap_or(0.0);
+                                    e.book_ns = b.recv_ts_ns;
+                                    if e.expiry_ns == 0 {
+                                        if let Some(&x) = expiry.get(&mid) { e.expiry_ns = x; }
+                                    }
+                                }
+                            }
+                            Payload::Meta(m) if m.instrument.starts_with("kalshi.") => {
+                                if let (Some(mid), Some(x)) = (mid_of(&m.instrument), m.expiry_ts_ns) {
+                                    expiry.insert(mid.clone(), x);
+                                    if let Some(e) = books.get_mut(&mid) { e.expiry_ns = x; }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    _ = tick.tick() => {
+                        let Some((pb, pa)) = perp else { continue };
+                        let now = arb_core::now_ns();
+                        // rotate the daily file
+                        let day = {
+                            let secs = now / 1_000_000_000;
+                            let days = secs / 86_400;
+                            // civil date from unix days (valid 2000-2099)
+                            let (mut y, mut doy) = (1970i64, days);
+                            loop {
+                                let len = if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 { 366 } else { 365 };
+                                if doy < len { break; }
+                                doy -= len; y += 1;
+                            }
+                            let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+                            let ml = [31, if leap {29} else {28}, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+                            let mut m = 0usize;
+                            while doy >= ml[m] { doy -= ml[m]; m += 1; }
+                            format!("{y:04}-{:02}-{:02}", m + 1, doy + 1)
+                        };
+                        if out.as_ref().map(|(d, _)| d != &day).unwrap_or(true) {
+                            if let Some((_, mut w)) = out.take() { let _ = w.flush(); }
+                            let path = format!("{dir}/{day}.csv");
+                            let fresh = !std::path::Path::new(&path).exists();
+                            match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+                                Ok(f) => {
+                                    let mut w = std::io::BufWriter::new(f);
+                                    if fresh {
+                                        let _ = writeln!(w, "ts_ms,ticker,tte_ms,perp_bid,perp_ask,ybid,yask,ybid_sz,yask_sz");
+                                    }
+                                    out = Some((day, w));
+                                }
+                                Err(e) => { tracing::warn!("sampler open {path}: {e}"); continue; }
+                            }
+                        }
+                        let Some((_, w)) = out.as_mut() else { continue };
+                        for (mid, k) in &books {
+                            if k.expiry_ns == 0 || (k.yask <= 0.0 && k.ybid <= 0.0) {
+                                continue;
+                            }
+                            let tte_ms = (k.expiry_ns - now) / 1_000_000;
+                            if !(-10_000..=1_200_000).contains(&tte_ms) {
+                                continue; // only the active window (+/- a little)
+                            }
+                            let _ = writeln!(
+                                w,
+                                "{},{},{},{:.2},{:.2},{:.3},{:.3},{:.1},{:.1}",
+                                now / 1_000_000, mid, tte_ms, pb, pa, k.ybid, k.yask, k.ybsz, k.yasz
+                            );
+                        }
+                        n_since_flush += 1;
+                        if n_since_flush >= 20 { // ~1s
+                            let _ = w.flush();
+                            n_since_flush = 0;
+                            // drop books long past settle so the map stays small
+                            books.retain(|_, k| k.expiry_ns == 0 || k.expiry_ns > now - 3_600_000_000_000);
+                        }
+                    }
+                }
+            }
+        }))
+    };
+
     // --- modules (all from config) ---
     let mut recorder = Recorder::new(cfg.recorder.clone());
     let mut poly = PolyCollector::new(cfg.polymarket.clone());
