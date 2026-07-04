@@ -217,8 +217,8 @@ def main():
             opt.zero_grad()
             loss.backward()
             opt.step()
-            tot += float(bce) * len(ix)
-        print(f"epoch {ep + 1}/{EPOCHS} train_bce={tot / n_tr:.4f} rho_bar={float(rho_bar):.3f} (s≈${math.exp(float(rho_bar)):.0f})", flush=True)
+            tot += float(bce.detach()) * len(ix)
+        print(f"epoch {ep + 1}/{EPOCHS} train_bce={tot / n_tr:.4f} rho_bar={float(rho_bar):.3f} (s~${math.exp(float(rho_bar)):.0f})", flush=True)
 
     # ── eval: online rehearsal on validation events ──
     surface.eval()
