@@ -181,3 +181,46 @@ path); executor untouched:
 | Eval deep-dive (gap×horizon×tte) | NEXT |
 | Rust `FairGapRule` | to build (phase 3) |
 | Shadow → live | gated on the above |
+
+## 9. VERDICT (2026-07-06, on 239 events of 50ms one-clock data)
+
+Every test below on real bid/ask books, causal per-event `(b,s)` fits,
+strictly out-of-sample surface (trained on the May–Jun backfill). Tools:
+`tools/sim_50ms.py`, `tools/train_lead.py`.
+
+**The model is an excellent coincident tracker and nothing more.**
+
+1. **Tracking:** held-out KL vs the market mid ≈ 0.008–0.013 nats — the
+   2-input surface + per-event affine calibration nearly replicates the
+   market's map. The architecture works exactly as designed.
+2. **No lead:** predicting `mid(t+n)`, the optimal blend weight on `fair`
+   is **α\* = 0.00 for every n ∈ [1s, 60s]**; a residual-on-martingale MLP
+   trained directly on future mids learns `g → 0` (and hurts OOS at 30s).
+3. **No outcome edge at any tte:** market beats model on outcome-BCE in
+   every minute bucket (paired t < 2 everywhere the model looked ahead early
+   at n=109 — regressed to null at n=197); the market's advantage in the
+   FINAL minute is the only significant cell (+0.073, t = 2.7): the CF
+   settlement index converges and the market sees it, the perp doesn't.
+4. **Strategies (episode triggers, expanding refits, real costs):** every
+   cell of {taker, maker-∞, maker-10s} × {δ = 1–20¢} × {5 entry minutes} ×
+   {settle, revert} lies within ~1σ of zero. Maker entries are DOMINATED by
+   taker at all δ: the fill itself is adverse information (win% −5 to −9
+   pts, immediate — no fill-window escapes it). Reversion gaps close fast
+   (93–98% in 10–30s) but mostly from the fair side (perp noise), costing
+   the round trip.
+5. **Incidental positives that decayed with data or methodology fixes:**
+   late-window settle pocket (+19¢@n=7 → +9.7¢@n=12 → negative under
+   expanding fits); early-window BCE advantage (died at n=197); last-minute
+   reversion column (static-fit artifact).
+
+**Pre-registered for ONE-SHOT confirmation on ~Jul 13 fresh data (no
+further slicing of the current dataset):**
+- (a) settle-hold, expanding fit, taker, |gap| ≥ 15¢, tte ∈ (60s, 300s]
+  — observed +6.6¢/trade, n=72, t ≈ 1.2;
+- (b) the minute-4 (tte 240–180s) column — positive in ~every table
+  (+1.6…+5.1¢), never individually significant.
+
+**Forward forks:** new information inputs (order flow, book imbalance, the
+CF index itself) — the only route left to outcome edge; or the market-making
+reframe (two-sided quoting anchored on the model's calibration — its actual
+demonstrated strength); or park with the collector accumulating.
