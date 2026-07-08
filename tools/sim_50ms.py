@@ -556,7 +556,18 @@ def main():
                         dmid = mid_p[k] - mid_p[j]
                     else:
                         dfair = dmid = float("nan")
-                    tdump.append((dl, t, won, cost, abs(gap[k]), tte_p[k], side_yes, dfair, dmid))
+                    # chase: executable entry price (our side's ask) at +100/300/500ms
+                    # after the trigger row — quantifies fill slippage vs order latency.
+                    def ask_at(kk):
+                        return yask_p[kk] if side_yes else 1.0 - ybid_p[kk]
+                    fut = []
+                    for h in (0.1, 0.3, 0.5):
+                        jj = k
+                        while jj + 1 < len(tte_p) and (tte_p[k] - tte_p[jj]) < h:
+                            jj += 1
+                        fut.append(ask_at(jj) if (tte_p[k] - tte_p[jj]) >= h and (tte_p[k] - tte_p[jj]) <= h + 1.0 else float("nan"))
+                    tdump.append((dl, t, won, cost, abs(gap[k]), tte_p[k], side_yes, dfair, dmid,
+                                  ask_at(k), fut[0], fut[1], fut[2]))
                 if EXIT_MODE == "revert":
                     elapsed = tte_p[k] - tte_p[k + 1 :]
                     closed = np.abs(gap[k + 1 :]) <= EXIT_EPS
@@ -587,10 +598,11 @@ def main():
     if TRADES_OUT:
         with open(TRADES_OUT, "w", newline="") as f:
             w = csv.writer(f)
-            w.writerow(["delta", "ticker", "won", "cost", "gap", "tte", "side_yes", "dfair1s", "dmid1s"])
+            w.writerow(["delta", "ticker", "won", "cost", "gap", "tte", "side_yes", "dfair1s", "dmid1s",
+                        "ask0", "ask100", "ask300", "ask500"])
             for r in tdump:
                 w.writerow([r[0], r[1], int(r[2]), f"{r[3]:.4f}", f"{r[4]:.4f}", f"{r[5]:.1f}", int(r[6]),
-                            f"{r[7]:.4f}", f"{r[8]:.4f}"])
+                            f"{r[7]:.4f}", f"{r[8]:.4f}", f"{r[9]:.3f}", f"{r[10]:.3f}", f"{r[11]:.3f}", f"{r[12]:.3f}"])
         print(f"trades -> {TRADES_OUT} ({len(tdump)} rows)")
 
     print(f"\n=== TEST ({len(test_ev)} events): fit tte>{FIT_TTE_S}s, trade tte<={FIT_TTE_S}s, REAL bid/ask entries, exit={EXIT_MODE} ===")
