@@ -79,6 +79,11 @@ FEAT_OFFSET_MS = float(os.environ.get("FEAT_OFFSET_MS", "0"))
 # columns (post-3759b5c rows) — causally exact, no join. Rows without sizes
 # are dropped (for every model, keeping row sets identical).
 FEAT_NATIVE = os.environ.get("FEAT_NATIVE", "") == "1"
+# MAX_ENTRIES_PER_EVENT: cap stacked episodes per event per delta (0 = off).
+# Motivation (2026-07-08 event-level study): losses concentrate in trending
+# events where the gap keeps re-opening — 25-trade one-sided pileups; you
+# stack the most exactly when you're most wrong.
+MAX_EV = int(os.environ.get("MAX_ENTRIES_PER_EVENT", "0"))
 # TRADES_OUT=path: dump per-trade rows (settle mode) for clustered stats.
 TRADES_OUT = os.environ.get("TRADES_OUT", "")
 
@@ -453,6 +458,7 @@ def main():
             armed = True
             run = 0
             k = 0
+            n_entered = 0
             N = len(gap)
             while k < N:
                 ag = abs(gap[k])
@@ -469,6 +475,9 @@ def main():
                 # ── ENTER at k ──
                 if ENTRY_MIN_TTE_S > 0 and tte_p[k] <= ENTRY_MIN_TTE_S:
                     break  # entry window closed for this event
+                if MAX_EV and n_entered >= MAX_EV:
+                    break  # per-event exposure cap reached
+                n_entered += 1
                 run = 0
                 armed = False
                 side_yes = gap[k] > 0
