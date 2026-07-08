@@ -75,6 +75,10 @@ FEAT_STALE_MS = float(os.environ.get("FEAT_STALE_MS", "1000"))
 # server-time-keyed features to model feed latency: offset=100 means a book
 # state stamped T becomes visible to the strategy at local time T+100ms.
 FEAT_OFFSET_MS = float(os.environ.get("FEAT_OFFSET_MS", "0"))
+# FEAT_NATIVE=1: compute imb1 from the sampler's own perp_bid_sz/perp_ask_sz
+# columns (post-3759b5c rows) — causally exact, no join. Rows without sizes
+# are dropped (for every model, keeping row sets identical).
+FEAT_NATIVE = os.environ.get("FEAT_NATIVE", "") == "1"
 # TRADES_OUT=path: dump per-trade rows (settle mode) for clustered stats.
 TRADES_OUT = os.environ.get("TRADES_OUT", "")
 
@@ -117,6 +121,12 @@ def load_samples(path):
                 tte = int(r["tte_ms"])
                 if tte <= 0 or tte > 900_000:
                     continue
+                pbs, pas = r.get("perp_bid_sz"), r.get("perp_ask_sz")
+                imb1 = float("nan")
+                if pbs is not None and pas is not None:
+                    b_sz, a_sz = float(pbs), float(pas)
+                    if b_sz + a_sz > 0:
+                        imb1 = (b_sz - a_sz) / (b_sz + a_sz)
                 e = ev.setdefault(r["ticker"], [])
                 e.append(
                     (
@@ -125,15 +135,16 @@ def load_samples(path):
                         (float(r["perp_bid"]) + float(r["perp_ask"])) / 2.0,
                         ybid,
                         yask,
+                        imb1,
                     )
                 )
-            except (ValueError, KeyError):
+            except (ValueError, KeyError, TypeError):
                 continue
     out = {}
     for t, rows in ev.items():
         rows.sort()
         a = np.array(rows, dtype=np.float64)
-        out[t] = {"ts": a[:, 0], "tte": a[:, 1], "spot": a[:, 2], "ybid": a[:, 3], "yask": a[:, 4]}
+        out[t] = {"ts": a[:, 0], "tte": a[:, 1], "spot": a[:, 2], "ybid": a[:, 3], "yask": a[:, 4], "imb1n": a[:, 5]}
     return out
 
 
@@ -226,7 +237,26 @@ def main():
     # ── extra features: align onto each event's rows; DROP rows w/o fresh
     # feature (identical row sets whether or not the model consumes them) ──
     extras_names = js.get("extras", [])
-    if FEAT:
+    if FEAT_NATIVE:
+        if [c for c in extras_names if c != "imb1"]:
+            sys.exit(f"FEAT_NATIVE only provides imb1; model wants {extras_names}")
+        mu = np.array(js.get("mu", [0.0] * len(extras_names)))
+        sd = np.array(js.get("sd", [1.0] * len(extras_names)))
+        dropped = kept = 0
+        for t, d in ev.items():
+            ok = ~np.isnan(d["imb1n"])
+            if extras_names:
+                d["X"] = np.clip((d["imb1n"][:, None] - mu) / sd, -5, 5)
+            else:
+                d["X"] = np.zeros((len(d["ts"]), 0))
+            for k in list(d):
+                if k != "X":
+                    d[k] = d[k][ok]
+            d["X"] = d["X"][ok]
+            dropped += int((~ok).sum())
+            kept += int(ok.sum())
+        print(f"native imb1: kept {kept:,} rows, dropped {dropped:,} (no sizes)")
+    elif FEAT:
         ft, fcols = load_feat_file(FEAT)
         ft = ft + int(FEAT_OFFSET_MS)
         mu = np.array(js.get("mu", [0.0] * len(extras_names)))
