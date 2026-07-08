@@ -26,6 +26,9 @@ import time
 import urllib.request
 
 SOCKS = "127.0.0.1:1081"
+CB_PRODUCT = os.environ.get("CB_PRODUCT", "BTC-USD")
+VENUES = [v for v in os.environ.get("VENUES", "").split(",") if v]
+MAX_CLOSE_TS = int(os.environ.get("MAX_CLOSE_TS", "0"))
 PACE = {"bitstamp": 0.35, "kraken": 0.6, "coinbase": 0.25, "binance_p": 0.15}
 
 
@@ -86,7 +89,7 @@ _CB_ID_CACHE = {}  # rough (ts -> trade_id) anchors to speed successive searches
 
 
 def _cb_page(before=None, limit=1000):
-    url = f"https://api.exchange.coinbase.com/products/BTC-USD/trades?limit={limit}"
+    url = f"https://api.exchange.coinbase.com/products/{CB_PRODUCT}/trades?limit={limit}"
     if before:
         url += f"&after={before}"  # exchange API: 'after' pages BACKWARD in ids
     return http_json(url)
@@ -175,6 +178,8 @@ FETCHERS = {
     "coinbase": fetch_coinbase,
     "binance_p": fetch_binance_perp,
 }
+if VENUES:
+    FETCHERS = {k: v for k, v in FETCHERS.items() if k in VENUES}
 
 
 def main():
@@ -187,7 +192,7 @@ def main():
     events = []
     with open(os.path.join(data_dir, "events_meta.csv")) as f:
         for r in csv.DictReader(f):
-            if int(r["open_ts"]) >= cutoff:
+            if int(r["open_ts"]) >= cutoff and (not MAX_CLOSE_TS or int(r["close_ts"]) <= MAX_CLOSE_TS):
                 events.append((r["ticker"], int(r["open_ts"]), int(r["close_ts"])))
     events.sort(key=lambda x: x[1])
     print(f"events in last {days}d: {len(events)}", flush=True)
