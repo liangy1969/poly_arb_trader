@@ -224,3 +224,93 @@ further slicing of the current dataset):**
 CF index itself) — the only route left to outcome edge; or the market-making
 reframe (two-sided quoting anchored on the model's calibration — its actual
 demonstrated strength); or park with the collector accumulating.
+
+## 10. THE MICROSTRUCTURE ARC (2026-07-07/08) — two assets, three venues, and where the null actually lives
+
+One research day, following §9's "new information inputs" fork. Every offline
+claim below used the standard protocol (chronological split, causal (Δb,Δρ)
+fit tte>300s, core window 300–60s); every strategy number is settle-mode,
+expanding fits, taker entries, real books.
+
+### 10.1 Data infrastructure built / discovered
+- **`e:\crypto` lake** (discovered): 200GB multi-venue microstructure archive
+  — binance/bybit/okx × SPOT+PERP × BTC/ETH, full-depth L2 @~105ms
+  (500 lvls), trades w/ aggressor, funding/OI/liquidations, mark+index,
+  2026-05-24→ongoing, zero day gaps, ns timestamps (exch/recv/ingest).
+  Also `e:\poly\crypto_collector`: full-depth **Kalshi** books Jun 21–24
+  (308 events, ~117ms) — Kalshi-side depth still untested.
+- **Sampler upgrades** (the 50ms collector, now 23 columns): perp + coinbase
+  top-of-book **sizes**; **server-time ages** (`ts_ms − age` = exchange
+  stamp; perp feed measured ~128ms behind Binance's clock, coinbase ~13ms);
+  **binance SPOT** feed (second collector via tunnel; spot bookTicker has no
+  exchange ts — spot_age is local-only); **second app instance for
+  KXETH15M** (per-asset config: `run.perp_instrument`, `run.cb_product`,
+  `TRADER_EVENTS_LOG`; kill patterns: `pkill -f "kalshi-{trade,eth}\.yaml$"`,
+  never combined with relaunch in one ssh command).
+- **Directive**: simulations use ONLY online-collected sampler data. Lake
+  joins remain legitimate for offline training/calibration studies.
+
+### 10.2 Methodology lessons (each cost us a wrong number first)
+1. **Recv-time cross-collector joins flatter fast features.** The perp-imb1
+   strategy "edge" (+0.106/ev, t=+1.44) collapsed to +0.029/ev (t=+0.36)
+   when the book was re-joined on Binance server time + 100ms feed latency.
+   ~Half the apparent gain was sub-100ms freshness production cannot have —
+   even though the two clocks agree to <50ms (price-diff xcorr). Native
+   sampler columns are causally exact by construction; prefer them always.
+2. **Event-cluster everything.** +$16.6/day headlines deflate to t≈0.7; the
+   P&L distribution is fat-tailed in BOTH directions at event level.
+3. **Episode stacking is auto-adverse.** Median event ≈ 0; the tails are
+   25-trade one-sided pileups — the gap re-opens exactly when you're most
+   wrong, so uncapped size concentrates in the worst events (worst −$8.9 vs
+   best +$2.9). Caps (1–3/event) truncate both tails: variance control, not
+   edge (the Jul4–7 uncapped imb1 "+$16.6" was pileups that happened to win
+   — flipped to −$8.8 under cap=3).
+4. **Final-minute rows must be excluded from surface TRAINING** (was only
+   excluded from eval; user-caught). Retraining all six surfaces with
+   SKIP_LAST_S=60 flipped same-day BTC base from −$21.6 to +$3.2 (win% 39.5
+   →51.8): much of what looked like adverse selection was settlement-regime
+   contamination leaking through the smooth log-τ axis. x60 surfaces are the
+   standard; they extrapolate below 60s → pair with ENTRY_MIN_TTE_S=60.
+
+### 10.3 Features and assets (offline, standard protocol)
+- **Perp book imbalance (BTC)**: tiny, internally consistent KL gain (~2%,
+  |t|≤2.0), spread control clean — real information, economically nil.
+- **ETH transfers wholesale**: same architecture, priors rescaled (s≈$4,
+  b_scale $1.5). Perp 0.00518 < spot 0.00584 KL (venue ordering replicates);
+  model ≥ market on outcome-BCE in core window on both inputs. Imbalance
+  features STRONGER on ETH (six |t|≥2.5 cells; thin market → book carries
+  more unpriced info) — still ~0.0004 nats, not tradable alone.
+- **Other venues**: bybit tracks worse than binance on both symbols (0.00679
+  BTC / 0.00600 ETH); coinbase-ETH ties spot in core but is WORSE in the
+  final minute (sparse prints lag the endgame — opposite of BTC, where
+  coinbase owns it).
+
+### 10.4 The central discovery: trigger attribution (ride vs fade)
+Decompose each entry's gap-opening over the prior 1s: model_push = s·Δfair
+vs market_pull = −s·Δmid (they sum exactly to the signed Δgap).
+- **Fading the Kalshi move loses everywhere** it's informed (BTC: −1.7 to
+  −9.6¢/trade; the 0.6–0.8 entry-price bucket is its worst face — buying
+  favorites at 70¢ that win 56–64%).
+- **Riding your input venue's own move is the only persistent green**: with
+  clean (x60) surfaces at δ=0.05, the ride class is positive in **6/6**
+  model×asset cells (+0.3¢ to +15.9¢/trade), fade negative in 5/6.
+- Ride quality orders by settlement relevance: perp < perp+imb1 < coinbase
+  (settlement-chain prints; positive in 4/4 coinbase cells even pre-x60).
+- Features mostly SHIFT trades between classes (imb1 converts fades into
+  rides) rather than improving either class.
+- ETH at δ=0.03 dissolves into noise (model moves ≈ quote flutter on the
+  thin book) — the gate needs the trigger large vs the venue's noise floor.
+
+### 10.5 The pre-registered spec (frozen 2026-07-08, score cold on fresh days)
+**Enter only when the MODEL side opened the gap (1s model-share > 0.75),
+δ ≥ 0.05, ENTRY_MIN_TTE_S=60, per-event cap ≤3, x60 surfaces, both assets;
+coinbase-input surfaces are the primary candidates.** Every input is
+computable live from collected columns. Expectations stated in advance: the
+ride/fade split survives; absolute profitability after costs remains the
+open question (attribution t's are 1.5–1.9 unclustered — suggestive only).
+
+### 10.6 Open
+- Coinbase-native imbalance surface (needs ~2 weeks of sampler cb sizes).
+- Kalshi-side depth features (crypto_collector books, Jun 21–24).
+- BRTI-replica collector remains the terminal info play.
+- okx offline venue cell (extraction done, table not run) — low priority.
