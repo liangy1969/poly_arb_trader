@@ -79,6 +79,15 @@ FEAT_OFFSET_MS = float(os.environ.get("FEAT_OFFSET_MS", "0"))
 # columns (post-3759b5c rows) — causally exact, no join. Rows without sizes
 # are dropped (for every model, keeping row sets identical).
 FEAT_NATIVE = os.environ.get("FEAT_NATIVE", "") == "1"
+# PX_FROM_FEAT=1: use the FEAT file's `mid` column (as-of joined, offset
+# applied) as the MODEL PRICE INPUT instead of the sampler's perp column —
+# lets other-venue surfaces be simulated with their own venue's price.
+# Execution (kalshi book) stays from the sampler.
+PX_FROM_FEAT = os.environ.get("PX_FROM_FEAT", "") == "1"
+# PX_NATIVE=cb: model price = the sampler's own coinbase quote mid (cb_bid/
+# cb_ask, age<=5s) — the online-collected settlement-chain price. Rows
+# without a usable cb quote are dropped.
+PX_NATIVE = os.environ.get("PX_NATIVE", "")
 # MAX_ENTRIES_PER_EVENT: cap stacked episodes per event per delta (0 = off).
 # Motivation (2026-07-08 event-level study): losses concentrate in trending
 # events where the gap keeps re-opening — 25-trade one-sided pileups; you
@@ -132,6 +141,12 @@ def load_samples(path):
                     b_sz, a_sz = float(pbs), float(pas)
                     if b_sz + a_sz > 0:
                         imb1 = (b_sz - a_sz) / (b_sz + a_sz)
+                cbmid = float("nan")
+                cb_b, cb_a, cb_age = r.get("cb_bid"), r.get("cb_ask"), r.get("cb_age_ms")
+                if cb_b is not None and cb_a is not None and cb_age is not None:
+                    b_px, a_px, age = float(cb_b), float(cb_a), float(cb_age)
+                    if b_px > 0 and a_px > 0 and 0 <= age <= 5000:
+                        cbmid = (b_px + a_px) / 2.0
                 e = ev.setdefault(r["ticker"], [])
                 e.append(
                     (
@@ -141,6 +156,7 @@ def load_samples(path):
                         ybid,
                         yask,
                         imb1,
+                        cbmid,
                     )
                 )
             except (ValueError, KeyError, TypeError):
@@ -149,7 +165,7 @@ def load_samples(path):
     for t, rows in ev.items():
         rows.sort()
         a = np.array(rows, dtype=np.float64)
-        out[t] = {"ts": a[:, 0], "tte": a[:, 1], "spot": a[:, 2], "ybid": a[:, 3], "yask": a[:, 4], "imb1n": a[:, 5]}
+        out[t] = {"ts": a[:, 0], "tte": a[:, 1], "spot": a[:, 2], "ybid": a[:, 3], "yask": a[:, 4], "imb1n": a[:, 5], "cbmid": a[:, 6]}
     return out
 
 
@@ -186,7 +202,10 @@ def logit_of(fwd, spot, tte, b, s, extra=None):
 
 
 def load_feat_file(path):
-    """FEAT csv -> (t_ms sorted int64 array, {col: value array})."""
+    """FEAT csv -> (t_ms sorted int64 array, {col: value array}).
+
+    Accepts either a `t_ms` column (ms) or a `t` column (unix seconds, the
+    1s-grid extractor format)."""
     op = gzip.open if path.endswith(".gz") else open
     cols = None
     rows = []
@@ -196,9 +215,12 @@ def load_feat_file(path):
         for r in rd:
             rows.append(tuple(float(x) for x in r))
     a = np.array(rows, dtype=np.float64)
-    o = np.argsort(a[:, 0])
+    tcol = "t_ms" if "t_ms" in cols else "t"
+    ti = cols.index(tcol)
+    t = a[:, ti] * (1 if tcol == "t_ms" else 1000)
+    o = np.argsort(t)
     a = a[o]
-    return a[:, 0].astype(np.int64), {c: a[:, i] for i, c in enumerate(cols) if c != "t_ms"}
+    return t[o].astype(np.int64), {c: a[:, i] for i, c in enumerate(cols) if c not in ("t_ms", "t")}
 
 
 def fee(p):
@@ -242,6 +264,16 @@ def main():
     # ── extra features: align onto each event's rows; DROP rows w/o fresh
     # feature (identical row sets whether or not the model consumes them) ──
     extras_names = js.get("extras", [])
+    if PX_NATIVE == "cb":
+        kept = dropped = 0
+        for t, d in ev.items():
+            ok = ~np.isnan(d["cbmid"])
+            d["spot"] = d["cbmid"]
+            for k in list(d):
+                d[k] = d[k][ok]
+            dropped += int((~ok).sum())
+            kept += int(ok.sum())
+        print(f"native cb price: kept {kept:,} rows, dropped {dropped:,} (no fresh cb quote)")
     if FEAT_NATIVE:
         if [c for c in extras_names if c != "imb1"]:
             sys.exit(f"FEAT_NATIVE only provides imb1; model wants {extras_names}")
@@ -271,6 +303,8 @@ def main():
             idx = np.searchsorted(ft, d["ts"].astype(np.int64), side="right") - 1
             ok = idx >= 0
             ok[ok] &= (d["ts"][ok] - ft[idx[ok]]) <= FEAT_STALE_MS
+            if PX_FROM_FEAT:
+                d["spot"] = np.where(ok, fcols["mid"][np.maximum(idx, 0)], np.nan)
             if extras_names:
                 raw = np.stack([fcols[c][np.maximum(idx, 0)] for c in extras_names], axis=1)
                 d["X"] = np.clip((raw - mu) / sd, -5, 5)

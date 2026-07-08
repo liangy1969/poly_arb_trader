@@ -235,6 +235,7 @@ async fn main() -> anyhow::Result<()> {
         let period = Duration::from_millis(cfg.run.sample_ms.max(10));
         let cbq = cb_quote.clone();
         let perp_inst = cfg.run.perp_instrument.clone();
+        let spot_inst = cfg.binance_spot.as_ref().map(|c| c.instrument.clone()).unwrap_or_default();
         let mut sub = bus.subscribe("market.#", 8192, Policy::Conflate(key_by_instrument));
         Some(tokio::spawn(async move {
             use std::collections::HashMap;
@@ -253,6 +254,8 @@ async fn main() -> anyhow::Result<()> {
                 inst.strip_prefix("kalshi.")?.rsplit_once('.').map(|(m, _)| m.to_string())
             };
             let mut perp: Option<(f64, f64, f64, f64, i64)> = None; // bid, ask, bid_sz, ask_sz, exch_ns
+            // binance SPOT top (settlement-chain sibling): same shape as perp
+            let mut spotq: (f64, f64, f64, f64, i64) = (f64::NAN, f64::NAN, 0.0, 0.0, 0);
             let mut books: HashMap<String, KTop> = HashMap::new();
             let mut expiry: HashMap<String, i64> = HashMap::new();
             let mut out: Option<(String, std::io::BufWriter<std::fs::File>)> = None;
@@ -268,6 +271,11 @@ async fn main() -> anyhow::Result<()> {
                             Payload::Book(b) if b.instrument == perp_inst => {
                                 if let (Some(&(pb, pbs)), Some(&(pa, pas))) = (b.bids.first(), b.asks.first()) {
                                     perp = Some((pb, pa, pbs, pas, b.exch_ts_ns));
+                                }
+                            }
+                            Payload::Book(b) if !spot_inst.is_empty() && b.instrument == spot_inst => {
+                                if let (Some(&(sb, sbs)), Some(&(sa, sas))) = (b.bids.first(), b.asks.first()) {
+                                    spotq = (sb, sa, sbs, sas, b.exch_ts_ns);
                                 }
                             }
                             Payload::Book(b) if b.instrument.starts_with("kalshi.") && b.instrument.ends_with(".YES") => {
@@ -320,7 +328,7 @@ async fn main() -> anyhow::Result<()> {
                                 Ok(f) => {
                                     let mut w = std::io::BufWriter::new(f);
                                     if fresh {
-                                        let _ = writeln!(w, "ts_ms,ticker,tte_ms,perp_bid,perp_ask,ybid,yask,ybid_sz,yask_sz,cb_bid,cb_ask,cb_age_ms,perp_bid_sz,perp_ask_sz,cb_bid_sz,cb_ask_sz,perp_age_ms,cb_srv_age_ms");
+                                        let _ = writeln!(w, "ts_ms,ticker,tte_ms,perp_bid,perp_ask,ybid,yask,ybid_sz,yask_sz,cb_bid,cb_ask,cb_age_ms,perp_bid_sz,perp_ask_sz,cb_bid_sz,cb_ask_sz,perp_age_ms,cb_srv_age_ms,spot_bid,spot_ask,spot_bid_sz,spot_ask_sz,spot_age_ms");
                                     }
                                     out = Some((day, w));
                                 }
@@ -334,6 +342,8 @@ async fn main() -> anyhow::Result<()> {
                         // (ts_ms - age = exchange stamp) + continuous feed-latency watch
                         let perp_age_ms = if p_exch_ns > 0 { (now - p_exch_ns) / 1_000_000 } else { -1 };
                         let cb_srv_age_ms = if cb_srv_ns > 0 { (now - cb_srv_ns) / 1_000_000 } else { -1 };
+                        let (sp_b, sp_a, sp_bs, sp_as, sp_exch_ns) = spotq;
+                        let spot_age_ms = if sp_exch_ns > 0 { (now - sp_exch_ns) / 1_000_000 } else { -1 };
                         for (mid, k) in &books {
                             if k.expiry_ns == 0 || (k.yask <= 0.0 && k.ybid <= 0.0) {
                                 continue;
@@ -344,9 +354,10 @@ async fn main() -> anyhow::Result<()> {
                             }
                             let _ = writeln!(
                                 w,
-                                "{},{},{},{:.2},{:.2},{:.3},{:.3},{:.1},{:.1},{:.2},{:.2},{},{:.3},{:.3},{:.4},{:.4},{},{}",
+                                "{},{},{},{:.2},{:.2},{:.3},{:.3},{:.1},{:.1},{:.2},{:.2},{},{:.3},{:.3},{:.4},{:.4},{},{},{:.2},{:.2},{:.4},{:.4},{}",
                                 now / 1_000_000, mid, tte_ms, pb, pa, k.ybid, k.yask, k.ybsz, k.yasz,
-                                cb_b, cb_a, cb_age_ms, pbs, pas, cb_bs, cb_as, perp_age_ms, cb_srv_age_ms
+                                cb_b, cb_a, cb_age_ms, pbs, pas, cb_bs, cb_as, perp_age_ms, cb_srv_age_ms,
+                                sp_b, sp_a, sp_bs, sp_as, spot_age_ms
                             );
                         }
                         n_since_flush += 1;
@@ -367,6 +378,7 @@ async fn main() -> anyhow::Result<()> {
     let mut poly = PolyCollector::new(cfg.polymarket.clone());
     let mut kalshi = KalshiCollector::new(cfg.kalshi.clone());
     let mut binance = BinanceCollector::new(cfg.binance.clone());
+    let mut binance_spot = cfg.binance_spot.clone().map(BinanceCollector::new);
     let mut databento = DatabentoCollector::new(cfg.databento.clone());
     let mut cryptospot = CryptoSpotCollector::new(cfg.cryptospot.clone());
     let mut processor = Processor::new(cfg.processor.clone());
@@ -383,6 +395,10 @@ async fn main() -> anyhow::Result<()> {
         kalshi.start(bus.clone()).await?;
     }
     binance.start(bus.clone()).await?;
+    if let Some(c) = binance_spot.as_mut() {
+        c.start(bus.clone()).await?;
+        tracing::info!("binance spot feed up");
+    }
     if cfg.databento.enabled {
         databento.start(bus.clone()).await?;
     }
@@ -415,6 +431,9 @@ async fn main() -> anyhow::Result<()> {
     }
     if cfg.databento.enabled {
         databento.stop().await?;
+    }
+    if let Some(c) = binance_spot.as_mut() {
+        c.stop().await?;
     }
     binance.stop().await?;
     if active_venue == "kalshi" {

@@ -57,6 +57,10 @@ ABLATIONS = [
     ("sprd", ["spread_bps"]),
     ("all", ["imb1", "imb5", "imb20", "imb100", "band5", "band10", "band25", "moff_bps"]),
 ]
+# ABL=base,imb1 : run only the named ablations (default: all of them)
+_abl = [a for a in os.environ.get("ABL", "").split(",") if a]
+if _abl:
+    ABLATIONS = [(n, e) for n, e in ABLATIONS if n in _abl]
 
 
 def load_feats(path):

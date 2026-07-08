@@ -47,6 +47,9 @@ impl Default for RunCfg {
 #[serde(default)]
 pub struct AppConfig {
     pub binance: BinanceCfg,
+    /// Optional second Binance feed (e.g. SPOT bookTicker) for the sampler's
+    /// settlement-chain columns. None = not spawned.
+    pub binance_spot: Option<BinanceCfg>,
     pub databento: DatabentoCfg,
     pub cryptospot: CryptoSpotCfg,
     pub polymarket: PolyCfg,

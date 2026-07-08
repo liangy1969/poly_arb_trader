@@ -23,7 +23,8 @@ except ImportError:
 
 MARKET = sys.argv[4] if len(sys.argv) > 4 else "USDT_PERP"
 SYMBOL = sys.argv[5] if len(sys.argv) > 5 else "BTCUSDT"
-LAKE = rf"E:\crypto\data\parquet\stream=l2_snapshot\venue=binance\market={MARKET}\symbol={SYMBOL}"
+VENUE = sys.argv[6] if len(sys.argv) > 6 else "binance"
+LAKE = rf"E:\crypto\data\parquet\stream=l2_snapshot\venue={VENUE}\market={MARKET}\symbol={SYMBOL}"
 BANDS_BPS = (5.0, 10.0, 25.0)
 KS = (1, 5, 20, 100)
 
