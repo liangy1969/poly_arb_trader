@@ -8,7 +8,8 @@
 #   band5/10/25     qty imbalance within +/-{5,10,25} bps of mid
 #   moff_bps        microprice offset in bps: ((a1*bq1+b1*aq1)/(bq1+aq1)-mid)/mid*1e4
 #
-# Usage: python extract_l2_features.py <start-date> <end-date> <out.csv.gz>
+# Usage: python extract_l2_features.py <start-date> <end-date> <out.csv.gz> [market] [symbol]
+#   market: USDT_PERP (default) | SPOT     symbol: BTCUSDT (default) | ETHUSDT
 import sys, os, glob, gzip, json
 from datetime import date, timedelta
 import numpy as np
@@ -20,7 +21,9 @@ try:
 except ImportError:
     loads = json.loads
 
-LAKE = r"E:\crypto\data\parquet\stream=l2_snapshot\venue=binance\market=USDT_PERP\symbol=BTCUSDT"
+MARKET = sys.argv[4] if len(sys.argv) > 4 else "USDT_PERP"
+SYMBOL = sys.argv[5] if len(sys.argv) > 5 else "BTCUSDT"
+LAKE = rf"E:\crypto\data\parquet\stream=l2_snapshot\venue=binance\market={MARKET}\symbol={SYMBOL}"
 BANDS_BPS = (5.0, 10.0, 25.0)
 KS = (1, 5, 20, 100)
 

@@ -43,6 +43,9 @@ FIT_STEPS = 150
 FIT_LR = 0.05
 FFILL_S = 5
 CLIP = 0.005
+# Asset-scale priors: BTC defaults; e.g. ETH (~$1.7k): RHO0~4, B_SCALE~1.5
+RHO0 = float(os.environ.get("RHO0", "150"))
+B_SCALE = float(os.environ.get("B_SCALE", "50"))
 
 FEATS = ["imb1", "imb5", "imb20", "imb100", "band5", "band10", "band25", "moff_bps", "spread_bps"]
 ABLATIONS = [
@@ -154,7 +157,7 @@ def run(extras, ev, order, fcols, train_all=False):
     net = Surface(len(fidx))
     d_b = nn.Parameter(torch.zeros(len(tr_ids)))
     d_r = nn.Parameter(torch.zeros(len(tr_ids)))
-    rho = nn.Parameter(torch.tensor(math.log(150.0)))
+    rho = nn.Parameter(torch.tensor(math.log(RHO0)))
     opt = torch.optim.Adam([{"params": net.parameters()}, {"params": [d_b, d_r, rho]}], lr=LR)
     E = torch.tensor(eidx)
     TT = torch.tensor(tte_a, dtype=torch.float32)
@@ -169,7 +172,7 @@ def run(extras, ev, order, fcols, train_all=False):
         for i in range(0, n, BATCH):
             ix = perm[i : i + BATCH]
             e = E[ix]
-            lo = logit_of(net, SP[ix], TT[ix], XF[ix], strikes[e] + 50.0 * d_b[e], torch.exp(rho + d_r[e]))
+            lo = logit_of(net, SP[ix], TT[ix], XF[ix], strikes[e] + B_SCALE * d_b[e], torch.exp(rho + d_r[e]))
             bce = nn.functional.binary_cross_entropy_with_logits(lo, Y[ix], weight=W[ix], reduction="sum") / W[ix].sum()
             opt.zero_grad()
             bce.backward()
@@ -197,7 +200,7 @@ def run(extras, ev, order, fcols, train_all=False):
         y = torch.tensor(np.clip(prob_v[fit], P_CLIP, 1 - P_CLIP), dtype=torch.float32)
         for _ in range(FIT_STEPS):
             o2.zero_grad()
-            lo = logit_of(net, ts, tt, xx, d["strike"] + 50.0 * db, torch.exp(rho_f + dr))
+            lo = logit_of(net, ts, tt, xx, d["strike"] + B_SCALE * db, torch.exp(rho_f + dr))
             nn.functional.binary_cross_entropy_with_logits(lo, y).backward()
             o2.step()
         with torch.no_grad():
@@ -206,7 +209,7 @@ def run(extras, ev, order, fcols, train_all=False):
                 torch.tensor(px_v[pred], dtype=torch.float32),
                 torch.tensor(tte_v[pred], dtype=torch.float32),
                 torch.tensor(xf_v[pred], dtype=torch.float32),
-                d["strike"] + 50.0 * db,
+                d["strike"] + B_SCALE * db,
                 torch.exp(rho_f + dr),
             )
             fair = torch.sigmoid(lo).numpy()
@@ -261,7 +264,7 @@ def main():
             "features": "zp=(px-b)/s/sqrt(tte/900); u_in=[zp, log(tte/900)] + extras",
             "rho_bar": r["rho"],
             "b_prior": "strike",
-            "b_scale": 50.0,
+            "b_scale": B_SCALE,
             "extras": extras,
             "mu": r["mu"],
             "sd": r["sd"],

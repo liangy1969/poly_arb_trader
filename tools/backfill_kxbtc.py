@@ -29,6 +29,8 @@ KALSHI = "https://api.elections.kalshi.com/trade-api/v2"
 SOCKS = "127.0.0.1:1081"
 PACE_S = 0.08  # ~6 req/s against Kalshi
 FFILL_MAX_S = 30  # carry the last trade price at most this far
+SERIES = os.environ.get("SERIES", "KXBTC15M")
+SYMBOL = os.environ.get("SYMBOL", "BTCUSDT")
 
 
 def kget(path, q=""):
@@ -46,7 +48,7 @@ def kget(path, q=""):
 def binance_1s(start_ms, end_ms):
     """One 15-min window fits a single 1000-row request."""
     url = (
-        "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1s"
+        f"https://api.binance.com/api/v3/klines?symbol={SYMBOL}&interval=1s"
         f"&startTime={start_ms}&endTime={end_ms}&limit=1000"
     )
     for attempt in range(4):
@@ -74,7 +76,7 @@ def settled_markets(days):
     min_close = int(time.time()) - days * 86400
     cursor, out = None, []
     while True:
-        q = f"?series_ticker=KXBTC15M&status=settled&limit=1000&min_close_ts={min_close}"
+        q = f"?series_ticker={SERIES}&status=settled&limit=1000&min_close_ts={min_close}"
         if cursor:
             q += f"&cursor={cursor}"
         d = kget("/markets", q)
