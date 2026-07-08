@@ -65,6 +65,14 @@ MAKER_FILL_S = float(os.environ.get("MAKER_FILL_S", "0"))
 MIN_OPEN_TS = float(os.environ.get("MIN_OPEN_TS", "0"))
 EXIT_EPS = float(os.environ.get("EXIT_EPS", "0.02"))
 EXIT_HORIZON_S = float(os.environ.get("EXIT_HORIZON_S", "120"))
+# FEAT=path: per-timestamp extra-feature CSV (t_ms,<name>,...). When set, rows
+# without a feature within FEAT_STALE_MS are DROPPED (for every model, so row
+# sets stay identical across model variants). The model JSON's "extras" list
+# selects which columns feed the net (z-scored with the JSON's mu/sd).
+FEAT = os.environ.get("FEAT", "")
+FEAT_STALE_MS = float(os.environ.get("FEAT_STALE_MS", "1000"))
+# TRADES_OUT=path: dump per-trade rows (settle mode) for clustered stats.
+TRADES_OUT = os.environ.get("TRADES_OUT", "")
 
 KALSHI = "https://api.elections.kalshi.com/trade-api/v2"
 
@@ -127,7 +135,8 @@ def load_samples(path):
 
 def build_surface(js):
     hid = js["arch"]["hidden"]
-    net = nn.Sequential(nn.Linear(2, hid), nn.Tanh(), nn.Linear(hid, hid), nn.Tanh(), nn.Linear(hid, 1))
+    n_extra = len(js.get("extras", []))
+    net = nn.Sequential(nn.Linear(2 + n_extra, hid), nn.Tanh(), nn.Linear(hid, hid), nn.Tanh(), nn.Linear(hid, 1))
     lin = [m for m in net if isinstance(m, nn.Linear)]
     for m, lw in zip(lin, js["layers"]):
         m.weight.data = torch.tensor(lw["w"], dtype=torch.float32)
@@ -136,8 +145,11 @@ def build_surface(js):
 
 
 def make_fwd(net, mode, clamp):
-    def fwd(zp, log_tau):
-        x = torch.stack([zp, log_tau], dim=-1)
+    def fwd(zp, log_tau, extra=None):
+        cols = [zp.unsqueeze(-1), log_tau.unsqueeze(-1)]
+        if extra is not None and extra.shape[-1] > 0:
+            cols.append(extra)
+        x = torch.cat(cols, dim=-1)
         raw = net(x).squeeze(-1)
         if mode == "direct":
             return raw
@@ -147,26 +159,43 @@ def make_fwd(net, mode, clamp):
     return fwd
 
 
-def logit_of(fwd, spot, tte, b, s):
+def logit_of(fwd, spot, tte, b, s, extra=None):
     tau = (tte / 900.0).clamp(1e-4, 1.0)
     zp = ((spot - b) / s) / tau.sqrt()
-    return fwd(zp, tau.log())
+    return fwd(zp, tau.log(), extra)
+
+
+def load_feat_file(path):
+    """FEAT csv -> (t_ms sorted int64 array, {col: value array})."""
+    op = gzip.open if path.endswith(".gz") else open
+    cols = None
+    rows = []
+    with op(path, "rt") as f:
+        rd = csv.reader(f)
+        cols = next(rd)
+        for r in rd:
+            rows.append(tuple(float(x) for x in r))
+    a = np.array(rows, dtype=np.float64)
+    o = np.argsort(a[:, 0])
+    a = a[o]
+    return a[:, 0].astype(np.int64), {c: a[:, i] for i, c in enumerate(cols) if c != "t_ms"}
 
 
 def fee(p):
     return FEE_RATE * p * (1.0 - p)
 
 
-def fit_event(fwd, spot, tte, target, strike, rho_bar, b_scale, steps=FIT_STEPS, init=None):
+def fit_event(fwd, spot, tte, target, strike, rho_bar, b_scale, steps=FIT_STEPS, init=None, extra=None):
     db = torch.tensor([init[0]] if init else [0.0], requires_grad=True)
     dr = torch.tensor([init[1]] if init else [0.0], requires_grad=True)
     opt = torch.optim.Adam([db, dr], lr=FIT_LR)
     ts = torch.tensor(spot, dtype=torch.float32)
     tt = torch.tensor(tte, dtype=torch.float32)
+    xx = torch.tensor(extra, dtype=torch.float32) if extra is not None else None
     y = torch.tensor(np.clip(target, P_CLIP, 1 - P_CLIP), dtype=torch.float32)
     for _ in range(steps):
         opt.zero_grad()
-        lo = logit_of(fwd, ts, tt, strike + b_scale * db, torch.exp(rho_bar + dr))
+        lo = logit_of(fwd, ts, tt, strike + b_scale * db, torch.exp(rho_bar + dr), xx)
         nn.functional.binary_cross_entropy_with_logits(lo, y).backward()
         opt.step()
     return db.detach(), dr.detach()
@@ -189,6 +218,36 @@ def main():
                 ev[t] = {k: np.concatenate([ev[t][k], d[k]]) for k in d}
             else:
                 ev[t] = d
+
+    # ── extra features: align onto each event's rows; DROP rows w/o fresh
+    # feature (identical row sets whether or not the model consumes them) ──
+    extras_names = js.get("extras", [])
+    if FEAT:
+        ft, fcols = load_feat_file(FEAT)
+        mu = np.array(js.get("mu", [0.0] * len(extras_names)))
+        sd = np.array(js.get("sd", [1.0] * len(extras_names)))
+        dropped = kept = 0
+        for t, d in ev.items():
+            idx = np.searchsorted(ft, d["ts"].astype(np.int64), side="right") - 1
+            ok = idx >= 0
+            ok[ok] &= (d["ts"][ok] - ft[idx[ok]]) <= FEAT_STALE_MS
+            if extras_names:
+                raw = np.stack([fcols[c][np.maximum(idx, 0)] for c in extras_names], axis=1)
+                d["X"] = np.clip((raw - mu) / sd, -5, 5)
+            else:
+                d["X"] = np.zeros((len(d["ts"]), 0))
+            for k in list(d):
+                if k != "X":
+                    d[k] = d[k][ok]
+            d["X"] = d["X"][ok]
+            dropped += int((~ok).sum())
+            kept += int(ok.sum())
+        print(f"feature align: kept {kept:,} rows, dropped {dropped:,} (stale>{FEAT_STALE_MS:.0f}ms)")
+    else:
+        if extras_names:
+            sys.exit(f"model needs extras {extras_names} but FEAT not set")
+        for d in ev.values():
+            d["X"] = np.zeros((len(d["ts"]), 0))
     meta = fetch_meta(sorted(ev), os.path.join(os.path.dirname(samples_paths[0]), "meta_cache.json"))
     # usable: settled, strike known, coverage in both fit and trade regions
     usable = []
@@ -222,6 +281,7 @@ def main():
                 d["tte"][sl],
                 d["spot"][sl],
                 mid,
+                d["X"][sl],
             )
         )
     if rows:
@@ -229,9 +289,11 @@ def main():
         tte_a = np.concatenate([r[1] for r in rows])
         spot_a = np.concatenate([r[2] for r in rows])
         mid_a = np.concatenate([r[3] for r in rows])
+        x_a = np.concatenate([r[4] for r in rows])
     else:  # ALL_TEST: nothing to tune on
         eidx = np.zeros(0, dtype=np.int64)
         tte_a = spot_a = mid_a = np.zeros(0)
+        x_a = np.zeros((0, len(extras_names)))
     strikes = torch.tensor([meta[t]["strike"] for t in tune_ev], dtype=torch.float32)
     print(f"fine-tune rows: {len(eidx)} (1s grid)")
 
@@ -245,6 +307,7 @@ def main():
     E = torch.tensor(eidx)
     TT = torch.tensor(tte_a, dtype=torch.float32)
     SP = torch.tensor(spot_a, dtype=torch.float32)
+    XA = torch.tensor(x_a, dtype=torch.float32)
     Y = torch.tensor(np.clip(mid_a, P_CLIP, 1 - P_CLIP), dtype=torch.float32)
     cnt = np.bincount(eidx, minlength=len(tune_ev)).astype(np.float64)
     W = torch.tensor(1.0 / cnt[eidx], dtype=torch.float32)
@@ -255,7 +318,7 @@ def main():
         for i in range(0, n_rows, 8192):
             ix = perm[i : i + 8192]
             e = E[ix]
-            lo = logit_of(fwd, SP[ix], TT[ix], strikes[e] + b_scale * d_b[e], torch.exp(rho_bar + d_r[e]))
+            lo = logit_of(fwd, SP[ix], TT[ix], strikes[e] + b_scale * d_b[e], torch.exp(rho_bar + d_r[e]), XA[ix])
             bce = nn.functional.binary_cross_entropy_with_logits(lo, Y[ix], weight=W[ix], reduction="sum") / W[ix].sum()
             opt.zero_grad()
             bce.backward()
@@ -280,6 +343,7 @@ def main():
     # ── simulate on the second half with REAL book prices ──
     trades = {d: [] for d in DELTAS}
     unfilled = {d: 0 for d in DELTAS}
+    tdump = []
     for t in test_ev:
         d = ev[t]
         outc = 1 if meta[t]["result"] == "yes" else 0
@@ -291,6 +355,7 @@ def main():
         tte_p = d["tte"][pred][ss]
         ybid_p = d["ybid"][pred][ss]
         yask_p = d["yask"][pred][ss]
+        x_p = d["X"][pred][ss]
         if FIT_MODE == "expand":
             # refit (db,dr) at each minute boundary on ALL history so far
             # (warm-started); rows in (B-60, B] use the fit from tte>B.
@@ -305,6 +370,7 @@ def main():
                     fwd, d["spot"][fitm][sl], d["tte"][fitm][sl], mid_f, strike,
                     rho_fixed, b_scale,
                     steps=FIT_STEPS if init is None else 60, init=init,
+                    extra=d["X"][fitm][sl],
                 )
                 init = (float(db), float(dr))
                 seg = (tte_p <= B) & (tte_p > B - 60)
@@ -316,6 +382,7 @@ def main():
                             torch.tensor(tte_p[seg], dtype=torch.float32),
                             strike + b_scale * db,
                             torch.exp(rho_fixed + dr),
+                            torch.tensor(x_p[seg], dtype=torch.float32),
                         )
                         fair[seg] = torch.sigmoid(lo).numpy()
             ok = ~np.isnan(fair)
@@ -326,7 +393,8 @@ def main():
             fit = d["tte"] > FIT_TTE_S
             mid_fit = (d["ybid"][fit] + d["yask"][fit]) / 2.0
             db, dr = fit_event(
-                fwd, d["spot"][fit][sl], d["tte"][fit][sl], mid_fit[sl], strike, rho_fixed, b_scale
+                fwd, d["spot"][fit][sl], d["tte"][fit][sl], mid_fit[sl], strike, rho_fixed, b_scale,
+                extra=d["X"][fit][sl],
             )
             with torch.no_grad():
                 lo = logit_of(
@@ -335,6 +403,7 @@ def main():
                     torch.tensor(tte_p, dtype=torch.float32),
                     strike + b_scale * db,
                     torch.exp(rho_fixed + dr),
+                    torch.tensor(x_p, dtype=torch.float32),
                 )
                 fair = torch.sigmoid(lo).numpy()
         mid_p = (ybid_p + yask_p) / 2.0
@@ -397,6 +466,8 @@ def main():
                     continue
                 won = outc == 1 if side_yes else outc == 0
                 cost = p_entry + fee(p_entry)
+                if EXIT_MODE == "settle" and TRADES_OUT:
+                    tdump.append((dl, t, won, cost, abs(gap[k]), tte_p[k], side_yes))
                 if EXIT_MODE == "revert":
                     elapsed = tte_p[k] - tte_p[k + 1 :]
                     closed = np.abs(gap[k + 1 :]) <= EXIT_EPS
@@ -423,6 +494,14 @@ def main():
                 else:
                     trades[dl].append((won, cost, abs(gap[k]), tte_p[k], side_yes))
                 k += 1
+
+    if TRADES_OUT:
+        with open(TRADES_OUT, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["delta", "ticker", "won", "cost", "gap", "tte", "side_yes"])
+            for r in tdump:
+                w.writerow([r[0], r[1], int(r[2]), f"{r[3]:.4f}", f"{r[4]:.4f}", f"{r[5]:.1f}", int(r[6])])
+        print(f"trades -> {TRADES_OUT} ({len(tdump)} rows)")
 
     print(f"\n=== TEST ({len(test_ev)} events): fit tte>{FIT_TTE_S}s, trade tte<={FIT_TTE_S}s, REAL bid/ask entries, exit={EXIT_MODE} ===")
     if EXIT_MODE == "revert":

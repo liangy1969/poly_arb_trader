@@ -21,6 +21,7 @@ Usage: python train_l2_imb.py <data_dir_with_rows> <l2feat.csv.gz>
 """
 import csv
 import gzip
+import json
 import math
 import os
 import sys
@@ -123,13 +124,13 @@ def logit_of(net, px, tte, extra, b, s):
     return net(zp, tau.log(), extra)
 
 
-def run(extras, ev, order, fcols):
+def run(extras, ev, order, fcols, train_all=False):
     torch.manual_seed(SEED)
     np.random.seed(SEED)
     fidx = [fcols.index(c) for c in extras]
     ids = order
     n_val = max(1, int(len(ids) * VAL_FRAC))
-    tr_ids, val_ids = ids[:-n_val], ids[-n_val:]
+    tr_ids, val_ids = (ids, []) if train_all else (ids[:-n_val], ids[-n_val:])
 
     eidx, tte, px, prob, xf = [], [], [], [], []
     for i, t in enumerate(tr_ids):
@@ -226,7 +227,8 @@ def run(extras, ev, order, fcols):
         if (~core).sum() >= 30:
             m["kl_last"] = kl_row[~core].mean()
         per_ev[t] = m
-    return {"rho": float(rho_f), "per_ev": per_ev, "n_train": len(tr_ids)}
+    return {"rho": float(rho_f), "per_ev": per_ev, "n_train": len(tr_ids),
+            "net": net, "mu": mu.tolist(), "sd": sd.tolist()}
 
 
 def agg(per_ev, key):
@@ -238,12 +240,38 @@ def main():
     data_dir, feat_path = sys.argv[1], sys.argv[2]
     T, mid, X = load_feats(feat_path)
     print(f"features: {len(T):,} secs  {T.min()} -> {T.max()}")
-    ev = load_kalshi(data_dir, int(T.min()), int(T.max()) - 900)
+    cap = int(os.environ.get("CAP_TS", "0"))  # exclude events opening at/after this
+    ev = load_kalshi(data_dir, int(T.min()), min(int(T.max()) - 900, cap - 1) if cap else int(T.max()) - 900)
     attach(ev, T, mid, X)
     # keep events with decent coverage
     order = [t for t in sorted(ev, key=lambda t: ev[t]["open_ts"])
              if (~np.isnan(ev[t]["px"])).sum() >= 600]
     print(f"events with kalshi+L2 coverage: {len(order)}")
+
+    # Export mode: EXPORT=<path> EXTRAS=<comma-list or empty> — train on ALL
+    # events (train_all) and dump a sim_50ms-compatible JSON with extras/mu/sd.
+    export = os.environ.get("EXPORT", "")
+    if export:
+        extras = [c for c in os.environ.get("EXTRAS", "").split(",") if c]
+        r = run(extras, ev, order, FEATS, train_all=True)
+        net = r["net"]
+        layers = [{"w": m.weight.tolist(), "b": m.bias.tolist()} for m in net.net if isinstance(m, nn.Linear)]
+        out = {
+            "arch": {"hidden": HID, "clamp": 2.0, "act": "tanh", "logit": "raw", "mode": "direct"},
+            "features": "zp=(px-b)/s/sqrt(tte/900); u_in=[zp, log(tte/900)] + extras",
+            "rho_bar": r["rho"],
+            "b_prior": "strike",
+            "b_scale": 50.0,
+            "extras": extras,
+            "mu": r["mu"],
+            "sd": r["sd"],
+            "layers": layers,
+            "train": {"venue": "lake_perp_mid", "events": len(order), "cap_ts": cap, "target": "market_prob"},
+        }
+        os.makedirs(os.path.dirname(export), exist_ok=True)
+        json.dump(out, open(export, "w"))
+        print(f"exported extras={extras} ({len(order)} events, s~${math.exp(r['rho']):.0f}) -> {export}")
+        return
 
     results = {}
     base_pe = None
