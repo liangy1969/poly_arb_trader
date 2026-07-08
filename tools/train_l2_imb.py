@@ -45,6 +45,7 @@ FFILL_S = 5
 CLIP = 0.005
 # Asset-scale priors: BTC defaults; e.g. ETH (~$1.7k): RHO0~4, B_SCALE~1.5
 RHO0 = float(os.environ.get("RHO0", "150"))
+SKIP_LAST_S = float(os.environ.get("SKIP_LAST_S", "0"))
 B_SCALE = float(os.environ.get("B_SCALE", "50"))
 
 FEATS = ["imb1", "imb5", "imb20", "imb100", "band5", "band10", "band25", "moff_bps", "spread_bps"]
@@ -143,6 +144,8 @@ def run(extras, ev, order, fcols, train_all=False):
     for i, t in enumerate(tr_ids):
         d = ev[t]
         ok = ~np.isnan(d["px"])
+        if SKIP_LAST_S > 0:
+            ok &= d["tte"] > SKIP_LAST_S
         eidx.append(np.full(ok.sum(), i))
         tte.append(d["tte"][ok])
         px.append(d["px"][ok])

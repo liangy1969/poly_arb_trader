@@ -40,6 +40,7 @@ FIT_LR = 0.05
 FFILL_S = 30
 CLIP = 0.005
 RHO0 = float(os.environ.get("RHO0", "150"))
+SKIP_LAST_S = float(os.environ.get("SKIP_LAST_S", "0"))
 B_SCALE = float(os.environ.get("B_SCALE", "50"))
 
 
@@ -121,6 +122,8 @@ def run_venue(name, ev, order, train_all=False):
     for i, t in enumerate(tr_ids):
         d = ev[t]
         ok = ~np.isnan(d[name])
+        if SKIP_LAST_S > 0:
+            ok &= d["tte"] > SKIP_LAST_S
         eidx.append(np.full(ok.sum(), i))
         tte.append(d["tte"][ok])
         px.append(d[name][ok])
