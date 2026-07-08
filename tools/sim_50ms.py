@@ -61,6 +61,8 @@ ENTRY_MODE = os.environ.get("ENTRY_MODE", "taker")
 ENTRY_MIN_TTE_S = float(os.environ.get("ENTRY_MIN_TTE_S", "0"))
 # Maker fill window: bid rests this many seconds then cancels (0 = to settle).
 MAKER_FILL_S = float(os.environ.get("MAKER_FILL_S", "0"))
+# Only events whose data starts at/after this unix-seconds time (0 = all).
+MIN_OPEN_TS = float(os.environ.get("MIN_OPEN_TS", "0"))
 EXIT_EPS = float(os.environ.get("EXIT_EPS", "0.02"))
 EXIT_HORIZON_S = float(os.environ.get("EXIT_HORIZON_S", "120"))
 
@@ -198,6 +200,8 @@ def main():
         if (d["tte"] > FIT_TTE_S).sum() < 2000 or (d["tte"] <= FIT_TTE_S).sum() < need_trade:
             continue  # need ~100s+ of fit rows and decent trade-window coverage
         usable.append(t)
+    if MIN_OPEN_TS > 0:
+        usable = [t for t in usable if ev[t]["ts"][0] >= MIN_OPEN_TS * 1000.0]
     usable.sort(key=lambda t: ev[t]["ts"][0])
     n = len(usable)
     if ALL_TEST:
@@ -476,6 +480,25 @@ def main():
                 f"{dl:>6} {len(T):>4} " + fr + f"{100 * won.mean():>5.1f}% {gaps.mean():>8.3f} {ttes.mean():>7.0f}s "
                 f"{cost.mean():>8.3f} {net.mean():>+8.4f} {net.sum():>+8.2f} {100 * yes.mean():>4.0f}%"
             )
+        # ── P&L by ENTRY PRICE bucket ──
+        pbuckets = [(0.0, 0.2), (0.2, 0.4), (0.4, 0.6), (0.6, 0.8), (0.8, 1.0)]
+        print(f"\nP&L by ENTRY PRICE: {'delta':>6} " + "".join(f"{f'{lo:.1f}-{hi:.1f}':>22}" for lo, hi in pbuckets))
+        for dl in DELTAS:
+            T = trades[dl]
+            if not T:
+                continue
+            won = np.array([x[0] for x in T])
+            cost = np.array([x[1] for x in T])
+            net = won.astype(float) - cost
+            cells = []
+            for lo, hi in pbuckets:
+                m = (cost >= lo) & (cost < hi)
+                if m.sum() == 0:
+                    cells.append(f"{'-':>22}")
+                else:
+                    cells.append(f"{net[m].mean():>+8.3f} n={m.sum():<3} w={100 * won[m].mean():>3.0f}%")
+            print(f"{'':>19}{dl:>6} " + "".join(cells))
+
         # ── P&L by entry-TTE bucket ──
         buckets = [(300 - 60 * k, 300 - 60 * (k + 1), f"{300 - 60 * k}-{300 - 60 * (k + 1)}s") for k in range(5)]
         print(f"\nP&L by ENTRY TTE:  {'delta':>6} " + "".join(f"{name:>22}" for _, _, name in buckets))
