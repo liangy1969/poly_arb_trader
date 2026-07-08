@@ -41,10 +41,12 @@ dependencies = [
  "arb-executor",
  "arb-processor",
  "arb-recorder",
+ "futures-util",
  "serde",
  "serde_json",
  "serde_yaml",
  "tokio",
+ "tokio-tungstenite",
  "tracing",
  "tracing-subscriber",
 ]

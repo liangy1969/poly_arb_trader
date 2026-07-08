@@ -168,11 +168,61 @@ async fn main() -> anyhow::Result<()> {
     // time-aligned high-resolution series the REST backfill cannot provide
     // (1s spot bars vs trade prints with unknown cross-source clock skew).
     // Daily-rotated CSVs: <sample_dir>/YYYY-MM-DD.csv (gzip old days via cron).
+    // Coinbase BTC-USD best bid/ask via the public `ticker` WS channel — the
+    // settlement-chain (BRTI constituent) price on the SAME local clock as the
+    // perp + Kalshi book. US venue: direct connection, no tunnel. NOTE: the
+    // ticker channel updates on trades, so between prints the quote can be up
+    // to a few seconds stale (stamped via its own recv ts for downstream use).
+    let cb_quote = Arc::new(std::sync::Mutex::new((f64::NAN, f64::NAN, 0i64)));
+    let _cb_feed = if cfg.run.sample_dir.is_empty() {
+        None
+    } else {
+        let q = cb_quote.clone();
+        Some(tokio::spawn(async move {
+            use futures_util::{SinkExt, StreamExt};
+            let mut backoff = 1u64;
+            loop {
+                match tokio_tungstenite::connect_async("wss://ws-feed.exchange.coinbase.com").await {
+                    Ok((mut ws, _)) => {
+                        let sub = serde_json::json!({
+                            "type": "subscribe",
+                            "product_ids": ["BTC-USD"],
+                            "channels": ["ticker"],
+                        });
+                        if ws.send(tokio_tungstenite::tungstenite::Message::Text(sub.to_string())).await.is_err() {
+                            continue;
+                        }
+                        tracing::info!("coinbase ticker feed up");
+                        backoff = 1;
+                        while let Some(Ok(msg)) = ws.next().await {
+                            if let tokio_tungstenite::tungstenite::Message::Text(txt) = msg {
+                                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
+                                    if v.get("type").and_then(|t| t.as_str()) == Some("ticker") {
+                                        let bid = v.get("best_bid").and_then(|x| x.as_str()).and_then(|s| s.parse().ok());
+                                        let ask = v.get("best_ask").and_then(|x| x.as_str()).and_then(|s| s.parse().ok());
+                                        if let (Some(b), Some(a)) = (bid, ask) {
+                                            *q.lock().unwrap() = (b, a, arb_core::now_ns());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        tracing::warn!("coinbase ticker feed dropped; reconnecting");
+                    }
+                    Err(e) => tracing::warn!("coinbase ws connect: {e}"),
+                }
+                tokio::time::sleep(Duration::from_secs(backoff)).await;
+                backoff = (backoff * 2).min(30);
+            }
+        }))
+    };
+
     let _sampler = if cfg.run.sample_dir.is_empty() {
         None
     } else {
         let dir = cfg.run.sample_dir.clone();
         let period = Duration::from_millis(cfg.run.sample_ms.max(10));
+        let cbq = cb_quote.clone();
         let mut sub = bus.subscribe("market.#", 8192, Policy::Conflate(key_by_instrument));
         Some(tokio::spawn(async move {
             use std::collections::HashMap;
@@ -258,7 +308,7 @@ async fn main() -> anyhow::Result<()> {
                                 Ok(f) => {
                                     let mut w = std::io::BufWriter::new(f);
                                     if fresh {
-                                        let _ = writeln!(w, "ts_ms,ticker,tte_ms,perp_bid,perp_ask,ybid,yask,ybid_sz,yask_sz");
+                                        let _ = writeln!(w, "ts_ms,ticker,tte_ms,perp_bid,perp_ask,ybid,yask,ybid_sz,yask_sz,cb_bid,cb_ask,cb_age_ms");
                                     }
                                     out = Some((day, w));
                                 }
@@ -266,6 +316,8 @@ async fn main() -> anyhow::Result<()> {
                             }
                         }
                         let Some((_, w)) = out.as_mut() else { continue };
+                        let (cb_b, cb_a, cb_ts) = *cbq.lock().unwrap();
+                        let cb_age_ms = if cb_ts > 0 { (now - cb_ts) / 1_000_000 } else { -1 };
                         for (mid, k) in &books {
                             if k.expiry_ns == 0 || (k.yask <= 0.0 && k.ybid <= 0.0) {
                                 continue;
@@ -276,8 +328,9 @@ async fn main() -> anyhow::Result<()> {
                             }
                             let _ = writeln!(
                                 w,
-                                "{},{},{},{:.2},{:.2},{:.3},{:.3},{:.1},{:.1}",
-                                now / 1_000_000, mid, tte_ms, pb, pa, k.ybid, k.yask, k.ybsz, k.yasz
+                                "{},{},{},{:.2},{:.2},{:.3},{:.3},{:.1},{:.1},{:.2},{:.2},{}",
+                                now / 1_000_000, mid, tte_ms, pb, pa, k.ybid, k.yask, k.ybsz, k.yasz,
+                                cb_b, cb_a, cb_age_ms
                             );
                         }
                         n_since_flush += 1;
