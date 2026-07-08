@@ -71,6 +71,10 @@ EXIT_HORIZON_S = float(os.environ.get("EXIT_HORIZON_S", "120"))
 # selects which columns feed the net (z-scored with the JSON's mu/sd).
 FEAT = os.environ.get("FEAT", "")
 FEAT_STALE_MS = float(os.environ.get("FEAT_STALE_MS", "1000"))
+# FEAT_OFFSET_MS: added to feature timestamps before the as-of join. Use with
+# server-time-keyed features to model feed latency: offset=100 means a book
+# state stamped T becomes visible to the strategy at local time T+100ms.
+FEAT_OFFSET_MS = float(os.environ.get("FEAT_OFFSET_MS", "0"))
 # TRADES_OUT=path: dump per-trade rows (settle mode) for clustered stats.
 TRADES_OUT = os.environ.get("TRADES_OUT", "")
 
@@ -224,6 +228,7 @@ def main():
     extras_names = js.get("extras", [])
     if FEAT:
         ft, fcols = load_feat_file(FEAT)
+        ft = ft + int(FEAT_OFFSET_MS)
         mu = np.array(js.get("mu", [0.0] * len(extras_names)))
         sd = np.array(js.get("sd", [1.0] * len(extras_names)))
         dropped = kept = 0
