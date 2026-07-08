@@ -545,7 +545,18 @@ def main():
                 won = outc == 1 if side_yes else outc == 0
                 cost = p_entry + fee(p_entry)
                 if EXIT_MODE == "settle" and TRADES_OUT:
-                    tdump.append((dl, t, won, cost, abs(gap[k]), tte_p[k], side_yes))
+                    # 1s-lookback trigger decomposition: how much of the gap at
+                    # entry was opened by the MODEL moving (fair) vs the MARKET
+                    # moving (mid) over the last second.
+                    j = k - 1
+                    while j > 0 and (tte_p[j] - tte_p[k]) < 1.0 and (k - j) < 40:
+                        j -= 1
+                    if j >= 0 and (tte_p[j] - tte_p[k]) >= 1.0 and (tte_p[j] - tte_p[k]) <= 10.0:
+                        dfair = fair[k] - fair[j]
+                        dmid = mid_p[k] - mid_p[j]
+                    else:
+                        dfair = dmid = float("nan")
+                    tdump.append((dl, t, won, cost, abs(gap[k]), tte_p[k], side_yes, dfair, dmid))
                 if EXIT_MODE == "revert":
                     elapsed = tte_p[k] - tte_p[k + 1 :]
                     closed = np.abs(gap[k + 1 :]) <= EXIT_EPS
@@ -576,9 +587,10 @@ def main():
     if TRADES_OUT:
         with open(TRADES_OUT, "w", newline="") as f:
             w = csv.writer(f)
-            w.writerow(["delta", "ticker", "won", "cost", "gap", "tte", "side_yes"])
+            w.writerow(["delta", "ticker", "won", "cost", "gap", "tte", "side_yes", "dfair1s", "dmid1s"])
             for r in tdump:
-                w.writerow([r[0], r[1], int(r[2]), f"{r[3]:.4f}", f"{r[4]:.4f}", f"{r[5]:.1f}", int(r[6])])
+                w.writerow([r[0], r[1], int(r[2]), f"{r[3]:.4f}", f"{r[4]:.4f}", f"{r[5]:.1f}", int(r[6]),
+                            f"{r[7]:.4f}", f"{r[8]:.4f}"])
         print(f"trades -> {TRADES_OUT} ({len(tdump)} rows)")
 
     print(f"\n=== TEST ({len(test_ev)} events): fit tte>{FIT_TTE_S}s, trade tte<={FIT_TTE_S}s, REAL bid/ask entries, exit={EXIT_MODE} ===")
