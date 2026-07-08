@@ -173,8 +173,8 @@ async fn main() -> anyhow::Result<()> {
     // perp + Kalshi book. US venue: direct connection, no tunnel. NOTE: the
     // ticker channel updates on trades, so between prints the quote can be up
     // to a few seconds stale (stamped via its own recv ts for downstream use).
-    // (bid, ask, bid_sz, ask_sz, recv_ns)
-    let cb_quote = Arc::new(std::sync::Mutex::new((f64::NAN, f64::NAN, 0.0f64, 0.0f64, 0i64)));
+    // (bid, ask, bid_sz, ask_sz, srv_ns, recv_ns) — srv = coinbase's own stamp
+    let cb_quote = Arc::new(std::sync::Mutex::new((f64::NAN, f64::NAN, 0.0f64, 0.0f64, 0i64, 0i64)));
     let _cb_feed = if cfg.run.sample_dir.is_empty() {
         None
     } else {
@@ -202,7 +202,11 @@ async fn main() -> anyhow::Result<()> {
                                         let f = |k: &str| v.get(k).and_then(|x| x.as_str()).and_then(|s| s.parse::<f64>().ok());
                                         if let (Some(b), Some(a)) = (f("best_bid"), f("best_ask")) {
                                             let (bs, asz) = (f("best_bid_size").unwrap_or(0.0), f("best_ask_size").unwrap_or(0.0));
-                                            *q.lock().unwrap() = (b, a, bs, asz, arb_core::now_ns());
+                                            let srv_ns = v.get("time").and_then(|x| x.as_str())
+                                                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                                                .and_then(|t| t.timestamp_nanos_opt())
+                                                .unwrap_or(0);
+                                            *q.lock().unwrap() = (b, a, bs, asz, srv_ns, arb_core::now_ns());
                                         }
                                     }
                                 }
@@ -241,7 +245,7 @@ async fn main() -> anyhow::Result<()> {
             let mid_of = |inst: &str| -> Option<String> {
                 inst.strip_prefix("kalshi.")?.rsplit_once('.').map(|(m, _)| m.to_string())
             };
-            let mut perp: Option<(f64, f64, f64, f64)> = None; // bid, ask, bid_sz, ask_sz
+            let mut perp: Option<(f64, f64, f64, f64, i64)> = None; // bid, ask, bid_sz, ask_sz, exch_ns
             let mut books: HashMap<String, KTop> = HashMap::new();
             let mut expiry: HashMap<String, i64> = HashMap::new();
             let mut out: Option<(String, std::io::BufWriter<std::fs::File>)> = None;
@@ -256,7 +260,7 @@ async fn main() -> anyhow::Result<()> {
                         match &ev.payload {
                             Payload::Book(b) if b.instrument == "binance.usdt_perp.BTCUSDT" => {
                                 if let (Some(&(pb, pbs)), Some(&(pa, pas))) = (b.bids.first(), b.asks.first()) {
-                                    perp = Some((pb, pa, pbs, pas));
+                                    perp = Some((pb, pa, pbs, pas, b.exch_ts_ns));
                                 }
                             }
                             Payload::Book(b) if b.instrument.starts_with("kalshi.") && b.instrument.ends_with(".YES") => {
@@ -282,7 +286,7 @@ async fn main() -> anyhow::Result<()> {
                         }
                     }
                     _ = tick.tick() => {
-                        let Some((pb, pa, pbs, pas)) = perp else { continue };
+                        let Some((pb, pa, pbs, pas, p_exch_ns)) = perp else { continue };
                         let now = arb_core::now_ns();
                         // rotate the daily file
                         let day = {
@@ -309,7 +313,7 @@ async fn main() -> anyhow::Result<()> {
                                 Ok(f) => {
                                     let mut w = std::io::BufWriter::new(f);
                                     if fresh {
-                                        let _ = writeln!(w, "ts_ms,ticker,tte_ms,perp_bid,perp_ask,ybid,yask,ybid_sz,yask_sz,cb_bid,cb_ask,cb_age_ms,perp_bid_sz,perp_ask_sz,cb_bid_sz,cb_ask_sz");
+                                        let _ = writeln!(w, "ts_ms,ticker,tte_ms,perp_bid,perp_ask,ybid,yask,ybid_sz,yask_sz,cb_bid,cb_ask,cb_age_ms,perp_bid_sz,perp_ask_sz,cb_bid_sz,cb_ask_sz,perp_age_ms,cb_srv_age_ms");
                                     }
                                     out = Some((day, w));
                                 }
@@ -317,8 +321,12 @@ async fn main() -> anyhow::Result<()> {
                             }
                         }
                         let Some((_, w)) = out.as_mut() else { continue };
-                        let (cb_b, cb_a, cb_bs, cb_as, cb_ts) = *cbq.lock().unwrap();
+                        let (cb_b, cb_a, cb_bs, cb_as, cb_srv_ns, cb_ts) = *cbq.lock().unwrap();
                         let cb_age_ms = if cb_ts > 0 { (now - cb_ts) / 1_000_000 } else { -1 };
+                        // ages vs the VENUES' OWN clocks: enable server-time joins
+                        // (ts_ms - age = exchange stamp) + continuous feed-latency watch
+                        let perp_age_ms = if p_exch_ns > 0 { (now - p_exch_ns) / 1_000_000 } else { -1 };
+                        let cb_srv_age_ms = if cb_srv_ns > 0 { (now - cb_srv_ns) / 1_000_000 } else { -1 };
                         for (mid, k) in &books {
                             if k.expiry_ns == 0 || (k.yask <= 0.0 && k.ybid <= 0.0) {
                                 continue;
@@ -329,9 +337,9 @@ async fn main() -> anyhow::Result<()> {
                             }
                             let _ = writeln!(
                                 w,
-                                "{},{},{},{:.2},{:.2},{:.3},{:.3},{:.1},{:.1},{:.2},{:.2},{},{:.3},{:.3},{:.4},{:.4}",
+                                "{},{},{},{:.2},{:.2},{:.3},{:.3},{:.1},{:.1},{:.2},{:.2},{},{:.3},{:.3},{:.4},{:.4},{},{}",
                                 now / 1_000_000, mid, tte_ms, pb, pa, k.ybid, k.yask, k.ybsz, k.yasz,
-                                cb_b, cb_a, cb_age_ms, pbs, pas, cb_bs, cb_as
+                                cb_b, cb_a, cb_age_ms, pbs, pas, cb_bs, cb_as, perp_age_ms, cb_srv_age_ms
                             );
                         }
                         n_since_flush += 1;

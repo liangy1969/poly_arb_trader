@@ -32,3 +32,4 @@ serde_yaml = "0.9"
 # sampler's coinbase quote feed (settlement-chain venue, one-clock alignment)
 tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 futures-util = "0.3"
+chrono = "0.4"

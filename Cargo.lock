@@ -41,6 +41,7 @@ dependencies = [
  "arb-executor",
  "arb-processor",
  "arb-recorder",
+ "chrono",
  "futures-util",
  "serde",
  "serde_json",
