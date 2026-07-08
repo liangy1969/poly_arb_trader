@@ -41,10 +41,14 @@ async fn main() -> anyhow::Result<()> {
         EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
     );
     let _ = std::fs::create_dir_all("data");
+    // Per-instance override (e.g. the ETH collector) so parallel apps don't
+    // interleave into one analysis log.
+    let events_path = std::env::var("TRADER_EVENTS_LOG")
+        .unwrap_or_else(|_| "data/trader-events.log".into());
     let events_file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open("data/trader-events.log");
+        .open(&events_path);
     match events_file {
         Ok(f) => {
             let events_layer = tracing_subscriber::fmt::layer()
@@ -62,7 +66,7 @@ async fn main() -> anyhow::Result<()> {
                         .with_target("maker", LevelFilter::INFO),
                 );
             tracing_subscriber::registry().with(stdout_layer).with(events_layer).init();
-            tracing::info!("trader events -> data/trader-events.log (append; survives relaunches)");
+            tracing::info!("trader events -> {events_path} (append; survives relaunches)");
         }
         Err(e) => {
             tracing_subscriber::registry().with(stdout_layer).init();
@@ -92,6 +96,7 @@ async fn main() -> anyhow::Result<()> {
 
     // --- pipeline heartbeat: perp mid + current Live target ---
     let mut mkt = bus.subscribe("market.#", 8192, Policy::Conflate(key_by_instrument));
+    let hb_perp_inst = cfg.run.perp_instrument.clone();
     let heartbeat = tokio::spawn(async move {
         let mut perp_mid = f64::NAN;
         let mut live_target: Option<String> = None;
@@ -114,7 +119,7 @@ async fn main() -> anyhow::Result<()> {
                 ev = mkt.recv() => {
                     let Some(ev) = ev else { break };
                     match &ev.payload {
-                        Payload::Book(b) if b.instrument == "binance.usdt_perp.BTCUSDT" => {
+                        Payload::Book(b) if b.instrument == hb_perp_inst => {
                             bn += 1;
                             if let (Some(&(bid, _)), Some(&(ask, _))) = (b.bids.first(), b.asks.first()) {
                                 perp_mid = (bid + ask) / 2.0;
@@ -179,6 +184,7 @@ async fn main() -> anyhow::Result<()> {
         None
     } else {
         let q = cb_quote.clone();
+        let product = cfg.run.cb_product.clone();
         Some(tokio::spawn(async move {
             use futures_util::{SinkExt, StreamExt};
             let mut backoff = 1u64;
@@ -187,13 +193,13 @@ async fn main() -> anyhow::Result<()> {
                     Ok((mut ws, _)) => {
                         let sub = serde_json::json!({
                             "type": "subscribe",
-                            "product_ids": ["BTC-USD"],
+                            "product_ids": [product.as_str()],
                             "channels": ["ticker"],
                         });
                         if ws.send(tokio_tungstenite::tungstenite::Message::Text(sub.to_string())).await.is_err() {
                             continue;
                         }
-                        tracing::info!("coinbase ticker feed up");
+                        tracing::info!("coinbase ticker feed up ({product})");
                         backoff = 1;
                         while let Some(Ok(msg)) = ws.next().await {
                             if let tokio_tungstenite::tungstenite::Message::Text(txt) = msg {
@@ -228,6 +234,7 @@ async fn main() -> anyhow::Result<()> {
         let dir = cfg.run.sample_dir.clone();
         let period = Duration::from_millis(cfg.run.sample_ms.max(10));
         let cbq = cb_quote.clone();
+        let perp_inst = cfg.run.perp_instrument.clone();
         let mut sub = bus.subscribe("market.#", 8192, Policy::Conflate(key_by_instrument));
         Some(tokio::spawn(async move {
             use std::collections::HashMap;
@@ -258,7 +265,7 @@ async fn main() -> anyhow::Result<()> {
                     ev = sub.recv() => {
                         let Some(ev) = ev else { break };
                         match &ev.payload {
-                            Payload::Book(b) if b.instrument == "binance.usdt_perp.BTCUSDT" => {
+                            Payload::Book(b) if b.instrument == perp_inst => {
                                 if let (Some(&(pb, pbs)), Some(&(pa, pas))) = (b.bids.first(), b.asks.first()) {
                                     perp = Some((pb, pa, pbs, pas, b.exch_ts_ns));
                                 }

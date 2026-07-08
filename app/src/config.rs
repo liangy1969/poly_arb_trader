@@ -25,11 +25,21 @@ pub struct RunCfg {
     pub sample_dir: String,
     /// Sampler grid period (ms).
     pub sample_ms: u64,
+    /// Perp bus instrument the sampler/heartbeat track (per-asset instances).
+    pub perp_instrument: String,
+    /// Coinbase product for the sampler's settlement-chain quote feed.
+    pub cb_product: String,
 }
 
 impl Default for RunCfg {
     fn default() -> Self {
-        RunCfg { duration_secs: 0, sample_dir: String::new(), sample_ms: 50 }
+        RunCfg {
+            duration_secs: 0,
+            sample_dir: String::new(),
+            sample_ms: 50,
+            perp_instrument: "binance.usdt_perp.BTCUSDT".into(),
+            cb_product: "BTC-USD".into(),
+        }
     }
 }
 
