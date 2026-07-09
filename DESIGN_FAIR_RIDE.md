@@ -217,3 +217,28 @@ hash so a mismatched pair refuses to arm.
   with the recorded recipe, new file, replay-parity re-run.
 - Kalshi mid as fit target inherits MM quirks at wide spreads; the 0.15
   spread filter is the only guard (same as offline).
+
+## 10. Implementation notes — surface & optimizer
+
+**Surface**: 3 dense layers from JSON (2→32→32→1, tanh), explicit-loop
+matvec, f64 throughout (serde-native, deterministic; f32↔f64 delta ~1e-6
+≪ the 1e-4 parity tolerance). ~1.2k MACs/forward. BCE in the stable
+with-logits form.
+
+**Fit**: full-batch, deterministic. Gradients by CENTRAL FINITE DIFFERENCE
+on the 2 params (ε=1e-4, 4 batch-evals/step) — chosen over analytic backprop
+because 2 params × few hundred rows makes compute irrelevant (≈270M MACs
+worst case ≈ ms on a blocking thread) and a hand-derived chain rule's bugs
+would masquerade as optimizer noise. Analytic gradient (dL/dlogit = σ−y
+chained through tanh layers; dzp/dΔb = −b_scale/(s√τ), dzp/dΔρ = −zp) is the
+recorded optimization if ever needed.
+
+**Adam**: lr .05, β .9/.999, ε 1e-8, bias correction, 150/60 fixed steps,
+and — matching the sim's fit_event exactly — FRESH moment state each
+(re)fit, params warm-started. No convergence test: determinism + sim parity
+over cleverness.
+
+**Parity tolerance is output-space**: |fair_rust − fair_python| < 0.005
+across the trade window on a canned real event (the (Δb,Δρ) surface has a
+soft ridge; parameter-space comparison would be brittle while fair is what
+trades). Surface-only parity: |Δlogit| < 1e-4 on exported random vectors.
