@@ -48,6 +48,7 @@ pub struct InstrumentState {
     pub status: Option<MarketStatus>,
     pub start_ts_ns: Option<i64>,
     pub expiry_ts_ns: Option<i64>,
+    pub strike: Option<f64>,
     pub ring: RollingWindow,
 }
 
@@ -69,6 +70,7 @@ impl InstrumentState {
             seq: 0,
             stale: false,
             status: None,
+            strike: None,
             start_ts_ns: None,
             expiry_ts_ns: None,
             ring: RollingWindow::new(ring_cap, horizon_ms),
@@ -147,6 +149,9 @@ impl MarketState {
                 st.status = Some(m.status);
                 st.start_ts_ns = m.start_ts_ns;
                 st.expiry_ts_ns = m.expiry_ts_ns;
+                if m.strike.is_some() {
+                    st.strike = m.strike;
+                }
                 self.linker_on_meta(m);
             }
             _ => {}

@@ -106,6 +106,7 @@ struct Market {
     close_ns: i64,
     phase: Phase,
     instrument: String,
+    strike: Option<f64>,
 }
 
 /// Desired active set, pushed to the WS / poll / trade tasks on change.
@@ -173,6 +174,7 @@ fn publish_catalog(bus: &dyn Bus, m: &Market, kind: &str, seq: &mut u64) {
         min_order_size: Some(1.0), // Kalshi trades whole contracts
         tick_size: Some(0.01),     // 1¢ tick
         fee_rate: None,            // consumers fall back to config
+        strike: m.strike,
     };
     bus.publish(Event::new(
         "market.kalshi.catalog",
@@ -328,7 +330,7 @@ async fn lifecycle_task(
                 .map(|a| f64::from_bits(a.load(Ordering::Relaxed)))
                 .unwrap_or(0.0);
             tracing::info!("kalshi discovery {series}: atm_mid={atm_mid:.2}");
-            let mut cands: Vec<(i64, f64, String, String, i64)> = Vec::new();
+            let mut cands: Vec<(i64, f64, String, String, i64, Option<f64>)> = Vec::new();
             for m in &list {
                 let ticker = match m.get("ticker").and_then(Value::as_str) {
                     Some(t) => t.to_string(),
@@ -357,14 +359,15 @@ async fn lifecycle_task(
                     (true, Some(k)) => (k - atm_mid).abs(),
                     _ => 0.0,
                 };
-                cands.push((close, atm_dist, ticker, title, open));
+                let strike = m.get("floor_strike").and_then(Value::as_f64);
+                cands.push((close, atm_dist, ticker, title, open, strike));
             }
             // nearest settlement first; within it, nearest to the money first.
             cands.sort_by(|a, b| {
                 a.0.cmp(&b.0)
                     .then(a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
             });
-            for (i, (close, _dist, ticker, title, open)) in
+            for (i, (close, _dist, ticker, title, open, strike)) in
                 cands.into_iter().take(cfg.n_windows).enumerate()
             {
                 if markets.contains_key(&ticker) {
@@ -376,7 +379,7 @@ async fn lifecycle_task(
                 }
                 let role = if i == 0 { "current".to_string() } else { format!("upcoming_{i}") };
                 let instrument = format!("kalshi.{ticker}.YES");
-                let m = Market { ticker: ticker.clone(), title, open_ns: open, close_ns: close, phase, instrument };
+                let m = Market { ticker: ticker.clone(), title, open_ns: open, close_ns: close, phase, instrument, strike };
                 tracing::info!(
                     "discovered {} [{}] {:?} close in {}s",
                     m.ticker,

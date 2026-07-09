@@ -50,6 +50,7 @@ async fn main() -> anyhow::Result<()> {
         ttl_ms: 1000,
         ring_cap: 512,
         ring_horizon_ms: 5000,
+        fair_ride: Default::default(),
     });
     processor.start(bus.clone()).await?;
 
@@ -87,6 +88,7 @@ async fn feed(bus: Arc<dyn Bus>) {
             min_order_size: None,
             tick_size: None,
             fee_rate: None,
+            strike: None,
         }),
     ));
 

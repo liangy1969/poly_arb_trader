@@ -29,6 +29,8 @@ pub struct ProcCfg {
     pub ttl_ms: u64,
     pub ring_cap: usize,
     pub ring_horizon_ms: u64,
+    /// FairRide strategy config (used when `strategy == "fair_ride"`).
+    pub fair_ride: crate::rule::FairRideCfg,
 }
 
 impl Default for ProcCfg {
@@ -47,6 +49,7 @@ impl Default for ProcCfg {
             ttl_ms: 1000,
             ring_cap: 512,
             ring_horizon_ms: 5000,
+            fair_ride: crate::rule::FairRideCfg::default(),
         }
     }
 }
@@ -78,18 +81,29 @@ impl Module for Processor {
             self.cfg.ring_cap,
             self.cfg.ring_horizon_ms,
         );
-        let rule = PerpMoveRule::new(
-            self.cfg.strategy.clone(),
-            self.cfg.reference.clone(),
-            self.cfg.window_ms,
-            self.cfg.threshold_bps,
-            self.cfg.yes_bucket,
-            self.cfg.cooldown_ms,
-            self.cfg.min_tte_ms,
-            self.cfg.hold_ms,
-            self.cfg.ttl_ms,
-        );
-        let mut engine = RuleEngine::new(vec![Box::new(rule)]);
+        let rules: Vec<Box<dyn crate::rule::Rule>> = if self.cfg.strategy == "fair_ride" {
+            let frc = self.cfg.fair_ride.clone();
+            let bytes = std::fs::read(&frc.model_path)?;
+            let surface = std::sync::Arc::new(crate::fair::FairSurface::from_json(
+                std::str::from_utf8(&bytes)?,
+            )?);
+            let hash = crate::calib::fnv1a(&bytes);
+            tracing::info!("fair_ride rule up: model={} hash={:016x}", frc.model_path, hash);
+            vec![Box::new(crate::rule::FairRideRule::new(frc, surface, hash))]
+        } else {
+            vec![Box::new(PerpMoveRule::new(
+                self.cfg.strategy.clone(),
+                self.cfg.reference.clone(),
+                self.cfg.window_ms,
+                self.cfg.threshold_bps,
+                self.cfg.yes_bucket,
+                self.cfg.cooldown_ms,
+                self.cfg.min_tte_ms,
+                self.cfg.hold_ms,
+                self.cfg.ttl_ms,
+            ))]
+        };
+        let mut engine = RuleEngine::new(rules);
         let mut seq = 0u64;
 
         let handle = tokio::spawn(async move {

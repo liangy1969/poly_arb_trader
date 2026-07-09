@@ -61,6 +61,30 @@ pub struct MarketMeta {
     pub min_order_size: Option<f64>,
     pub tick_size: Option<f64>,
     pub fee_rate: Option<f64>,
+    /// Settlement strike (e.g. Kalshi `floor_strike`) — the FairRide b-prior
+    /// (DESIGN_FAIR_RIDE §3). `None` for markets without one.
+    pub strike: Option<f64>,
+}
+
+/// Online per-event calibration result from the Calibrator module
+/// (DESIGN_FAIR_RIDE §5): the (Δb, Δρ) the FairRideRule uses to evaluate the
+/// frozen surface for `instrument`.
+#[derive(Clone, Debug, Serialize)]
+pub struct CalibUpdate {
+    /// Target prediction market (e.g. `kalshi.KXBTC15M-....YES`).
+    pub instrument: String,
+    /// Reference price instrument the fit consumed (e.g. `coinbase.spot.BTC-USD`).
+    pub reference: String,
+    pub seq: u64,
+    pub ts_ns: i64,
+    /// tte boundary (seconds) this fit was scheduled at (300/240/.../60).
+    pub fitted_at_tte_s: f64,
+    pub rows: u32,
+    pub d_b: f64,
+    pub d_rho: f64,
+    pub bce: f64,
+    /// FNV-1a hash of the model file — the rule refuses mismatched pairs.
+    pub model_hash: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]

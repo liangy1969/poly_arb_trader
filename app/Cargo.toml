@@ -11,6 +11,10 @@ path = "src/lib.rs"
 name = "arb-app"
 path = "src/main.rs"
 
+[[bin]]
+name = "replay_fair_ride"
+path = "src/bin/replay_fair_ride.rs"
+
 [dependencies]
 arb-core = { path = "../crates/core" }
 arb-bus = { path = "../crates/bus" }

@@ -29,6 +29,8 @@ pub enum Payload {
     ExecReport(ExecReport),
     TradeRecord(TradeRecord),
     Position(PositionSnapshot),
+    /// Online per-event (Δb,Δρ) calibration (FairRide; topic `market.calib.<id>`).
+    Calib(CalibUpdate),
 }
 
 impl Event {

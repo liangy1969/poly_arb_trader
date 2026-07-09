@@ -10,7 +10,7 @@ use arb_collector_databento::DatabentoCfg;
 use arb_collector_kalshi::KalshiCfg;
 use arb_collector_polymarket::PolyCfg;
 use arb_executor::ExecutorCfg;
-use arb_processor::ProcCfg;
+use arb_processor::{CalibCfg, ProcCfg};
 use arb_recorder::RecorderCfg;
 
 #[derive(Clone, Deserialize)]
@@ -55,6 +55,7 @@ pub struct AppConfig {
     pub polymarket: PolyCfg,
     pub kalshi: KalshiCfg,
     pub processor: ProcCfg,
+    pub calibrator: CalibCfg,
     pub recorder: RecorderCfg,
     pub executor: ExecutorCfg,
     pub run: RunCfg,

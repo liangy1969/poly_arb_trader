@@ -198,6 +198,7 @@ fn publish_catalog(bus: &dyn Bus, m: &Market, kind: &str, seq: &mut u64) {
         start_ts_ns: Some(m.info.start_ns),
         expiry_ts_ns: Some(m.info.expiry_ns),
         winner: None,
+        strike: None,
         min_order_size: m.info.min_order_size,
         tick_size: m.info.tick_size,
         fee_rate: m.info.fee_rate,
