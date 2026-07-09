@@ -16,15 +16,15 @@ strategy.
 ## 1. Dataflow (one new feed, one new rule, one new fitter)
 
 ```
- coinbase WS ──► CoinbaseCollector ──► market.coinbase.spot.BTC-USD.book ─┐
- kalshi WS ────► KalshiCollector ────► market.kalshi.<mkt>.YES.book ──────┤
-                 (meta + STRIKE) ────► market.kalshi.catalog (Meta) ──────┤
-                                                                          ▼
-                                                             Processor(MarketState)
-                                                                          │
-                                                            FairRideRule (per event)
-                                                              │  ├─ EventFit (Δb,Δρ)
-                                                              │  ├─ FairSurface (MLP)
+ coinbase WS ──► CoinbaseCollector ──► market.coinbase.spot.BTC-USD.book ─┬────────────┐
+ kalshi WS ────► KalshiCollector ────► market.kalshi.<mkt>.YES.book ──────┤            │
+                 (meta + STRIKE) ────► market.kalshi.catalog (Meta) ──────┤            │
+                                                                          ▼            ▼
+                                                             Processor(MarketState)  Calibrator (own task,
+                                                                          │           fits on blocking thread)
+                                                            FairRideRule (per event)    │
+                                                              │  ├─ FairSurface (MLP)   │ calib.<market>
+                                                              │  ├─ latest Calib ◄──────┘ {Δb,Δρ,seq,rows,bce}
                                                               │  └─ ride gate + caps
                                                               ▼
                                                       signal.fair_ride ──► (executor later)
@@ -33,7 +33,8 @@ strategy.
 ```
 
 The binance perp feed keeps running (sampler, heartbeat) but plays no role in
-this rule. The 50ms sampler is untouched.
+this rule. The 50ms sampler is untouched. The **Calibrator is a separate bus
+module on its own task**: the processor's hot path never runs a fit.
 
 ## 2. Component A — CoinbaseCollector (new crate `collector-coinbase`)
 
@@ -73,37 +74,54 @@ arm an event whose meta lacks a strike (b prior is strike-anchored).
   tuples from torch; a Rust unit test asserts |Δlogit| < 1e-4 on all of them.
   **No live signal until this test exists and passes.**
 
-## 5. Component D — EventFit (the online (Δb,Δρ) fitter, `processor/src/fair.rs`)
+## 5. Component D — Calibrator (separate module, own task: `crates/processor/src/calib.rs` or crate `calibrator`)
 
-Replicates the sim's `FIT_MODE=expand` causal protocol exactly:
+A first-class bus `Module` (like Recorder/Processor), NOT rule-internal —
+the fit runs in parallel and the signal path never blocks on it.
 
+- **Own subscription**: `market.#` conflated; maintains its own lightweight
+  per-event view (strike from Meta, cb px, kalshi YES mid) — share-nothing
+  with the processor, consistent with the rest of the system.
 - **Sampling**: per active event, append `(tte_s, cb_px, kalshi_mid)` at 1s
-  cadence (kalshi mid = YES top mid), skipping rows where either side is
-  stale (>1.5s), the YES spread > 0.15, or the book is one-sided — the sim's
-  row filters.
-- **Schedule**: first fit when tte first ≤ 300s (requires ≥60 rows, i.e.
-  ≥1min of usable history; else keep waiting and stay disarmed); warm-started
-  refits when tte first ≤ 240/180/120/60, each on ALL rows collected so far.
+  cadence, skipping rows where either side is stale (>1.5s), the YES spread
+  > 0.15, or the book is one-sided — the sim's row filters.
+- **Schedule**: first fit when tte first ≤ 300s (requires ≥60 rows; else
+  keep waiting — the rule stays disarmed); warm-started refits when tte
+  first ≤ 240/180/120/60, each on ALL rows collected so far. Exactly the
+  sim's `FIT_MODE=expand`.
 - **Objective**: BCE(σ(logit(px_i; b, s)), clip(mid_i, .01, .99)),
   `b = strike + b_scale·Δb`, `s = exp(rho_bar + Δρ)`.
 - **Optimizer**: Adam (β=0.9/0.999, eps 1e-8), lr 0.05; 150 steps first fit,
-  60 per refit — same as sim. Gradients via central finite differences on the
-  2 params (4 batch-forwards/step; ≤300 rows × 150 steps ≈ sub-10ms in Rust).
-  Runs inline at the boundary tick (blocking the processor loop for ms is
-  acceptable; if profiling disagrees, move to `spawn_blocking` with the rule
-  disarmed until the result lands).
-- Emits a `fit` target log line per (re)fit: event, rows, Δb, Δρ, final BCE —
-  the shadow-phase audit trail.
+  60 per refit — same as sim. Gradients via central finite differences on
+  the 2 params (4 batch-forwards/step; ≤300 rows × 150 steps ≈ sub-10ms).
+- **Threading**: the module's tokio task detects boundaries and runs each
+  fit via `spawn_blocking` (dedicated OS thread pool) so the 2-core box's
+  async workers — collectors, processor, sampler — are never starved even
+  during the 150-step first fit. Results return to the module task, which
+  publishes.
+- **Output**: new payload variant `Payload::Calib(CalibUpdate)` on topic
+  `calib.<market_id>`: `{instrument, seq, fitted_at_tte_s, rows, d_b, d_rho,
+  bce, ts_ns}`. Recorder/events-log capture it for free (audit trail); a
+  `fit`-target log line mirrors it into trader-events.log.
+- **Failure containment**: calibrator death only stops NEW signals (rule
+  guard below), never corrupts them; it restarts stateless (re-accumulates
+  the current event or waits for the next one).
 
 ## 6. Component E — FairRideRule (`processor/src/rule.rs`)
 
-Per-event state: `EventFit`, ring buffer of raw `(ts_ns, cb_px, kalshi_mid)`
-(≥1.2s deep, event-driven), `entries: u8`, `armed: bool`.
+Per-event state: `latest_calib: Option<CalibUpdate>`, ring buffer of raw
+`(ts_ns, cb_px, kalshi_mid)` (≥1.2s deep, event-driven), `entries: u8`,
+`armed: bool`. The processor's subscription widens to `market.#` + `calib.#`
+(or the calibrator publishes under `market.calib.*` to reuse the pattern);
+`Payload::Calib` events just update `latest_calib` — no computation.
 
 On every book event for the coinbase reference or a live kalshi target:
 
-1. **Eligibility**: meta has strike; fitted; `60s < tte ≤ 300s`; kalshi fresh
-   (≤1.5s) and spread ≤ 0.15; cb quote age ≤ 5s.
+1. **Eligibility**: meta has strike; `latest_calib` present AND not stale
+   (fitted_at within the current schedule window +30s grace — a dead
+   calibrator disarms the rule rather than trading on old params);
+   `60s < tte ≤ 300s`; kalshi fresh (≤1.5s) and spread ≤ 0.15; cb quote age
+   ≤ 5s.
 2. `fair = surface(cb_px; b, s)`, `gap = fair − kalshi_mid`, `side = sign`.
 3. **Hysteresis/cap**: if `!armed`: re-arm when `|gap| ≤ 0.02`, else return.
    If `entries ≥ 3`: return (event done).
@@ -136,12 +154,27 @@ processor:
     entry_max_tte_s: 300
     max_entries_per_event: 3   # tail cap        (spec)
     lookback_ms: [1000, 10000] # ride window bounds
-    fit: { first_tte_s: 300, refit_every_s: 60, steps_first: 150,
-           steps_refit: 60, lr: 0.05, min_rows: 60, sample_ms: 1000,
-           max_spread: 0.15, stale_ms: 1500 }
+    calib_grace_s: 30          # disarm if calibrator falls behind schedule
+
+calibrator:                    # the separate fitting module
+  enabled: true
+  reference: "coinbase.spot.BTC-USD"
+  model_path: "models/fair-cb-x60.json"   # same surface as the rule
+  first_tte_s: 300
+  refit_every_s: 60
+  steps_first: 150
+  steps_refit: 60
+  lr: 0.05
+  min_rows: 60
+  sample_ms: 1000
+  max_spread: 0.15
+  stale_ms: 1500
 ```
 
 Every number above is the frozen spec / sim protocol — nothing new is tuned.
+`FairSurface` is shared: both the calibrator (for fitting) and the rule (for
+fair evaluation) load the same JSON; the Calib event carries a model-file
+hash so a mismatched pair refuses to arm.
 
 ## 7. Validation gates (in order; each gates the next)
 
