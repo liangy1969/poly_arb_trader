@@ -190,6 +190,7 @@ dependencies = [
  "arb-core",
  "async-trait",
  "serde",
+ "serde_json",
  "tokio",
  "tracing",
 ]
