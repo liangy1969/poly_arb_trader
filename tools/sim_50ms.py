@@ -424,6 +424,7 @@ def main():
     trades = {d: [] for d in DELTAS}
     unfilled = {d: 0 for d in DELTAS}
     tdump = []
+    rdump = []
     fstats = {b: {"bias": [], "mae": [], "rmse": []} for b in range(5)}  # 0:300-240 .. 4:60-0
     for t in test_ev:
         d = ev[t]
@@ -563,6 +564,18 @@ def main():
                     continue
                 won = outc == 1 if side_yes else outc == 0
                 cost = p_entry + fee(p_entry)
+                if EXIT_MODE == "revert" and TRADES_OUT:
+                    j = k - 1
+                    while j > 0 and (tte_p[j] - tte_p[k]) < 1.0 and (k - j) < 40:
+                        j -= 1
+                    if j >= 0 and 1.0 <= (tte_p[j] - tte_p[k]) <= 10.0:
+                        rdfair = fair[k] - fair[j]
+                        rdmid = mid_p[k] - mid_p[j]
+                    else:
+                        rdfair = rdmid = float("nan")
+                    rmeta = (dl, t, won, cost, abs(gap[k]), tte_p[k], side_yes, rdfair, rdmid)
+                else:
+                    rmeta = None
                 if EXIT_MODE == "settle" and TRADES_OUT:
                     # 1s-lookback trigger decomposition: how much of the gap at
                     # entry was opened by the MODEL moving (fair) vs the MARKET
@@ -597,8 +610,17 @@ def main():
                             post.extend((fair[jj], mid_p[jj]))
                         else:
                             post.extend((float("nan"), float("nan")))
+                    # first gap closure (<1c) after entry: time + who traveled
+                    close_s = close_df = close_dm = float("nan")
+                    for jj in range(k + 1, len(tte_p)):
+                        if abs(fair[jj] - mid_p[jj]) < 0.01:
+                            close_s = tte_p[k] - tte_p[jj]
+                            close_df = fair[jj] - fair[k]
+                            close_dm = mid_p[jj] - mid_p[k]
+                            break
                     tdump.append((dl, t, won, cost, abs(gap[k]), tte_p[k], side_yes, dfair, dmid,
-                                  ask_at(k), fut[0], fut[1], fut[2], fair[k], mid_p[k], *post))
+                                  ask_at(k), fut[0], fut[1], fut[2], fair[k], mid_p[k], *post,
+                                  close_s, close_df, close_dm))
                 if EXIT_MODE == "revert":
                     elapsed = tte_p[k] - tte_p[k + 1 :]
                     closed = np.abs(gap[k + 1 :]) <= EXIT_EPS
@@ -616,11 +638,15 @@ def main():
                             ret_maker = no_ask - cost
                         hold_s = float(elapsed[cand[0]])
                         trades[dl].append((won, cost, abs(gap[k]), tte_p[k], side_yes, ret_taker, ret_maker, how, hold_s))
+                        if rmeta is not None:
+                            rdump.append(rmeta + (ret_taker, ret_maker, how, hold_s))
                         armed = how == "revert"  # gap<=eps at a revert exit
                         k = j + 1
                         continue
                     ret = float(won) - cost
                     trades[dl].append((won, cost, abs(gap[k]), tte_p[k], side_yes, ret, ret, "settle", float(tte_p[k])))
+                    if rmeta is not None:
+                        rdump.append(rmeta + (ret, ret, "settle", float(tte_p[k])))
                     break  # rode to settlement; event over
                 else:
                     trades[dl].append((won, cost, abs(gap[k]), tte_p[k], side_yes))
@@ -636,10 +662,20 @@ def main():
             if b["mae"]:
                 print(f"{f'{hi}-{lo}s':>12} {len(b['mae']):>5} {np.mean(b['bias']):>+8.4f} {np.mean(b['mae']):>8.4f} {np.mean(b['rmse']):>8.4f}")
 
-    if TRADES_OUT:
+    if TRADES_OUT and EXIT_MODE == "revert":
         with open(TRADES_OUT, "w", newline="") as f:
             w = csv.writer(f)
-            hcols = [f"{n}{h}" for h in (5, 15, 30, 60, 120) for n in ("fair", "mid")]
+            w.writerow(["delta", "ticker", "won", "cost", "gap", "tte", "side_yes", "dfair1s", "dmid1s",
+                        "ret_taker", "ret_maker", "how", "hold_s"])
+            for r in rdump:
+                w.writerow([r[0], r[1], int(r[2]), f"{r[3]:.4f}", f"{r[4]:.4f}", f"{r[5]:.1f}", int(r[6]),
+                            f"{r[7]:.4f}", f"{r[8]:.4f}", f"{r[9]:.4f}", f"{r[10]:.4f}", r[11], f"{r[12]:.1f}"])
+        print(f"revert trades -> {TRADES_OUT} ({len(rdump)} rows)")
+
+    if TRADES_OUT and EXIT_MODE != "revert":
+        with open(TRADES_OUT, "w", newline="") as f:
+            w = csv.writer(f)
+            hcols = [f"{n}{h}" for h in (5, 15, 30, 60, 120) for n in ("fair", "mid")] + ["close_s", "close_dfair", "close_dmid"]
             w.writerow(["delta", "ticker", "won", "cost", "gap", "tte", "side_yes", "dfair1s", "dmid1s",
                         "ask0", "ask100", "ask300", "ask500", "fair0", "mid0"] + hcols)
             for r in tdump:
