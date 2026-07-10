@@ -95,6 +95,12 @@ PX_NATIVE = os.environ.get("PX_NATIVE", "")
 MAX_EV = int(os.environ.get("MAX_ENTRIES_PER_EVENT", "0"))
 # TRADES_OUT=path: dump per-trade rows (settle mode) for clustered stats.
 TRADES_OUT = os.environ.get("TRADES_OUT", "")
+# FAIR_STATS=1: aggregate per-event fair-vs-mid tracking error over the
+# trade window (bias/MAE/RMSE by tte-minute bucket, event-weighted).
+FAIR_STATS = os.environ.get("FAIR_STATS", "") == "1"
+# FIT_WINDOW_S: in expand mode, fit (db,dr) on only the LAST this-many
+# seconds before each boundary (0 = all history since open, the default).
+FIT_WINDOW_S = float(os.environ.get("FIT_WINDOW_S", "0"))
 
 KALSHI = "https://api.elections.kalshi.com/trade-api/v2"
 
@@ -418,6 +424,7 @@ def main():
     trades = {d: [] for d in DELTAS}
     unfilled = {d: 0 for d in DELTAS}
     tdump = []
+    fstats = {b: {"bias": [], "mae": [], "rmse": []} for b in range(5)}  # 0:300-240 .. 4:60-0
     for t in test_ev:
         d = ev[t]
         outc = 1 if meta[t]["result"] == "yes" else 0
@@ -437,7 +444,10 @@ def main():
             init = None
             for B in range(FIT_TTE_S, 0, -60):
                 fitm = d["tte"] > B
-                if fitm[sl].sum() < 60:
+                if FIT_WINDOW_S > 0:
+                    fitm &= d["tte"] <= B + FIT_WINDOW_S
+                min_fit_rows = 30 if FIT_WINDOW_S > 0 else 60
+                if fitm[sl].sum() < min_fit_rows:
                     continue
                 mid_f = ((d["ybid"] + d["yask"]) / 2.0)[fitm][sl]
                 db, dr = fit_event(
@@ -482,6 +492,15 @@ def main():
                 fair = torch.sigmoid(lo).numpy()
         mid_p = (ybid_p + yask_p) / 2.0
         gap = fair - mid_p
+        if FAIR_STATS:
+            err = fair - mid_p
+            for bi in range(5):
+                hi, lo = 300 - 60 * bi, 300 - 60 * (bi + 1)
+                m = (tte_p <= hi) & (tte_p > lo)
+                if m.sum() >= 20:
+                    fstats[bi]["bias"].append(float(err[m].mean()))
+                    fstats[bi]["mae"].append(float(np.abs(err[m]).mean()))
+                    fstats[bi]["rmse"].append(float(np.sqrt((err[m] ** 2).mean())))
         for dl in DELTAS:
             # EPISODE semantics (2026-07-06): trade EVERY excursion of the gap
             # past the threshold, not just the first. Armed -> enter when
@@ -566,8 +585,20 @@ def main():
                         while jj + 1 < len(tte_p) and (tte_p[k] - tte_p[jj]) < h:
                             jj += 1
                         fut.append(ask_at(jj) if (tte_p[k] - tte_p[jj]) >= h and (tte_p[k] - tte_p[jj]) <= h + 1.0 else float("nan"))
+                    # post-entry reconciliation path: (fair, mid) at horizons
+                    # after entry — how the gap resolves (market catch-up vs
+                    # model reversion).
+                    post = []
+                    for h in (5.0, 15.0, 30.0, 60.0, 120.0):
+                        jj = k
+                        while jj + 1 < len(tte_p) and (tte_p[k] - tte_p[jj]) < h:
+                            jj += 1
+                        if (tte_p[k] - tte_p[jj]) >= h:
+                            post.extend((fair[jj], mid_p[jj]))
+                        else:
+                            post.extend((float("nan"), float("nan")))
                     tdump.append((dl, t, won, cost, abs(gap[k]), tte_p[k], side_yes, dfair, dmid,
-                                  ask_at(k), fut[0], fut[1], fut[2]))
+                                  ask_at(k), fut[0], fut[1], fut[2], fair[k], mid_p[k], *post))
                 if EXIT_MODE == "revert":
                     elapsed = tte_p[k] - tte_p[k + 1 :]
                     closed = np.abs(gap[k + 1 :]) <= EXIT_EPS
@@ -595,14 +626,26 @@ def main():
                     trades[dl].append((won, cost, abs(gap[k]), tte_p[k], side_yes))
                 k += 1
 
+    if FAIR_STATS:
+        print()
+        print("=== FAIR vs MARKET tracking error (per-event means, trade window) ===")
+        print(f"{'tte bucket':>12} {'n_ev':>5} {'bias':>8} {'MAE':>8} {'RMSE':>8}")
+        for bi in range(5):
+            hi, lo = 300 - 60 * bi, 300 - 60 * (bi + 1)
+            b = fstats[bi]
+            if b["mae"]:
+                print(f"{f'{hi}-{lo}s':>12} {len(b['mae']):>5} {np.mean(b['bias']):>+8.4f} {np.mean(b['mae']):>8.4f} {np.mean(b['rmse']):>8.4f}")
+
     if TRADES_OUT:
         with open(TRADES_OUT, "w", newline="") as f:
             w = csv.writer(f)
+            hcols = [f"{n}{h}" for h in (5, 15, 30, 60, 120) for n in ("fair", "mid")]
             w.writerow(["delta", "ticker", "won", "cost", "gap", "tte", "side_yes", "dfair1s", "dmid1s",
-                        "ask0", "ask100", "ask300", "ask500"])
+                        "ask0", "ask100", "ask300", "ask500", "fair0", "mid0"] + hcols)
             for r in tdump:
                 w.writerow([r[0], r[1], int(r[2]), f"{r[3]:.4f}", f"{r[4]:.4f}", f"{r[5]:.1f}", int(r[6]),
-                            f"{r[7]:.4f}", f"{r[8]:.4f}", f"{r[9]:.3f}", f"{r[10]:.3f}", f"{r[11]:.3f}", f"{r[12]:.3f}"])
+                            f"{r[7]:.4f}", f"{r[8]:.4f}", f"{r[9]:.3f}", f"{r[10]:.3f}", f"{r[11]:.3f}", f"{r[12]:.3f}"]
+                           + [f"{x:.4f}" for x in r[13:]])
         print(f"trades -> {TRADES_OUT} ({len(tdump)} rows)")
 
     print(f"\n=== TEST ({len(test_ev)} events): fit tte>{FIT_TTE_S}s, trade tte<={FIT_TTE_S}s, REAL bid/ask entries, exit={EXIT_MODE} ===")
