@@ -88,6 +88,11 @@ PX_FROM_FEAT = os.environ.get("PX_FROM_FEAT", "") == "1"
 # cb_ask, age<=5s) — the online-collected settlement-chain price. Rows
 # without a usable cb quote are dropped.
 PX_NATIVE = os.environ.get("PX_NATIVE", "")
+# NATIVE_MOM=1: reconstruct momentum extras (mom15/mom60/mom180) from the
+# model's own price series (after PX_NATIVE selection), z-scored with the
+# model JSON's mu/sd. Rows in the first 180s of an event's data are dropped
+# (no lookback), for every model variant identically.
+NATIVE_MOM = os.environ.get("NATIVE_MOM", "") == "1"
 # MAX_ENTRIES_PER_EVENT: cap stacked episodes per event per delta (0 = off).
 # Motivation (2026-07-08 event-level study): losses concentrate in trending
 # events where the gap keeps re-opening — 25-trade one-sided pileups; you
@@ -280,6 +285,29 @@ def main():
             dropped += int((~ok).sum())
             kept += int(ok.sum())
         print(f"native cb price: kept {kept:,} rows, dropped {dropped:,} (no fresh cb quote)")
+    if NATIVE_MOM:
+        moms_wanted = [int(c[3:]) for c in extras_names if c.startswith("mom")]
+        assert moms_wanted and len(moms_wanted) == len(extras_names), "NATIVE_MOM expects mom-only extras"
+        mu = np.array(js.get("mu", [0.0] * len(extras_names)))
+        sd = np.array(js.get("sd", [1.0] * len(extras_names)))
+        kept = dropped = 0
+        for t, d in ev.items():
+            ts = d["ts"]
+            X = np.full((len(ts), len(moms_wanted)), np.nan)
+            for ci, k in enumerate(moms_wanted):
+                idx = np.searchsorted(ts, ts - k * 1000.0, side="right") - 1
+                okk = idx >= 0
+                okk[okk] &= (ts[okk] - ts[idx[okk]]) <= (k * 1000.0 + 2000.0)
+                col = np.full(len(ts), np.nan)
+                col[okk] = d["spot"][okk] - d["spot"][idx[okk]]
+                X[:, ci] = col
+            ok = ~np.isnan(X).any(axis=1)
+            d["X"] = np.clip((X - mu) / sd, -5, 5)
+            for kcol in list(d):
+                d[kcol] = d[kcol][ok]
+            dropped += int((~ok).sum())
+            kept += int(ok.sum())
+        print(f"native mom: kept {kept:,} rows, dropped {dropped:,} (no lookback)")
     if FEAT_NATIVE:
         if [c for c in extras_names if c != "imb1"]:
             sys.exit(f"FEAT_NATIVE only provides imb1; model wants {extras_names}")
@@ -323,7 +351,7 @@ def main():
             dropped += int((~ok).sum())
             kept += int(ok.sum())
         print(f"feature align: kept {kept:,} rows, dropped {dropped:,} (stale>{FEAT_STALE_MS:.0f}ms)")
-    else:
+    elif not NATIVE_MOM:
         if extras_names:
             sys.exit(f"model needs extras {extras_names} but FEAT not set")
         for d in ev.values():

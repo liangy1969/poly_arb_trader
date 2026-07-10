@@ -52,7 +52,7 @@ B_SCALE = float(os.environ.get("B_SCALE", "50"))
 # only online-fittable quantity).
 TARGET = os.environ.get("TARGET", "market")
 
-FEATS = ["imb1", "imb5", "imb20", "imb100", "band5", "band10", "band25", "moff_bps", "spread_bps", "mom15", "mom60", "mom180"]
+FEATS = ["imb1", "imb5", "imb20", "imb100", "band5", "band10", "band25", "moff_bps", "spread_bps", "basis", "mom15", "mom60", "mom180", "dbasis15", "dbasis60"]
 ABLATIONS = [
     ("base", []),
     ("imb1", ["imb1"]),
@@ -63,6 +63,9 @@ ABLATIONS = [
     ("all", ["imb1", "imb5", "imb20", "imb100", "band5", "band10", "band25", "moff_bps"]),
     ("mom", ["mom60"]),
     ("momK", ["mom15", "mom60", "mom180"]),
+    ("px2", ["basis"]),
+    ("px2K", ["basis", "dbasis15", "dbasis60"]),
+    ("px2mom", ["basis", "dbasis15", "dbasis60", "mom15", "mom60", "mom180"]),
 ]
 # ABL=base,imb1 : run only the named ablations (default: all of them)
 _abl = [a for a in os.environ.get("ABL", "").split(",") if a]
@@ -80,8 +83,10 @@ def load_feats(path):
     o = np.argsort(T)
     T = T[o]
     mid = np.array(cols["mid"])[o]
-    base_feats = [k for k in FEATS if not k.startswith("mom")]
-    X = np.stack([np.array(cols[k])[o] for k in base_feats], axis=1)
+    base_feats = [k for k in FEATS if not (k.startswith("mom") or k.startswith("dbasis"))]
+    X = np.stack(
+        [np.array(cols[k])[o] if k in cols else np.zeros(len(T)) for k in base_feats], axis=1
+    )
     # momentum features: k-second underlying return, from the same series
     lut = dict(zip(T.tolist(), mid.tolist()))
     moms = []
@@ -89,6 +94,17 @@ def load_feats(path):
         prev = np.array([lut.get(int(t) - k, np.nan) for t in T])
         moms.append(mid - prev)
     X = np.concatenate([X, np.stack(moms, axis=1)], axis=1)
+    # basis-change features (only meaningful when the file carries `basis`)
+    if "basis" in cols:
+        bas = np.array(cols["basis"])[o]
+        blut = dict(zip(T.tolist(), bas.tolist()))
+        dbs = []
+        for k in (15, 60):
+            prev = np.array([blut.get(int(t) - k, np.nan) for t in T])
+            dbs.append(bas - prev)
+    else:
+        dbs = [np.zeros(len(T)), np.zeros(len(T))]
+    X = np.concatenate([X, np.stack(dbs, axis=1)], axis=1)
     ok = ~np.isnan(X).any(axis=1)
     return T[ok], mid[ok], X[ok]
 
@@ -293,6 +309,12 @@ def run(extras, ev, order, fcols, train_all=False):
         else:
             m_extra_adj = None
         m = {"kl": kl_row.mean()}
+        tte_pred = tte_v[pred]
+        for bi, (bhi, blo) in enumerate(((300, 240), (240, 180), (180, 120), (120, 60))):
+            bm = (tte_pred <= bhi) & (tte_pred > blo)
+            if bm.sum() >= 15:
+                m[f"bF{bi}"] = bo_f[bm].mean()
+                m[f"bM{bi}"] = bo_m[bm].mean()
         if core.sum() >= 30:
             m["kl_core"] = kl_row[core].mean()
             m["out_model_core"] = bo_f[core].mean()
@@ -369,6 +391,16 @@ def main():
             return x.mean() / (x.std(ddof=1) / math.sqrt(len(x))) if len(x) > 2 and x.std() > 0 else float("nan")
         dkl_s = f"{np.mean(dkl):+.5f}({tstat(dkl):+.1f})" if dkl and name != "base" else "-"
         dout_s = f"{np.mean(dout):+.5f}({tstat(dout):+.1f})" if dout and name != "base" else "-"
+        if os.environ.get("BUCKET_BCE", "") == "1":
+            cells = []
+            for bi, lab in enumerate(("300-240", "240-180", "180-120", "120-60")):
+                bf = [x[f"bF{bi}"] for x in pe.values() if f"bF{bi}" in x]
+                bmk = [x[f"bM{bi}"] for x in pe.values() if f"bM{bi}" in x]
+                if bf:
+                    dd = np.array(bf) - np.array(bmk)
+                    tt = dd.mean() / (dd.std(ddof=1) / math.sqrt(len(dd))) if len(dd) > 2 and dd.std() > 0 else float("nan")
+                    cells.append(f"{lab}: F{np.mean(bf):.4f} M{np.mean(bmk):.4f} d{dd.mean():+.4f}(t{tt:+.1f})")
+            print(f"    [{name}] " + "  ".join(cells), flush=True)
         adj = agg(pe, 'out_adj_core')
         adj_s = f" adjOut {adj:.4f}" if adj == adj else ""
         print(
