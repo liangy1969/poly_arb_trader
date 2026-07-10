@@ -47,8 +47,12 @@ CLIP = 0.005
 RHO0 = float(os.environ.get("RHO0", "150"))
 SKIP_LAST_S = float(os.environ.get("SKIP_LAST_S", "0"))
 B_SCALE = float(os.environ.get("B_SCALE", "50"))
+# TARGET=outcome trains the surface on settlement labels instead of the
+# market prob (the per-event eval fit ALWAYS uses market mid - that is the
+# only online-fittable quantity).
+TARGET = os.environ.get("TARGET", "market")
 
-FEATS = ["imb1", "imb5", "imb20", "imb100", "band5", "band10", "band25", "moff_bps", "spread_bps"]
+FEATS = ["imb1", "imb5", "imb20", "imb100", "band5", "band10", "band25", "moff_bps", "spread_bps", "mom15", "mom60", "mom180"]
 ABLATIONS = [
     ("base", []),
     ("imb1", ["imb1"]),
@@ -57,6 +61,8 @@ ABLATIONS = [
     ("moff", ["moff_bps"]),
     ("sprd", ["spread_bps"]),
     ("all", ["imb1", "imb5", "imb20", "imb100", "band5", "band10", "band25", "moff_bps"]),
+    ("mom", ["mom60"]),
+    ("momK", ["mom15", "mom60", "mom180"]),
 ]
 # ABL=base,imb1 : run only the named ablations (default: all of them)
 _abl = [a for a in os.environ.get("ABL", "").split(",") if a]
@@ -74,8 +80,17 @@ def load_feats(path):
     o = np.argsort(T)
     T = T[o]
     mid = np.array(cols["mid"])[o]
-    X = np.stack([np.array(cols[k])[o] for k in FEATS], axis=1)
-    return T, mid, X
+    base_feats = [k for k in FEATS if not k.startswith("mom")]
+    X = np.stack([np.array(cols[k])[o] for k in base_feats], axis=1)
+    # momentum features: k-second underlying return, from the same series
+    lut = dict(zip(T.tolist(), mid.tolist()))
+    moms = []
+    for k in (15, 60, 180):
+        prev = np.array([lut.get(int(t) - k, np.nan) for t in T])
+        moms.append(mid - prev)
+    X = np.concatenate([X, np.stack(moms, axis=1)], axis=1)
+    ok = ~np.isnan(X).any(axis=1)
+    return T[ok], mid[ok], X[ok]
 
 
 def load_kalshi(data_dir, t_lo, t_hi):
@@ -149,7 +164,10 @@ def run(extras, ev, order, fcols, train_all=False):
         eidx.append(np.full(ok.sum(), i))
         tte.append(d["tte"][ok])
         px.append(d["px"][ok])
-        prob.append(d["prob"][ok])
+        if TARGET == "outcome":
+            prob.append(np.full(ok.sum(), float(d["outcome"])))
+        else:
+            prob.append(d["prob"][ok])
         xf.append(d["X"][ok][:, fidx] if fidx else np.zeros((ok.sum(), 0)))
     eidx = np.concatenate(eidx).astype(np.int64)
     tte_a = np.concatenate(tte)
@@ -188,6 +206,38 @@ def run(extras, ev, order, fcols, train_all=False):
         p.requires_grad_(False)
     rho_f = rho.detach()
 
+    # RESID_MOM=1: logistic residual outcome ~ logit_fair + beta*mom_norm,
+    # beta fit on the train rows (using their trained per-event params).
+    beta = 0.0
+    mom_col = fcols.index("mom60")
+    if os.environ.get("RESID_MOM", "") == "1":
+        with torch.no_grad():
+            lo_tr = logit_of(net, SP, TT, XF, strikes[E] + B_SCALE * d_b[E].detach(), torch.exp(rho_f + d_r[E].detach()))
+        mom_raw = []
+        for i, t in enumerate(tr_ids):
+            d = ev[t]
+            ok = ~np.isnan(d["px"])
+            if SKIP_LAST_S > 0:
+                ok &= d["tte"] > SKIP_LAST_S
+            mom_raw.append(d["X"][ok][:, mom_col])
+        mom_a = np.concatenate(mom_raw)
+        m_mu, m_sd = mom_a.mean(), mom_a.std() + 1e-9
+        mz = torch.tensor(np.clip((mom_a - m_mu) / m_sd, -5, 5), dtype=torch.float32)
+        yo = torch.tensor(np.concatenate([np.full(int((~np.isnan(ev[t]["px"]) & (ev[t]["tte"] > SKIP_LAST_S if SKIP_LAST_S > 0 else ~np.isnan(ev[t]["px"]))).sum()) if False else int(len(x)), float(ev[t]["outcome"])) for t, x in zip(tr_ids, mom_raw)]), dtype=torch.float32)
+        b_p = torch.zeros(1, requires_grad=True)
+        a_p = torch.zeros(1, requires_grad=True)
+        ob = torch.optim.Adam([b_p, a_p], lr=0.05)
+        Wt = W
+        for _ in range(200):
+            ob.zero_grad()
+            lo2 = lo_tr + a_p + b_p * mz
+            loss = nn.functional.binary_cross_entropy_with_logits(lo2, yo, weight=Wt, reduction="sum") / Wt.sum()
+            loss.backward()
+            ob.step()
+        beta = float(b_p)
+        print(f"  RESID_MOM: beta={beta:+.4f} alpha={float(a_p):+.4f} (mom60 z-scored, train outcome fit)")
+        globals()["_RESID"] = (beta, float(a_p), m_mu, m_sd, mom_col)
+
     per_ev = {}  # ticker -> dict of per-event metrics (for pairing)
     for t in val_ids:
         d = ev[t]
@@ -222,6 +272,13 @@ def run(extras, ev, order, fcols, train_all=False):
             fair = torch.sigmoid(lo).numpy()
         mid_p = np.clip(prob_v[pred], CLIP, 1 - CLIP)
         f = np.clip(fair, CLIP, 1 - CLIP)
+        if "_RESID" in globals():
+            _b, _a, _mu, _sd, _mc = globals()["_RESID"]
+            mzv = np.clip((d["X"][ok][:, _mc][pred] - _mu) / _sd, -5, 5)
+            lo_adj = np.log(f / (1 - f)) + _a + _b * mzv
+            f_adj = np.clip(1 / (1 + np.exp(-lo_adj)), CLIP, 1 - CLIP)
+        else:
+            f_adj = None
         bce = -(mid_p * np.log(f) + (1 - mid_p) * np.log(1 - f))
         H = -(mid_p * np.log(mid_p) + (1 - mid_p) * np.log(1 - mid_p))
         kl_row = bce - H
@@ -229,11 +286,19 @@ def run(extras, ev, order, fcols, train_all=False):
         o = d["outcome"]
         bo_f = -(o * np.log(f) + (1 - o) * np.log(1 - f))
         bo_m = -(o * np.log(mid_p) + (1 - o) * np.log(1 - mid_p))
+        if f_adj is not None:
+            bo_adj = -(o * np.log(f_adj) + (1 - o) * np.log(1 - f_adj))
+            if core.sum() >= 30:
+                m_extra_adj = bo_adj[core].mean()
+        else:
+            m_extra_adj = None
         m = {"kl": kl_row.mean()}
         if core.sum() >= 30:
             m["kl_core"] = kl_row[core].mean()
             m["out_model_core"] = bo_f[core].mean()
             m["out_market_core"] = bo_m[core].mean()
+            if f_adj is not None:
+                m["out_adj_core"] = bo_adj[core].mean()
         if (~core).sum() >= 30:
             m["kl_last"] = kl_row[~core].mean()
         per_ev[t] = m
@@ -304,10 +369,12 @@ def main():
             return x.mean() / (x.std(ddof=1) / math.sqrt(len(x))) if len(x) > 2 and x.std() > 0 else float("nan")
         dkl_s = f"{np.mean(dkl):+.5f}({tstat(dkl):+.1f})" if dkl and name != "base" else "-"
         dout_s = f"{np.mean(dout):+.5f}({tstat(dout):+.1f})" if dout and name != "base" else "-"
+        adj = agg(pe, 'out_adj_core')
+        adj_s = f" adjOut {adj:.4f}" if adj == adj else ""
         print(
             f"{name:>8} {len(pe):>4} {math.exp(r['rho']):>5.0f} {agg(pe,'kl_core'):>9.5f} {dkl_s:>16} "
             f"{agg(pe,'out_model_core'):>11.4f} {agg(pe,'out_market_core'):>11.4f} {dout_s:>16}  "
-            f"({agg(pe,'kl'):.4f} / {agg(pe,'kl_last'):.4f})",
+            f"({agg(pe,'kl'):.4f} / {agg(pe,'kl_last'):.4f}){adj_s}",
             flush=True,
         )
 

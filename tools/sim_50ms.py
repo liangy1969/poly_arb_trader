@@ -425,7 +425,7 @@ def main():
     unfilled = {d: 0 for d in DELTAS}
     tdump = []
     rdump = []
-    fstats = {b: {"bias": [], "mae": [], "rmse": []} for b in range(5)}  # 0:300-240 .. 4:60-0
+    fstats = {b: {"bias": [], "mae": [], "rmse": [], "bf": [], "bm": []} for b in range(5)}  # 0:300-240 .. 4:60-0
     for t in test_ev:
         d = ev[t]
         outc = 1 if meta[t]["result"] == "yes" else 0
@@ -502,6 +502,11 @@ def main():
                     fstats[bi]["bias"].append(float(err[m].mean()))
                     fstats[bi]["mae"].append(float(np.abs(err[m]).mean()))
                     fstats[bi]["rmse"].append(float(np.sqrt((err[m] ** 2).mean())))
+                    fc = np.clip(fair[m], 0.005, 0.995)
+                    mc = np.clip(mid_p[m], 0.005, 0.995)
+                    o = float(outc)
+                    fstats[bi]["bf"].append(float(-(o * np.log(fc) + (1 - o) * np.log(1 - fc)).mean()))
+                    fstats[bi]["bm"].append(float(-(o * np.log(mc) + (1 - o) * np.log(1 - mc)).mean()))
         for dl in DELTAS:
             # EPISODE semantics (2026-07-06): trade EVERY excursion of the gap
             # past the threshold, not just the first. Armed -> enter when
@@ -660,7 +665,10 @@ def main():
             hi, lo = 300 - 60 * bi, 300 - 60 * (bi + 1)
             b = fstats[bi]
             if b["mae"]:
-                print(f"{f'{hi}-{lo}s':>12} {len(b['mae']):>5} {np.mean(b['bias']):>+8.4f} {np.mean(b['mae']):>8.4f} {np.mean(b['rmse']):>8.4f}")
+                bf, bm = np.array(b["bf"]), np.array(b["bm"])
+                d = bf - bm
+                td = d.mean() / (d.std(ddof=1) / np.sqrt(len(d))) if len(d) > 2 and d.std() > 0 else float("nan")
+                print(f"{f'{hi}-{lo}s':>12} {len(b['mae']):>5} {np.mean(b['bias']):>+8.4f} {np.mean(b['mae']):>8.4f} {np.mean(b['rmse']):>8.4f}   bceF {bf.mean():.4f} bceM {bm.mean():.4f} d {d.mean():+.4f} (t{td:+.1f})")
 
     if TRADES_OUT and EXIT_MODE == "revert":
         with open(TRADES_OUT, "w", newline="") as f:
