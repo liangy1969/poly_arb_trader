@@ -461,6 +461,28 @@ def report(trades, bce_rows, a, models):
     print(" ~0 => the fair retreated = the model was wrong. Compare net P&L across")
     print(" the two columns: a real edge should earn where the market traveled.)")
 
+    # ── 5b. closure BY DATE: does the market keep coming to the model? ──
+    print(f"\n{'=' * 100}\n### 5b. CLOSURE BY DATE (median market_share = how much of the gap "
+          f"the MARKET closed)\n{'=' * 100}")
+    print("a decaying mkt_sh column = the market stopped chasing this model's fair")
+    dates = sorted({t["date"] for t in trades})
+    for dl in a.deltas:
+        print(f"\n  delta={dl}   (cells: mkt_sh | net/tr | n)")
+        for m in models:
+            lb = m["label"]
+            cells = []
+            for dt in dates:
+                C = [t for t in trades if t["model"] == lb and t["delta"] == dl
+                     and t["date"] == dt and not math.isnan(t["close_s"])]
+                if not C:
+                    cells.append(f"{'--':>19}")
+                    continue
+                ms = np.median([r["mkt_share"] for r in C])
+                nt = 100 * np.mean([r["net"] for r in C])
+                cells.append(f"{ms:>+5.2f} |{nt:>+6.1f}c |{len(C):>3d}")
+            print(f"    {lb:10s} " + "  ".join(
+                f"{dt[5:]} {c}" for dt, c in zip(dates, cells)))
+
 
 # ── main ─────────────────────────────────────────────────────────────────────
 def main():
