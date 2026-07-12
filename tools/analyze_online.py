@@ -424,64 +424,74 @@ def report(trades, bce_rows, a, models):
                       f"{np.mean([r['brier_mkt'] for r in R]):>7.4f} "
                       f"{np.mean([r['mae'] for r in R]):>9.4f}")
 
-    # ── 5. closure ──
-    print(f"\n{'=' * 100}\n### 5. CLOSURE: time to |fair-mid| < {100 * a.close_eps:.0f}c, "
-          f"and who traveled\n{'=' * 100}")
-    print("market_share = fraction of the closure the MARKET moved toward our fair")
-    print("fair_share   = fraction the FAIR retreated toward the market")
-    print("(the two sum to 1 PER TRADE; the medians below are taken separately "
-          "and need not sum to 1)")
+    # ── 5. closure: WHO MOVED. Headline first (see memory: closure-analysis-
+    # format) — the two signed mean moves, then the date x model breakdown of
+    # the same pair. The normalized shares are bimodal (a third of trades
+    # overshoot, a third go negative), so their medians mislead; the raw signed
+    # moves obey  mkt_move - fair_move = gap_at_entry,  which IS gap closure.
+    C_all = [t for t in trades if not math.isnan(t["close_s"])]
+
+    def moves(R):
+        """-> (mean market move, mean fair move, mean entry gap) in CENTS,
+        signed by trade direction (+ = moved the way the trade bets)."""
+        if not R:
+            return float("nan"), float("nan"), float("nan")
+        s = np.array([1.0 if r["side_yes"] else -1.0 for r in R])
+        mk = 100 * s * np.array([r["close_dmid"] for r in R])
+        fr = 100 * s * np.array([r["close_dfair"] for r in R])
+        g0 = 100 * np.array([r["gap"] for r in R])
+        return mk.mean(), fr.mean(), g0.mean()
+
+    print(f"\n{'=' * 100}\n### 5. CLOSURE: who moved, entry -> first |fair-mid| < "
+          f"{100 * a.close_eps:.0f}c\n{'=' * 100}")
+    mk, fr, g0 = moves(C_all)
+    print(f"  n = {len(C_all)} closed trades of {len(trades)} "
+          f"({100 * len(C_all) / max(1, len(trades)):.0f}% close before settle)")
+    print(f"  mean gap at entry : {g0:+6.2f}c")
+    print()
+    print(f"  mean MARKET move  : {mk:+6.2f}c   (toward the trade)")
+    print(f"  mean FAIR   move  : {fr:+6.2f}c   (away from the trade)")
+    print()
+    print(f"  -> the market did {100 * mk / (abs(mk) + abs(fr) + 1e-9):.0f}% of the closing, "
+          f"the model capitulated the rest.  (identity: mkt - fair = gap)")
+
+    print(f"\n--- 5a. same two numbers, BY DATE x MODEL  (m = market, f = fair, cents) ---")
+    dates = sorted({t["date"] for t in trades})
+    for m in models:
+        lb = m["label"]
+        cells = []
+        for dt in dates:
+            R = [t for t in C_all if t["model"] == lb and t["date"] == dt]
+            if not R:
+                cells.append(f"{'--':>18}")
+                continue
+            mk, fr, _ = moves(R)
+            cells.append(f"m{mk:>+5.1f} f{fr:>+5.1f} n{len(R):>3d}")
+        print(f"  {lb:10s} " + "  ".join(f"{dt[5:]} {c}" for dt, c in zip(dates, cells)))
+
+    print(f"\n--- 5b. per model x delta (+ closure timing) ---")
     for tag, T in panels(trades, a.fresh_from):
         print(f"\n{tag}")
         print(f"{'model':12s} {'delta':>6s} {'n':>5s} {'closed%':>8s} {'med_s':>6s} "
-              f"{'p90_s':>6s} {'mkt_sh':>7s} {'fair_sh':>8s} | "
-              f"{'net|mkt>0.5':>12s} {'net|mkt<0.5':>12s}")
+              f"{'gap0':>6s} {'mkt_mv':>7s} {'fair_mv':>8s} | {'net|WON':>9s} {'net|LOST':>9s}")
         for lb in labels:
             for dl in a.deltas:
                 R = [t for t in T if t["model"] == lb and t["delta"] == dl]
-                if not R:
-                    continue
                 C = [r for r in R if not math.isnan(r["close_s"])]
-                if not C:
-                    print(f"{lb:12s} {dl:>6.3f} {len(R):>5d} {'0%':>8s}")
+                if not R or not C:
                     continue
-                cs = np.array([r["close_s"] for r in C])
-                ms = np.array([r["mkt_share"] for r in C])
-                hi_ = [(r["ticker"], r["net"]) for r in C if r["mkt_share"] > 0.5]
-                lo_ = [(r["ticker"], r["net"]) for r in C if r["mkt_share"] <= 0.5]
-                f_hi = (f"{100 * np.mean([x[1] for x in hi_]):>+7.1f}c n={len(hi_):<3d}"
-                        if hi_ else f"{'--':>12}")
-                f_lo = (f"{100 * np.mean([x[1] for x in lo_]):>+7.1f}c n={len(lo_):<3d}"
-                        if lo_ else f"{'--':>12}")
-                print(f"{lb:12s} {dl:>6.3f} {len(R):>5d} {100 * len(C) / len(R):>7.0f}% "
-                      f"{np.median(cs):>6.1f} {np.percentile(cs, 90):>6.1f} "
-                      f"{np.median(ms):>+7.2f} {np.median([r['fair_share'] for r in C]):>+8.2f} | "
-                      f"{f_hi} {f_lo}")
-    print("\n(reads: mkt_share ~1 => the market came to the model = the ride thesis;")
-    print(" ~0 => the fair retreated = the model was wrong. Compare net P&L across")
-    print(" the two columns: a real edge should earn where the market traveled.)")
-
-    # ── 5b. closure BY DATE: does the market keep coming to the model? ──
-    print(f"\n{'=' * 100}\n### 5b. CLOSURE BY DATE (median market_share = how much of the gap "
-          f"the MARKET closed)\n{'=' * 100}")
-    print("a decaying mkt_sh column = the market stopped chasing this model's fair")
-    dates = sorted({t["date"] for t in trades})
-    for dl in a.deltas:
-        print(f"\n  delta={dl}   (cells: mkt_sh | net/tr | n)")
-        for m in models:
-            lb = m["label"]
-            cells = []
-            for dt in dates:
-                C = [t for t in trades if t["model"] == lb and t["delta"] == dl
-                     and t["date"] == dt and not math.isnan(t["close_s"])]
-                if not C:
-                    cells.append(f"{'--':>19}")
-                    continue
-                ms = np.median([r["mkt_share"] for r in C])
-                nt = 100 * np.mean([r["net"] for r in C])
-                cells.append(f"{ms:>+5.2f} |{nt:>+6.1f}c |{len(C):>3d}")
-            print(f"    {lb:10s} " + "  ".join(
-                f"{dt[5:]} {c}" for dt, c in zip(dates, cells)))
+                mk, fr, g0 = moves(C)
+                w = [r["net"] for r in C if r["won"]]
+                l = [r["net"] for r in C if not r["won"]]
+                print(f"{lb:12s} {dl:>6.3f} {len(R):>5d} "
+                      f"{100 * len(C) / len(R):>7.0f}% "
+                      f"{np.median([r['close_s'] for r in C]):>6.1f} {g0:>6.2f} "
+                      f"{mk:>+7.2f} {fr:>+8.2f} | "
+                      f"{100 * np.mean(w) if w else float('nan'):>+8.1f}c "
+                      f"{100 * np.mean(l) if l else float('nan'):>+8.1f}c")
+    print("\n(a real convergence edge would show market >> |fair|: the market comes to a")
+    print(" fair that stays put. An even split means the gap closes half because we were")
+    print(" wrong -- the gap is a trigger, not a mispricing.)")
 
 
 # ── main ─────────────────────────────────────────────────────────────────────
