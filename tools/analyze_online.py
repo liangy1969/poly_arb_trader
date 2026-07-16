@@ -516,9 +516,13 @@ def main():
                    help="gap must fall below this to re-arm (one trade/episode)")
     p.add_argument("--close-eps", type=float, default=0.01,
                    help="closure threshold for analysis 5")
-    p.add_argument("--cap", type=int, default=3,
-                   help="max entries per event per delta (0 = uncapped; the "
-                        "uncapped tail is ~6x the median event)")
+    p.add_argument("--cap", type=int, default=0,
+                   help="max entries per event per delta (0 = uncapped, the "
+                        "default; pass e.g. 3 to bound the per-event tail, "
+                        "which is ~6x the median event). NOTE: uncapped inflates "
+                        "raw P&L/Sharpe via stacked non-independent bets in "
+                        "trending events -- read the EVENT-CLUSTERED t, which "
+                        "discounts the stacking, as the honest metric.")
     p.add_argument("--fresh-from", default="", metavar="YYYY-MM-DD",
                    help="split every table in-sample vs fresh at this UTC date")
     p.add_argument("--meta-cache", default="",
