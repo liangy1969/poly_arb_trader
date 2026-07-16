@@ -26,14 +26,18 @@ use arb_core::model::CalibUpdate;
 use arb_core::module::{Health, Module};
 use arb_core::now_ns;
 
-use crate::fair::{FairSurface, FitRow};
+use crate::fair::{FairSurface, FeatureState, FitRow, MAX_EXTRA};
 
 #[derive(Clone, Deserialize)]
 #[serde(default)]
 pub struct CalibCfg {
     pub enabled: bool,
-    /// Reference price instrument (e.g. `coinbase.BTC` from cryptospot).
+    /// Reference PRICE instrument. cb model: `coinbase.BTC`. px2imb: the perp
+    /// (`binance.usdt_perp.BTCUSDT`) — its book also supplies imb1 sizes.
     pub reference: String,
+    /// BASIS reference instrument (coinbase mid for `basis = cb − perp`);
+    /// only used when the surface has extras. Default `coinbase.BTC`.
+    pub basis_reference: String,
     /// Market kind to calibrate (matches MarketMeta.kind).
     pub kind: String,
     pub model_path: String,
@@ -47,6 +51,10 @@ pub struct CalibCfg {
     pub sample_ms: i64,
     pub max_spread: f64,
     pub stale_ms: i64,
+    /// Rolling fit window (seconds): fit each boundary B on rows with tte in
+    /// (B, B+fit_window_s]. 0 = expanding (all history since open). The frozen
+    /// analysis config uses 120 — matches the sim's `FIT_WINDOW_S`.
+    pub fit_window_s: f64,
 }
 
 impl Default for CalibCfg {
@@ -54,6 +62,7 @@ impl Default for CalibCfg {
         CalibCfg {
             enabled: false,
             reference: "coinbase.BTC".into(),
+            basis_reference: "coinbase.BTC".into(),
             kind: "15m_updown".into(),
             model_path: "models/fair-cb-x60.json".into(),
             first_tte_s: 300.0,
@@ -66,6 +75,7 @@ impl Default for CalibCfg {
             sample_ms: 1000,
             max_spread: 0.15,
             stale_ms: 1500,
+            fit_window_s: 0.0,
         }
     }
 }
@@ -96,22 +106,37 @@ pub struct CalibCore {
     pub model_hash: u64,
     ref_px: f64,
     ref_ns: i64,
+    /// px2imb feature reconstruction (basis/dbasis/imb1); inactive for cb.
+    feats: FeatureState,
     events: HashMap<String, EvState>,
 }
 
 impl CalibCore {
     pub fn new(cfg: CalibCfg, surface: Arc<FairSurface>, model_hash: u64) -> Self {
-        CalibCore { cfg, surface, model_hash, ref_px: f64::NAN, ref_ns: 0, events: HashMap::new() }
+        let feats = FeatureState::new(surface.extras.clone());
+        CalibCore { cfg, surface, model_hash, ref_px: f64::NAN, ref_ns: 0, feats, events: HashMap::new() }
     }
 
     /// Feed one bus event; returns any calibration updates produced.
     pub fn on_event(&mut self, ev: &Event) -> Vec<CalibUpdate> {
         match &ev.payload {
             Payload::Book(b) if b.instrument == self.cfg.reference => {
+                if let (Some(&(bid, bsz)), Some(&(ask, asz))) = (b.bids.first(), b.asks.first()) {
+                    if bid > 0.0 && ask > 0.0 {
+                        let mid = 0.5 * (bid + ask);
+                        self.ref_px = mid;
+                        self.ref_ns = b.recv_ts_ns;
+                        // the price reference (perp for px2imb) also carries imb1 sizes
+                        if self.feats.active() {
+                            self.feats.on_perp(b.recv_ts_ns, mid, bsz, asz);
+                        }
+                    }
+                }
+            }
+            Payload::Book(b) if self.feats.active() && b.instrument == self.cfg.basis_reference => {
                 if let (Some(&(bid, _)), Some(&(ask, _))) = (b.bids.first(), b.asks.first()) {
                     if bid > 0.0 && ask > 0.0 {
-                        self.ref_px = 0.5 * (bid + ask);
-                        self.ref_ns = b.recv_ts_ns;
+                        self.feats.on_cb(b.recv_ts_ns, 0.5 * (bid + ask));
                     }
                 }
             }
@@ -170,17 +195,34 @@ impl CalibCore {
                 let y_fresh = st.y_ns > 0 && now - st.y_ns <= cfg.stale_ms * 1_000_000;
                 let two_sided = st.ybid > 0.0 && st.yask > 0.0 && st.yask > st.ybid;
                 if ref_fresh && y_fresh && two_sided && (st.yask - st.ybid) <= cfg.max_spread {
-                    st.rows.push(FitRow {
-                        tte_s,
-                        px: self.ref_px,
-                        mid: 0.5 * (st.ybid + st.yask),
-                    });
+                    // px2imb: reconstruct features; None (no lookback / stale cb)
+                    // ⇒ drop this sample, exactly as the sim drops NaN rows (but
+                    // still consume the 1s slot and fall through to the boundary
+                    // fit, which uses previously-collected rows).
+                    let feats = if self.feats.active() { self.feats.feats(now) } else { Some([0.0; MAX_EXTRA]) };
+                    if let Some(feats) = feats {
+                        st.rows.push(FitRow { tte_s, px: self.ref_px, mid: 0.5 * (st.ybid + st.yask), feats });
+                    }
                     st.last_sample_ns = now;
                 }
             }
             // boundary fit
             if tte_s <= st.next_boundary_s && st.next_boundary_s >= cfg.last_tte_s {
-                if st.rows.len() < cfg.min_rows {
+                let boundary = st.next_boundary_s;
+                // Rolling window: fit on rows with tte in (B, B+window]. Expanding
+                // (window 0) uses all collected rows. Borrow-free: filter into a
+                // scratch Vec since `self.surface` and `st` are both needed.
+                let fit_rows: Vec<FitRow> = if cfg.fit_window_s > 0.0 {
+                    st.rows
+                        .iter()
+                        .filter(|r| r.tte_s > boundary && r.tte_s <= boundary + cfg.fit_window_s)
+                        .copied()
+                        .collect()
+                } else {
+                    st.rows.clone()
+                };
+                let min_fit = if cfg.fit_window_s > 0.0 { 30 } else { cfg.min_rows };
+                if fit_rows.len() < min_fit {
                     continue; // keep waiting at this boundary until enough rows
                 }
                 let (steps, init) = if st.fitted {
@@ -188,13 +230,12 @@ impl CalibCore {
                 } else {
                     (cfg.steps_first, (0.0, 0.0))
                 };
-                let (db, dr) = self.surface.fit(&st.rows, st.strike, init, steps, cfg.lr);
-                let bce = self.surface.fit_loss(&st.rows, st.strike, db, dr);
+                let (db, dr) = self.surface.fit(&fit_rows, st.strike, init, steps, cfg.lr);
+                let bce = self.surface.fit_loss(&fit_rows, st.strike, db, dr);
                 st.d_b = db;
                 st.d_rho = dr;
                 st.fitted = true;
                 st.seq += 1;
-                let boundary = st.next_boundary_s;
                 st.next_boundary_s -= cfg.refit_every_s;
                 out.push(CalibUpdate {
                     instrument: inst.clone(),
@@ -202,7 +243,7 @@ impl CalibCore {
                     seq: st.seq,
                     ts_ns: now,
                     fitted_at_tte_s: boundary,
-                    rows: st.rows.len() as u32,
+                    rows: fit_rows.len() as u32,
                     d_b: db,
                     d_rho: dr,
                     bce,

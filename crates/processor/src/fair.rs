@@ -2,11 +2,14 @@
 //! core of the FairRide strategy (DESIGN_FAIR_RIDE §4/§5/§10).
 //!
 //! - Forward: τ = clamp(tte/900, 1e-4, 1); z′ = ((px − b)/s)/√τ;
-//!   logit = MLP([z′, ln τ]) (2→32→32→1 tanh, "direct" mode); fair = σ(logit).
+//!   logit = MLP([z′, ln τ, x₀…x_{k−1}]) (2+k→32→32→1 tanh, "direct" mode);
+//!   fair = σ(logit). The k EXTRA features (px2imb: basis, dbasis15, dbasis60,
+//!   imb1) are z-scored with the model's `mu`/`sd` and clipped to ±5 — exactly
+//!   the sim's `NATIVE_MOM` reconstruction. k = 0 is the plain cb surface.
 //! - Fit: full-batch Adam (lr .05, fresh moments per fit, fixed steps) on
 //!   BCE(σ(logit), clip(mid, .01, .99)) over the 2 params, gradients by
 //!   central finite difference (ε=1e-4). b = strike + b_scale·Δb,
-//!   s = exp(rho_bar + Δρ).
+//!   s = exp(rho_bar + Δρ). Features are held fixed per row during the fit.
 //!
 //! Everything is f64; parity vs PyTorch is asserted in output space
 //! (tests below: |Δlogit| < 1e-4 on exported vectors; |Δfair| < 0.005 across
@@ -16,6 +19,8 @@ use serde::Deserialize;
 
 const P_CLIP: f64 = 0.01;
 const FD_EPS: f64 = 1e-4;
+/// Compile-time cap on extra features (px2imb uses 4). Keeps `FitRow` `Copy`.
+pub const MAX_EXTRA: usize = 8;
 
 #[derive(Deserialize)]
 struct LayerJson {
@@ -35,6 +40,12 @@ struct ModelJson {
     rho_bar: f64,
     b_scale: f64,
     layers: Vec<LayerJson>,
+    #[serde(default)]
+    extras: Vec<String>,
+    #[serde(default)]
+    mu: Vec<f64>,
+    #[serde(default)]
+    sd: Vec<f64>,
 }
 
 /// The frozen fair-probability surface.
@@ -45,14 +56,28 @@ pub struct FairSurface {
     dims: Vec<(usize, usize)>, // (in, out) per layer
     pub rho_bar: f64,
     pub b_scale: f64,
+    /// Extra-feature names in input order (after [z′, ln τ]); empty for cb.
+    pub extras: Vec<String>,
+    mu: Vec<f64>,
+    sd: Vec<f64>,
 }
 
-/// One calibration sample: (tte seconds, reference price, kalshi YES mid).
+/// One calibration sample: tte seconds, reference price, kalshi YES mid, and
+/// the RAW extra features (un-z-scored; the surface z-scores with mu/sd). Only
+/// the first `surface.n_extra()` entries of `feats` are read.
 #[derive(Clone, Copy, Debug)]
 pub struct FitRow {
     pub tte_s: f64,
     pub px: f64,
     pub mid: f64,
+    pub feats: [f64; MAX_EXTRA],
+}
+
+impl FitRow {
+    /// Convenience constructor for the cb (no-extra) path.
+    pub fn new(tte_s: f64, px: f64, mid: f64) -> Self {
+        FitRow { tte_s, px, mid, feats: [0.0; MAX_EXTRA] }
+    }
 }
 
 impl FairSurface {
@@ -61,6 +86,17 @@ impl FairSurface {
         anyhow::ensure!(js.arch.mode == "direct", "unsupported model mode {}", js.arch.mode);
         anyhow::ensure!(js.layers.len() == 3, "expected 3 layers");
         anyhow::ensure!(js.layers[0].b.len() == js.arch.hidden, "hidden dim mismatch");
+        let n_extra = js.extras.len();
+        anyhow::ensure!(n_extra <= MAX_EXTRA, "too many extras ({n_extra} > {MAX_EXTRA})");
+        anyhow::ensure!(
+            js.mu.len() == n_extra && js.sd.len() == n_extra,
+            "mu/sd length must match extras ({n_extra})"
+        );
+        anyhow::ensure!(
+            js.layers[0].w[0].len() == 2 + n_extra,
+            "input dim {} != 2 + {n_extra} extras",
+            js.layers[0].w[0].len()
+        );
         let mut w = Vec::new();
         let mut b = Vec::new();
         let mut dims = Vec::new();
@@ -77,18 +113,39 @@ impl FairSurface {
             b.push(l.b.clone());
             dims.push((in_dim, out_dim));
         }
-        Ok(FairSurface { w, b, dims, rho_bar: js.rho_bar, b_scale: js.b_scale })
+        Ok(FairSurface {
+            w,
+            b,
+            dims,
+            rho_bar: js.rho_bar,
+            b_scale: js.b_scale,
+            extras: js.extras,
+            mu: js.mu,
+            sd: js.sd,
+        })
     }
 
     pub fn load(path: &str) -> anyhow::Result<Self> {
         Self::from_json(&std::fs::read_to_string(path)?)
     }
 
-    /// Raw model logit for (px, tte) under event params (b, s).
-    pub fn logit(&self, px: f64, tte_s: f64, b: f64, s: f64) -> f64 {
+    /// Number of extra features this surface consumes (0 for cb).
+    pub fn n_extra(&self) -> usize {
+        self.extras.len()
+    }
+
+    /// Raw model logit for (px, tte) under event params (b, s). `feats` are the
+    /// RAW extra features (only the first `n_extra` are read; z-scored here).
+    pub fn logit(&self, px: f64, tte_s: f64, b: f64, s: f64, feats: &[f64]) -> f64 {
         let tau = (tte_s / 900.0).clamp(1e-4, 1.0);
         let zp = ((px - b) / s) / tau.sqrt();
-        let mut h = vec![zp, tau.ln()];
+        let mut h = Vec::with_capacity(2 + self.extras.len());
+        h.push(zp);
+        h.push(tau.ln());
+        for i in 0..self.extras.len() {
+            // z-score + clip to ±5, matching the sim's np.clip((X-mu)/sd,-5,5)
+            h.push(((feats[i] - self.mu[i]) / self.sd[i]).clamp(-5.0, 5.0));
+        }
         for l in 0..3 {
             let (in_dim, out_dim) = self.dims[l];
             let mut out = vec![0.0f64; out_dim];
@@ -106,19 +163,21 @@ impl FairSurface {
     }
 
     /// Fair probability under event params (Δb, Δρ) with the strike prior.
-    pub fn fair(&self, px: f64, tte_s: f64, strike: f64, d_b: f64, d_rho: f64) -> f64 {
+    /// `feats` are the RAW extra features (empty slice for cb).
+    pub fn fair(&self, px: f64, tte_s: f64, strike: f64, d_b: f64, d_rho: f64, feats: &[f64]) -> f64 {
         let b = strike + self.b_scale * d_b;
         let s = (self.rho_bar + d_rho).exp();
-        sigmoid(self.logit(px, tte_s, b, s))
+        sigmoid(self.logit(px, tte_s, b, s, feats))
     }
 
-    /// Mean BCE(σ(logit), clip(mid)) over rows for params (Δb, Δρ).
+    /// Mean BCE(σ(logit), clip(mid)) over rows for params (Δb, Δρ). Each row's
+    /// fixed features feed the surface.
     pub fn fit_loss(&self, rows: &[FitRow], strike: f64, d_b: f64, d_rho: f64) -> f64 {
         let b = strike + self.b_scale * d_b;
         let s = (self.rho_bar + d_rho).exp();
         let mut acc = 0.0;
         for r in rows {
-            let l = self.logit(r.px, r.tte_s, b, s);
+            let l = self.logit(r.px, r.tte_s, b, s, &r.feats);
             let y = r.mid.clamp(P_CLIP, 1.0 - P_CLIP);
             // stable BCE-with-logits: max(l,0) − l·y + ln(1 + e^{−|l|})
             acc += l.max(0.0) - l * y + (-l.abs()).exp().ln_1p();
@@ -158,6 +217,120 @@ pub fn sigmoid(x: f64) -> f64 {
     1.0 / (1.0 + (-x).exp())
 }
 
+/// Native reconstruction of the px2imb extra features from the live feed,
+/// replicating the sim's `NATIVE_MOM` path exactly:
+///   basis     = cb_mid − perp_mid            (both = latest snapshot)
+///   dbasis{k} = basis − basis(now − k·1000ms) (lag from the basis history)
+///   imb1      = (perp_bid_sz − perp_ask_sz) / (perp_bid_sz + perp_ask_sz)
+/// The lag accepts the most recent basis sample with ts ≤ now − k·1000 and
+/// ts ≥ now − k·1000 − 2000 (the sim's ±2s tolerance); if absent, `feats`
+/// returns `None` so the caller DROPS the row/skips the tick — matching the
+/// sim dropping NaN-feature rows. `extras` empty ⇒ inactive (the cb surface).
+#[derive(Clone)]
+pub struct FeatureState {
+    extras: Vec<String>,
+    perp_mid: f64,
+    perp_bsz: f64,
+    perp_asz: f64,
+    cb_mid: f64,
+    cb_ts: i64,
+    /// (ts_ns, basis) history; pruned to `horizon_ns`.
+    basis_ring: std::collections::VecDeque<(i64, f64)>,
+    horizon_ns: i64,
+}
+
+impl FeatureState {
+    pub fn new(extras: Vec<String>) -> Self {
+        FeatureState {
+            extras,
+            perp_mid: f64::NAN,
+            perp_bsz: 0.0,
+            perp_asz: 0.0,
+            cb_mid: f64::NAN,
+            cb_ts: 0,
+            basis_ring: std::collections::VecDeque::new(),
+            horizon_ns: 130_000_000_000, // 130s — covers dbasis60 + slack
+        }
+    }
+
+    /// Coinbase quote staleness gate (the sim only uses cb aged ≤ 5s).
+    const CB_STALE_NS: i64 = 5_000_000_000;
+
+    /// Any extra features to build? (false for the cb surface.)
+    pub fn active(&self) -> bool {
+        !self.extras.is_empty()
+    }
+
+    pub fn on_perp(&mut self, ts_ns: i64, mid: f64, bid_sz: f64, ask_sz: f64) {
+        if mid > 0.0 {
+            self.perp_mid = mid;
+            self.perp_bsz = bid_sz;
+            self.perp_asz = ask_sz;
+            self.push_basis(ts_ns);
+        }
+    }
+
+    pub fn on_cb(&mut self, ts_ns: i64, mid: f64) {
+        if mid > 0.0 {
+            self.cb_mid = mid;
+            self.cb_ts = ts_ns;
+            self.push_basis(ts_ns);
+        }
+    }
+
+    fn push_basis(&mut self, ts_ns: i64) {
+        if self.perp_mid > 0.0 && self.cb_mid > 0.0 {
+            self.basis_ring.push_back((ts_ns, self.cb_mid - self.perp_mid));
+            let cutoff = ts_ns - self.horizon_ns;
+            while self.basis_ring.front().map_or(false, |&(t, _)| t < cutoff) {
+                self.basis_ring.pop_front();
+            }
+        }
+    }
+
+    /// Most recent basis with ts ≤ now − k·1000ms, accepted iff also ≥ that − 2s.
+    fn basis_lag(&self, now_ns: i64, k_s: i64) -> Option<f64> {
+        let target = now_ns - k_s * 1_000_000_000;
+        let lo = target - 2_000_000_000;
+        for &(t, b) in self.basis_ring.iter().rev() {
+            if t <= target {
+                return if t >= lo { Some(b) } else { None };
+            }
+        }
+        None
+    }
+
+    /// Raw extra features in `extras` order, or `None` if any lag/size missing
+    /// or the coinbase quote is stale (> 5s) — each maps to a dropped sim row.
+    pub fn feats(&self, now_ns: i64) -> Option<[f64; MAX_EXTRA]> {
+        if !(self.perp_mid > 0.0 && self.cb_mid > 0.0)
+            || now_ns - self.cb_ts > Self::CB_STALE_NS
+        {
+            return None;
+        }
+        let basis = self.cb_mid - self.perp_mid;
+        let mut out = [0.0; MAX_EXTRA];
+        for (i, name) in self.extras.iter().enumerate() {
+            out[i] = match name.as_str() {
+                "basis" => basis,
+                "imb1" => {
+                    let s = self.perp_bsz + self.perp_asz;
+                    if s <= 0.0 {
+                        return None;
+                    }
+                    (self.perp_bsz - self.perp_asz) / s
+                }
+                n if n.starts_with("dbasis") => {
+                    let k: i64 = n[6..].parse().ok()?;
+                    basis - self.basis_lag(now_ns, k)?
+                }
+                _ => return None, // unknown feature name — fail loud via caller
+            };
+        }
+        Some(out)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -191,10 +364,44 @@ mod tests {
         assert!(v.rows.len() >= 500);
         let mut worst = 0.0f64;
         for r in &v.rows {
-            let l = m.logit(r.px, r.tte_s, r.b, r.s);
+            let l = m.logit(r.px, r.tte_s, r.b, r.s, &[]);
             worst = worst.max((l - r.logit).abs());
         }
         assert!(worst < 1e-4, "max |Δlogit| = {worst}");
+    }
+
+    #[derive(Deserialize)]
+    struct XVecs {
+        rows: Vec<XVecRow>,
+    }
+    #[derive(Deserialize)]
+    struct XVecRow {
+        px: f64,
+        tte_s: f64,
+        b: f64,
+        s: f64,
+        feats: Vec<f64>,
+        logit: f64,
+    }
+
+    /// Gate 1 for px2imb: the 6-input forward + mu/sd z-scoring == torch. The
+    /// vectors pass RAW features; the surface z-scores internally.
+    #[test]
+    fn surface_parity_px2imb_vs_torch() {
+        let m = FairSurface::load(&format!(
+            "{}/../../models/fair-px2imb-btc.json",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap();
+        assert_eq!(m.n_extra(), 4);
+        let v: XVecs = serde_json::from_str(&testdata("surface_vectors_px2imb.json")).unwrap();
+        assert!(v.rows.len() >= 500);
+        let mut worst = 0.0f64;
+        for r in &v.rows {
+            let l = m.logit(r.px, r.tte_s, r.b, r.s, &r.feats);
+            worst = worst.max((l - r.logit).abs());
+        }
+        assert!(worst < 1e-4, "px2imb max |Δlogit| = {worst}");
     }
 
     #[derive(Deserialize)]
@@ -224,7 +431,7 @@ mod tests {
     fn max_fair_diff(m: &FairSurface, case: &FitCase, db: f64, dr: f64, torch_curve: &[f64]) -> f64 {
         let mut worst = 0.0f64;
         for (r, tf) in case.core_rows.iter().zip(torch_curve) {
-            let f = m.fair(r.px, r.tte_s, case.strike, db, dr);
+            let f = m.fair(r.px, r.tte_s, case.strike, db, dr, &[]);
             worst = worst.max((f - tf).abs());
         }
         worst
@@ -239,7 +446,7 @@ mod tests {
             case.rows
                 .iter()
                 .filter(|r| r.tte_s > gt)
-                .map(|r| FitRow { tte_s: r.tte_s, px: r.px, mid: r.mid })
+                .map(|r| FitRow::new(r.tte_s, r.px, r.mid))
                 .collect()
         };
         // stage 1: cold fit

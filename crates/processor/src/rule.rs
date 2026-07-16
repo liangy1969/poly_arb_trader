@@ -255,14 +255,17 @@ use serde::Deserialize;
 
 use arb_core::model::CalibUpdate;
 
-use crate::fair::FairSurface;
+use crate::fair::{FairSurface, FeatureState, MAX_EXTRA};
 
 #[derive(Clone, Deserialize)]
 #[serde(default)]
 pub struct FairRideCfg {
     pub model_path: String,
-    /// Reference price instrument (must match the calibrator's).
+    /// Reference PRICE instrument (must match the calibrator's).
     pub reference: String,
+    /// BASIS reference (coinbase mid) for px2imb `basis = cb − perp`; only used
+    /// when the surface has extras. Must match the calibrator's.
+    pub basis_reference: String,
     /// |fair − mid| entry threshold (the frozen spec: 0.05).
     pub delta: f64,
     /// Ride gate: model share of the 1s gap-opening (spec: 0.75).
@@ -292,6 +295,7 @@ impl Default for FairRideCfg {
         FairRideCfg {
             model_path: "models/fair-cb-x60.json".into(),
             reference: "coinbase.BTC".into(),
+            basis_reference: "coinbase.BTC".into(),
             delta: 0.05,
             share_min: 0.75,
             open_min: 0.005,
@@ -314,8 +318,11 @@ impl Default for FairRideCfg {
 
 struct RideState {
     calib: Option<CalibUpdate>,
-    /// (ts_ns, reference px mid, kalshi YES mid) — raw, params-free.
-    ring: VecDeque<(i64, f64, f64)>,
+    /// (ts_ns, reference px mid, kalshi YES mid, raw extra features) — raw,
+    /// params-free, so the 1s lookback re-evaluates BOTH ends under the current
+    /// (Δb,Δρ). Feats are the px2imb extras captured at that sample (all-zero
+    /// for cb). `fair_then` uses these so refit jumps can't masquerade as pushes.
+    ring: VecDeque<(i64, f64, f64, [f64; MAX_EXTRA])>,
     entries: u8,
     armed: bool,
 }
@@ -330,12 +337,15 @@ pub struct FairRideRule {
     pub cfg: FairRideCfg,
     surface: Arc<FairSurface>,
     model_hash: u64,
+    /// px2imb feature reconstruction (basis/dbasis/imb1); inactive for cb.
+    feats: FeatureState,
     evs: HashMap<String, RideState>,
 }
 
 impl FairRideRule {
     pub fn new(cfg: FairRideCfg, surface: Arc<FairSurface>, model_hash: u64) -> Self {
-        FairRideRule { cfg, surface, model_hash, evs: HashMap::new() }
+        let feats = FeatureState::new(surface.extras.clone());
+        FairRideRule { cfg, surface, model_hash, feats, evs: HashMap::new() }
     }
 
     fn eval(&mut self, inst: &str, state: &MarketState, now: i64) -> Option<TradeSignal> {
@@ -362,12 +372,25 @@ impl FairRideRule {
         }
         let mid = 0.5 * (ybid + yask);
 
+        // px2imb: reconstruct the extra features NOW. None (no dbasis lookback
+        // or stale coinbase) ⇒ this row is not a valid scan point, so skip it
+        // (no fair, no ring push) — exactly as the sim drops NaN-feature rows.
+        // Empty (all-zero) for the cb surface.
+        let feats_now = if self.feats.active() {
+            match self.feats.feats(now) {
+                Some(f) => f,
+                None => return None,
+            }
+        } else {
+            [0.0; MAX_EXTRA]
+        };
+
         let st = self.evs.entry(inst.to_string()).or_insert_with(RideState::new);
         // ring upkeep (always, so history exists before the first calib)
-        while st.ring.front().map_or(false, |&(ts, _, _)| now - ts > cfg.lookback_max_ms * 1_200_000) {
+        while st.ring.front().map_or(false, |&(ts, _, _, _)| now - ts > cfg.lookback_max_ms * 1_200_000) {
             st.ring.pop_front();
         }
-        let push = (now, ref_mid, mid);
+        let push = (now, ref_mid, mid, feats_now);
 
         // calib gates
         let c = match st.calib.as_ref() {
@@ -387,7 +410,7 @@ impl FairRideRule {
         }
         let (d_b, d_rho) = (c.d_b, c.d_rho);
 
-        let fair = self.surface.fair(ref_mid, tte_s, strike, d_b, d_rho);
+        let fair = self.surface.fair(ref_mid, tte_s, strike, d_b, d_rho, &feats_now);
         let gap = fair - mid;
 
         // hysteresis / cap
@@ -406,8 +429,8 @@ impl FairRideRule {
         // ride gate: youngest ring sample >= lookback_min old
         let lo = now - cfg.lookback_max_ms * 1_000_000;
         let hi = now - cfg.lookback_min_ms * 1_000_000;
-        let then = st.ring.iter().rev().find(|&&(ts, _, _)| ts <= hi && ts >= lo).copied();
-        let (ts_then, px_then, mid_then) = match then {
+        let then = st.ring.iter().rev().find(|&&(ts, _, _, _)| ts <= hi && ts >= lo).copied();
+        let (ts_then, px_then, mid_then, feats_then) = match then {
             Some(x) => x,
             None => {
                 st.ring.push_back(push);
@@ -415,7 +438,7 @@ impl FairRideRule {
             }
         };
         let tte_then = (expiry - ts_then) as f64 / 1e9;
-        let fair_then = self.surface.fair(px_then, tte_then, strike, d_b, d_rho);
+        let fair_then = self.surface.fair(px_then, tte_then, strike, d_b, d_rho, &feats_then);
         let side = if gap > 0.0 { 1.0 } else { -1.0 };
         let mp = side * (fair - fair_then);
         let xp = -side * (mid - mid_then);
@@ -464,10 +487,28 @@ impl Rule for FairRideRule {
                 Vec::new()
             }
             Payload::Book(b) if b.instrument == self.cfg.reference => {
-                // reference moved: evaluate every tracked event
+                // reference (price) moved: refresh features FIRST (perp mid +
+                // imb1 sizes) so this tick's eval sees the current snapshot,
+                // then evaluate every tracked event.
+                if self.feats.active() {
+                    if let (Some(&(bid, bsz)), Some(&(ask, asz))) = (b.bids.first(), b.asks.first()) {
+                        if bid > 0.0 && ask > 0.0 {
+                            self.feats.on_perp(b.recv_ts_ns, 0.5 * (bid + ask), bsz, asz);
+                        }
+                    }
+                }
                 let insts: Vec<String> = self.evs.keys().cloned().collect();
                 let now = b.recv_ts_ns;
                 insts.iter().filter_map(|i| self.eval(i, state, now)).collect()
+            }
+            Payload::Book(b) if self.feats.active() && b.instrument == self.cfg.basis_reference => {
+                // coinbase moved: update basis; no eval (perp/YES ticks drive it)
+                if let (Some(&(bid, _)), Some(&(ask, _))) = (b.bids.first(), b.asks.first()) {
+                    if bid > 0.0 && ask > 0.0 {
+                        self.feats.on_cb(b.recv_ts_ns, 0.5 * (bid + ask));
+                    }
+                }
+                Vec::new()
             }
             Payload::Book(b) if b.instrument.ends_with(".YES") => {
                 let inst = b.instrument.clone();

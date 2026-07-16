@@ -224,6 +224,11 @@ def simulate(m, ev, meta, a):
         mid_p = (ybid_p + yask_p) / 2.0
         gap = fair - mid_p
 
+        # optional: dump the causal fair series for replay-parity checks
+        if a.dump_fair:
+            for k in range(len(tte_p)):
+                a.fair_rows.append((t, int(ts_p[k]), float(tte_p[k]), float(fair[k]), float(mid_p[k])))
+
         # ── (4) settlement BCE, fair vs market, per tte bucket, per event ──
         for hi, lo in BUCKETS:
             b = (tte_p <= hi) & (tte_p > lo)
@@ -528,8 +533,12 @@ def main():
     p.add_argument("--meta-cache", default="",
                    help="Kalshi meta cache json (default: beside the samples)")
     p.add_argument("--out-dir", default="", help="write trades/bce/summary CSVs here")
+    p.add_argument("--dump-fair", default="", metavar="PATH",
+                   help="also write the causal fair series (ticker,ts_ms,tte_s,"
+                        "fair,mid) here — for replay-parity checks")
     a = p.parse_args()
 
+    a.fair_rows = []
     a.deltas = [float(x) for x in a.deltas.split(",")]
     a.tte_max, a.tte_min = (float(x) for x in a.tte.split(":"))
     paths = a.samples.split(",")
@@ -562,6 +571,14 @@ def main():
         print(f"  [{m['label']}] {len(tr)} trades, {len(bc)} event-bucket BCE rows")
 
     report(trades, bce_rows, a, models)
+
+    if a.dump_fair and a.fair_rows:
+        with open(a.dump_fair, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["ticker", "ts_ms", "tte_s", "fair", "mid"])
+            for r in a.fair_rows:
+                w.writerow([r[0], r[1], f"{r[2]:.3f}", f"{r[3]:.6f}", f"{r[4]:.6f}"])
+        print(f"\n-> {a.dump_fair} ({len(a.fair_rows)} fair rows)")
 
     if a.out_dir:
         os.makedirs(a.out_dir, exist_ok=True)
