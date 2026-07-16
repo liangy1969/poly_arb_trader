@@ -102,6 +102,7 @@ fn main() -> anyhow::Result<()> {
     let (i_cbb, i_cba, i_cbage) = (idx("cb_bid"), idx("cb_ask"), idx("cb_age_ms"));
     let (i_pb, i_pa) = (idx("perp_bid"), idx("perp_ask"));
     let (i_pbs, i_pas) = (idx("perp_bid_sz"), idx("perp_ask_sz"));
+    let i_page = *col.get("perp_age_ms").unwrap_or(&usize::MAX);
 
     let mut sigs = std::io::BufWriter::new(std::fs::File::create(format!("{out_prefix}_signals.csv"))?);
     writeln!(sigs, "ts_ms,target,direction,yes_price,reason")?;
@@ -112,7 +113,11 @@ fn main() -> anyhow::Result<()> {
     let mut known: HashMap<String, (f64, i64)> = HashMap::new(); // ticker -> (strike, expiry_ns)
     let mut calibs: HashMap<String, arb_core::model::CalibUpdate> = HashMap::new();
     let mut last_cb_recv_ns: i64 = i64::MIN;
+    let mut last_perp_feed_ms: i64 = i64::MIN;
     let mut last_perp: (f64, f64) = (0.0, 0.0);
+    let mut n_cb_feeds: u64 = 0;
+    let mut last_cb_feed_ts: i64 = 0;
+    let debug = std::env::var("REPLAY_DEBUG").is_ok();
     let mut perp_mid = f64::NAN;
     let mut last_fair_ms: HashMap<String, i64> = HashMap::new();
     let mut n_rows = 0u64;
@@ -179,8 +184,20 @@ fn main() -> anyhow::Result<()> {
         if px2imb && pb > 0.0 && pa > 0.0 {
             perp_mid = 0.5 * (pb + pa);
             feat_diag.on_perp(ts_ns, perp_mid, pbs, pas);
-            if (pb, pa) != last_perp {
+            // Keep the pipeline's perp reference FRESH regardless of value
+            // change. In a flat market the best bid/ask sit unchanged for tens
+            // of seconds while binance messages keep arriving; feeding only on
+            // value change would let ref_ns go stale (>1.5s) so the calibrator
+            // drops most samples -> no fit (the flat-market analog of the
+            // coinbase bug). Feed immediately on a real price change (ride-gate
+            // responsiveness) AND at least every 250ms (freshness) — the 250ms
+            // throttle bounds the reference-book eval cost (it scans all events)
+            // while staying well inside the 1.5s stale gate. `perp_age_ms` isn't
+            // needed once we heartbeat; kept for reference only.
+            let _ = i_page;
+            if (pb, pa) != last_perp || ts_ms - last_perp_feed_ms >= 250 {
                 last_perp = (pb, pa);
+                last_perp_feed_ms = ts_ms;
                 seq += 1;
                 feed!(book(PERP, ts_ns, seq, pb, pbs, pa, pas));
             }
@@ -200,6 +217,8 @@ fn main() -> anyhow::Result<()> {
                 last_cb_recv_ns = cb_recv_ns;
                 feat_diag.on_cb(ts_ns, 0.5 * (cb_b + cb_a));
                 seq += 1;
+                n_cb_feeds += 1;
+                last_cb_feed_ts = ts_ms;
                 feed!(book(CB, ts_ns, seq, cb_b, 0.0, cb_a, 0.0));
             }
         }
@@ -238,6 +257,9 @@ fn main() -> anyhow::Result<()> {
         }
     }
     eprintln!("replay done: rows={n_rows} signals={n_sigs} events={}", known.len());
+    if debug {
+        eprintln!("cb feeds={n_cb_feeds}, last cb feed at ts_ms={last_cb_feed_ts}");
+    }
     Ok(())
 }
 
@@ -249,6 +271,9 @@ fn push_calib(
     seq: &mut u64,
     ts_ns: i64,
 ) {
+    if std::env::var("REPLAY_DEBUG").is_ok() {
+        eprintln!("CALIB {} tte={} rows={}", u.instrument, u.fitted_at_tte_s, u.rows);
+    }
     calibs.insert(u.instrument.clone(), u.clone());
     *seq += 1;
     let e = ev(format!("market.calib.{}", u.instrument), ts_ns, *seq, Payload::Calib(u));
