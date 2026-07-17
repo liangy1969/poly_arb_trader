@@ -458,7 +458,7 @@ impl FairRideRule {
             strategy: "fair_ride".into(),
             ts_ns: now,
             reason: format!(
-                "gap={gap:+.3} share={share:.2} fair={fair:.3} mid={mid:.3} tte={tte_s:.0}s px={ref_mid:.2} entry#{entry_no}"
+                "gap={gap:+.4} share={share:.2} fair={fair:.4} mid={mid:.4} tte={tte_s:.1}s px={ref_mid:.2} entry#{entry_no}"
             ),
             reference: cfg.reference.clone(),
             target: inst.to_string(),
