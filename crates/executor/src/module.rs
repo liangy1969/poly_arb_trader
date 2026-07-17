@@ -777,6 +777,20 @@ impl Engine {
                 fee_rate: plan.params.fee_rate,
             });
         }
+        // HOLD-TO-SETTLE (exit.mode = "hold"): buy-only, no exit leg. The Kalshi
+        // contract resolves 0/1 at expiry; we NEVER sell, so there is no oversell
+        // risk (the 2026-07-02 incident was an exit selling too much). Release the
+        // one-trade slot immediately so later signals can enter (subject to the
+        // real-balance floor). Position is left PendingResolution until settlement.
+        if self.cfg.exit.mode == "hold" {
+            self.pm.set_status(&inst, PosStatus::PendingResolution);
+            self.report(&plan.trade_id, &inst, "HoldToSettle",
+                &format!("qty={:.2} @ {:.3}; no exit — holding to settlement", entry.qty, entry.vwap));
+            self.emit_trade(&plan, TradeOutcome::PendingResolution, &entry, &LegSummary::default(), 0, 0.0);
+            self.pm.end_trade(now_ns(), self.cfg.risk.cooldown_ms);
+            return;
+        }
+
         // Cap the hold at the exit deadline: with min_tte low/zero a trade can enter
         // near settle, and a full hold_ms would sleep PAST the deadline (even past
         // settlement), stranding the position. min() makes the hold deadline-aware —

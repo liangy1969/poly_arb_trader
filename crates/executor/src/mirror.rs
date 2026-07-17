@@ -208,6 +208,7 @@ mod tests {
                 min_order_size: Some(5.0),
                 tick_size: Some(0.01),
                 fee_rate: Some(0.07),
+                strike: None,
             }),
         ));
 
