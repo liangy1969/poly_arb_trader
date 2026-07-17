@@ -426,6 +426,17 @@ impl FairRideRule {
             return None;
         }
 
+        // SIM EPISODE SEMANTICS (chosen 2026-07-16 to match analyze_online):
+        // a |gap|>=delta crossing CONSUMES the armed state regardless of the
+        // ride-gate outcome ("one trade per dislocation"). Disarm + count HERE,
+        // before the gate; a gate rejection (or missing lookback) then just
+        // returns without re-arming, so the next fire must wait for the gap to
+        // reset below rearm_eps. (Previously the rule disarmed only on an actual
+        // fire, which re-fired far more often than the sim.)
+        st.entries += 1;
+        st.armed = false;
+        let entry_no = st.entries;
+
         // ride gate: youngest ring sample >= lookback_min old
         let lo = now - cfg.lookback_max_ms * 1_000_000;
         let hi = now - cfg.lookback_min_ms * 1_000_000;
@@ -449,10 +460,7 @@ impl FairRideRule {
         }
 
         // ── SIGNAL ──
-        st.entries += 1;
-        st.armed = false;
         st.ring.push_back(push);
-        let entry_no = st.entries;
         let share = mp / tot;
         Some(TradeSignal {
             strategy: "fair_ride".into(),
