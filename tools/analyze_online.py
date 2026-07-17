@@ -288,6 +288,19 @@ def simulate(m, ev, meta, a):
                 if a.gate == "fade" and is_ride:
                     k += 1
                     continue
+                if a.gate == "overreact":
+                    # Market OVERSHOOT: over the 1s lookback the gap FLIPPED sign
+                    # (mid crossed PAST fair), fair & mid moved the SAME direction,
+                    # and mid moved much more than fair. dir = sign(gap) = toward
+                    # fair, i.e. FADE the overshoot betting it reverts to fair.
+                    gap_then = gap[k] - dfair1 + dmid1  # = fair[j] - mid[j]
+                    ok = (not math.isnan(dfair1)
+                          and dfair1 * dmid1 > 0                          # same direction
+                          and abs(dmid1) >= a.overreact_k * abs(dfair1)   # market moved >> fair
+                          and s * gap_then <= -a.overreact_flip)          # gap flipped past fair
+                    if not ok:
+                        k += 1
+                        continue
 
                 p_entry = yask_p[k] if side_yes else 1.0 - ybid_p[k]
                 if p_entry >= 0.99:
@@ -513,10 +526,16 @@ def main():
                    help="entry window in seconds to expiry")
     p.add_argument("--fit-window", type=float, default=120.0,
                    help="rolling (db,dr) fit window in s (0 = expanding)")
-    p.add_argument("--gate", choices=("ride", "fade", "none"), default="ride",
-                   help="ride = only gaps opened by the model (share>ride-share)")
+    p.add_argument("--gate", choices=("ride", "fade", "none", "overreact"), default="ride",
+                   help="ride = only gaps opened by the model (share>ride-share); "
+                        "overreact = fade a market overshoot (gap flipped past fair, "
+                        "mid moved >> fair, same direction)")
     p.add_argument("--ride-share", type=float, default=0.75)
     p.add_argument("--ride-open", type=float, default=0.005)
+    p.add_argument("--overreact-k", type=float, default=2.0,
+                   help="overreact gate: mid must have moved >= this x |fair move|")
+    p.add_argument("--overreact-flip", type=float, default=0.01,
+                   help="overreact gate: the gap must have been >= this on the OTHER side 1s ago")
     p.add_argument("--rearm-eps", type=float, default=0.02,
                    help="gap must fall below this to re-arm (one trade/episode)")
     p.add_argument("--close-eps", type=float, default=0.01,
