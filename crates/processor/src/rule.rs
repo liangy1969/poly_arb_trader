@@ -333,6 +333,50 @@ impl RideState {
     }
 }
 
+/// Emit a `gapstats` distribution line at most this often (wall-clock, ns).
+const GAP_FLUSH_NS: i64 = 60_000_000_000;
+/// Safety cap so a runaway-active market flushes before the Vec grows unbounded.
+const GAP_MAX_SAMPLES: usize = 50_000;
+
+/// Summary of the `gap = fair − mid` samples over one flush window. Pure so it
+/// can be unit-tested; percentiles are on |gap| (the magnitude compared to δ).
+struct GapSummary {
+    n: usize,
+    mean: f64,      // signed mean (bias)
+    abs_mean: f64,  // mean |gap| (typical magnitude)
+    p50: f64,
+    p90: f64,
+    p99: f64,
+    max: f64,
+    ge_delta: usize, // how many |gap| >= delta (would-be triggers)
+}
+
+fn gap_summary(samples: &[f64], delta: f64) -> Option<GapSummary> {
+    let n = samples.len();
+    if n == 0 {
+        return None;
+    }
+    let mean = samples.iter().sum::<f64>() / n as f64;
+    let ge_delta = samples.iter().filter(|g| g.abs() >= delta).count();
+    let mut abs: Vec<f64> = samples.iter().map(|g| g.abs()).collect();
+    abs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let abs_mean = abs.iter().sum::<f64>() / n as f64;
+    let pct = |p: f64| abs[(((p / 100.0) * (n as f64 - 1.0)).round() as usize).min(n - 1)];
+    Some(GapSummary { n, mean, abs_mean, p50: pct(50.0), p90: pct(90.0), p99: pct(99.0), max: abs[n - 1], ge_delta })
+}
+
+/// Log the distribution of the accumulated gaps and clear the buffer.
+fn flush_gap_stats(samples: &mut Vec<f64>, delta: f64) {
+    if let Some(s) = gap_summary(samples, delta) {
+        tracing::info!(
+            target: "gapstats",
+            "delta_stats n={} mean_abs={:.4} mean_signed={:+.4} p50={:.4} p90={:.4} p99={:.4} max={:.4} ge{:.2}={}",
+            s.n, s.abs_mean, s.mean, s.p50, s.p90, s.p99, s.max, delta, s.ge_delta,
+        );
+    }
+    samples.clear();
+}
+
 pub struct FairRideRule {
     pub cfg: FairRideCfg,
     surface: Arc<FairSurface>,
@@ -340,12 +384,24 @@ pub struct FairRideRule {
     /// px2imb feature reconstruction (basis/dbasis/imb1); inactive for cb.
     feats: FeatureState,
     evs: HashMap<String, RideState>,
+    /// Rolling `gap = fair − mid` samples (one per fair-model invocation) for the
+    /// periodic `gapstats` distribution log; `gap_flush_ns` is the last flush time.
+    gap_samples: Vec<f64>,
+    gap_flush_ns: i64,
 }
 
 impl FairRideRule {
     pub fn new(cfg: FairRideCfg, surface: Arc<FairSurface>, model_hash: u64) -> Self {
         let feats = FeatureState::new(surface.extras.clone());
-        FairRideRule { cfg, surface, model_hash, feats, evs: HashMap::new() }
+        FairRideRule {
+            cfg,
+            surface,
+            model_hash,
+            feats,
+            evs: HashMap::new(),
+            gap_samples: Vec::new(),
+            gap_flush_ns: 0,
+        }
     }
 
     fn eval(&mut self, inst: &str, state: &MarketState, now: i64) -> Option<TradeSignal> {
@@ -412,6 +468,17 @@ impl FairRideRule {
 
         let fair = self.surface.fair(ref_mid, tte_s, strike, d_b, d_rho, &feats_now);
         let gap = fair - mid;
+
+        // record the gap for the periodic distribution log (every fair-model
+        // invocation, before any gate — so it captures the FULL |fair−mid|
+        // distribution, not just the |gap|>=delta crossings that fire).
+        self.gap_samples.push(gap);
+        if self.gap_flush_ns == 0 {
+            self.gap_flush_ns = now; // first sample: set the baseline, don't flush
+        } else if now - self.gap_flush_ns >= GAP_FLUSH_NS || self.gap_samples.len() >= GAP_MAX_SAMPLES {
+            flush_gap_stats(&mut self.gap_samples, cfg.delta);
+            self.gap_flush_ns = now;
+        }
 
         // hysteresis / cap
         if !st.armed {
@@ -534,5 +601,40 @@ impl Rule for FairRideRule {
             }
             _ => Vec::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod gap_tests {
+    use super::gap_summary;
+
+    #[test]
+    fn gap_summary_stats() {
+        // gaps 0.001, 0.002, …, 0.100
+        let samples: Vec<f64> = (1..=100).map(|i| i as f64 * 0.001).collect();
+        let s = gap_summary(&samples, 0.03).expect("non-empty");
+        assert_eq!(s.n, 100);
+        assert!((s.mean - 0.0505).abs() < 1e-9, "mean {}", s.mean);
+        assert!((s.abs_mean - 0.0505).abs() < 1e-9);
+        assert!((s.max - 0.100).abs() < 1e-9);
+        // |gap| >= 0.03 → values 0.030..=0.100 = 71 samples
+        assert_eq!(s.ge_delta, 71);
+        assert!(s.p50 > 0.045 && s.p50 < 0.056, "p50 {}", s.p50);
+        assert!(s.p90 > 0.085 && s.p90 < 0.095, "p90 {}", s.p90);
+        assert!(s.p99 > 0.095, "p99 {}", s.p99);
+    }
+
+    #[test]
+    fn gap_summary_empty() {
+        assert!(gap_summary(&[], 0.03).is_none());
+    }
+
+    #[test]
+    fn gap_summary_signed_vs_abs() {
+        // symmetric signs → signed mean ~0, |gap| mean positive
+        let s = gap_summary(&[-0.02, 0.02, -0.04, 0.04], 0.03).unwrap();
+        assert!(s.mean.abs() < 1e-9, "signed mean {}", s.mean);
+        assert!((s.abs_mean - 0.03).abs() < 1e-9);
+        assert_eq!(s.ge_delta, 2); // the two |0.04|
     }
 }
