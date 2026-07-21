@@ -236,6 +236,10 @@ pub struct FeatureState {
     cb_ts: i64,
     /// (ts_ns, basis) history; pruned to `horizon_ns`.
     basis_ring: std::collections::VecDeque<(i64, f64)>,
+    /// (ts_ns, perp_mid) history for momentum lags; pruned to `horizon_ns`.
+    mid_ring: std::collections::VecDeque<(i64, f64)>,
+    /// (ts_ns, qty) perp trade volume for surge windows; pruned to `VOL_HORIZON_NS`.
+    trade_ring: std::collections::VecDeque<(i64, f64)>,
     horizon_ns: i64,
 }
 
@@ -249,12 +253,16 @@ impl FeatureState {
             cb_mid: f64::NAN,
             cb_ts: 0,
             basis_ring: std::collections::VecDeque::new(),
-            horizon_ns: 130_000_000_000, // 130s — covers dbasis60 + slack
+            mid_ring: std::collections::VecDeque::new(),
+            trade_ring: std::collections::VecDeque::new(),
+            horizon_ns: 130_000_000_000, // 130s — covers dbasis60 + mom120 + slack
         }
     }
 
     /// Coinbase quote staleness gate (the sim only uses cb aged ≤ 5s).
     const CB_STALE_NS: i64 = 5_000_000_000;
+    /// Trade-volume ring horizon — covers vsurge's 600s window + slack.
+    const VOL_HORIZON_NS: i64 = 620_000_000_000;
 
     /// Any extra features to build? (false for the cb surface.)
     pub fn active(&self) -> bool {
@@ -267,6 +275,7 @@ impl FeatureState {
             self.perp_bsz = bid_sz;
             self.perp_asz = ask_sz;
             self.push_basis(ts_ns);
+            self.push_mid(ts_ns, mid);
         }
     }
 
@@ -300,6 +309,48 @@ impl FeatureState {
         None
     }
 
+    fn push_mid(&mut self, ts_ns: i64, mid: f64) {
+        self.mid_ring.push_back((ts_ns, mid));
+        let cutoff = ts_ns - self.horizon_ns;
+        while self.mid_ring.front().map_or(false, |&(t, _)| t < cutoff) {
+            self.mid_ring.pop_front();
+        }
+    }
+
+    /// Most recent perp mid with ts ≤ now − k·1000ms, accepted iff also ≥ that − 2s.
+    fn mid_lag(&self, now_ns: i64, k_s: i64) -> Option<f64> {
+        let target = now_ns - k_s * 1_000_000_000;
+        let lo = target - 2_000_000_000;
+        for &(t, m) in self.mid_ring.iter().rev() {
+            if t <= target {
+                return if t >= lo { Some(m) } else { None };
+            }
+        }
+        None
+    }
+
+    /// Feed the perp CUMULATIVE traded volume (monotone). Conflation-safe: the
+    /// latest cumulative captures every trade even if intermediate events drop.
+    pub fn on_perp_trade(&mut self, ts_ns: i64, cum_vol: f64) {
+        self.trade_ring.push_back((ts_ns, cum_vol));
+        let cutoff = ts_ns - Self::VOL_HORIZON_NS;
+        while self.trade_ring.front().map_or(false, |&(t, _)| t < cutoff) {
+            self.trade_ring.pop_front();
+        }
+    }
+
+    /// Cumulative volume as of ≤ now − w_s (accepted iff also ≥ that − 5s).
+    fn cum_lag(&self, now_ns: i64, w_s: i64) -> Option<f64> {
+        let target = now_ns - w_s * 1_000_000_000;
+        let lo = target - 5_000_000_000;
+        for &(t, c) in self.trade_ring.iter().rev() {
+            if t <= target {
+                return if t >= lo { Some(c) } else { None };
+            }
+        }
+        None
+    }
+
     /// Raw extra features in `extras` order, or `None` if any lag/size missing
     /// or the coinbase quote is stale (> 5s) — each maps to a dropped sim row.
     pub fn feats(&self, now_ns: i64) -> Option<[f64; MAX_EXTRA]> {
@@ -323,6 +374,22 @@ impl FeatureState {
                 n if n.starts_with("dbasis") => {
                     let k: i64 = n[6..].parse().ok()?;
                     basis - self.basis_lag(now_ns, k)?
+                }
+                n if n.starts_with("mom") => {
+                    // perp mid change over k seconds (matches the trainer's mom{k})
+                    let k: i64 = n[3..].parse().ok()?;
+                    self.perp_mid - self.mid_lag(now_ns, k)?
+                }
+                "vsurge" => {
+                    // 60s / 600s taker volume from the cumulative counter:
+                    // vol(W) = cum(now) − cum(now − W). None until 600s of history.
+                    let cum_now = self.trade_ring.back().map(|&(_, c)| c)?;
+                    let v60 = cum_now - self.cum_lag(now_ns, 60)?;
+                    let v600 = cum_now - self.cum_lag(now_ns, 600)?;
+                    if v600 <= 0.0 {
+                        return None;
+                    }
+                    v60 / v600
                 }
                 _ => return None, // unknown feature name — fail loud via caller
             };

@@ -388,6 +388,8 @@ pub struct FairRideRule {
     /// periodic `gapstats` distribution log; `gap_flush_ns` is the last flush time.
     gap_samples: Vec<f64>,
     gap_flush_ns: i64,
+    /// last `featstats` (live extra-feature values) flush time.
+    feat_flush_ns: i64,
 }
 
 impl FairRideRule {
@@ -401,6 +403,7 @@ impl FairRideRule {
             evs: HashMap::new(),
             gap_samples: Vec::new(),
             gap_flush_ns: 0,
+            feat_flush_ns: 0,
         }
     }
 
@@ -440,6 +443,20 @@ impl FairRideRule {
         } else {
             [0.0; MAX_EXTRA]
         };
+
+        // periodic featstats: log the live extra-feature values so the online
+        // reconstruction (basis/dbasis/imb1/mom/vsurge) can be validated vs offline.
+        if self.feats.active() && now - self.feat_flush_ns >= 60_000_000_000 {
+            let kv: Vec<String> = self
+                .surface
+                .extras
+                .iter()
+                .zip(feats_now.iter())
+                .map(|(n, v)| format!("{}={:.5}", n, v))
+                .collect();
+            tracing::info!(target: "featstats", "feats {}", kv.join(" "));
+            self.feat_flush_ns = now;
+        }
 
         let st = self.evs.entry(inst.to_string()).or_insert_with(RideState::new);
         // ring upkeep (always, so history exists before the first calib)
@@ -575,6 +592,14 @@ impl Rule for FairRideRule {
                 let insts: Vec<String> = self.evs.keys().cloned().collect();
                 let now = b.recv_ts_ns;
                 insts.iter().filter_map(|i| self.eval(i, state, now)).collect()
+            }
+            Payload::Trade(t)
+                if self.feats.active()
+                    && t.instrument.strip_suffix(".vol") == Some(self.cfg.reference.as_str()) =>
+            {
+                // perp cumulative volume: feed vsurge; no eval (perp/YES ticks drive it)
+                self.feats.on_perp_trade(t.recv_ts_ns, t.qty);
+                Vec::new()
             }
             Payload::Book(b) if self.feats.active() && b.instrument == self.cfg.basis_reference => {
                 // coinbase moved: update basis; no eval (perp/YES ticks drive it)

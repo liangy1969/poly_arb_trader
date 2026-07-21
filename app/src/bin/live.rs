@@ -383,6 +383,7 @@ async fn main() -> anyhow::Result<()> {
     let mut cryptospot = CryptoSpotCollector::new(cfg.cryptospot.clone());
     let mut processor = Processor::new(cfg.processor.clone());
     let mut calibrator = arb_processor::Calibrator::new(cfg.calibrator.clone());
+    let mut feature_probe = arb_processor::FeatureProbe::new(cfg.feature_probe.clone());
     let mut executor = Executor::new(cfg.executor.clone());
 
     // Single active prediction venue (DESIGN_MULTI_VENUE): start only its
@@ -409,6 +410,7 @@ async fn main() -> anyhow::Result<()> {
     if cfg.calibrator.enabled {
         calibrator.start(bus.clone()).await?;
     }
+    feature_probe.start(bus.clone()).await?; // self-gates on feature_probe.enabled
     processor.start(bus.clone()).await?;
     executor.start(bus.clone()).await?;
     tracing::info!("active prediction venue = {active_venue}");
@@ -432,6 +434,7 @@ async fn main() -> anyhow::Result<()> {
     if cfg.calibrator.enabled {
         calibrator.stop().await?;
     }
+    feature_probe.stop().await?;
     processor.stop().await?;
     if cfg.cryptospot.enabled {
         cryptospot.stop().await?;

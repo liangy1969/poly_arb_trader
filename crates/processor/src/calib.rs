@@ -133,6 +133,12 @@ impl CalibCore {
                     }
                 }
             }
+            Payload::Trade(t)
+                if self.feats.active()
+                    && t.instrument.strip_suffix(".vol") == Some(self.cfg.reference.as_str()) =>
+            {
+                self.feats.on_perp_trade(t.recv_ts_ns, t.qty); // qty carries cumulative volume
+            }
             Payload::Book(b) if self.feats.active() && b.instrument == self.cfg.basis_reference => {
                 if let (Some(&(bid, _)), Some(&(ask, _))) = (b.bids.first(), b.asks.first()) {
                     if bid > 0.0 && ask > 0.0 {

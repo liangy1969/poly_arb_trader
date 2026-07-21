@@ -20,7 +20,7 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use arb_core::bus::Bus;
 use arb_core::event::{Event, Payload};
-use arb_core::model::BookUpdate;
+use arb_core::model::{BookUpdate, Side, TradeTick};
 use arb_core::module::{Health, Module};
 use arb_core::now_ns;
 
@@ -42,6 +42,9 @@ pub struct BinanceCfg {
     pub stale_timeout_s: u64,
     pub reconnect_base_ms: u64,
     pub reconnect_max_ms: u64,
+    /// Also open a `<symbol>@aggTrade` session and publish MONOTONE cumulative
+    /// perp taker volume on `market.…<symbol>.vol` (feeds the vsurge feature).
+    pub agg_trades: bool,
 }
 
 impl Default for BinanceCfg {
@@ -58,6 +61,7 @@ impl Default for BinanceCfg {
             stale_timeout_s: 5,
             reconnect_base_ms: 500,
             reconnect_max_ms: 30_000,
+            agg_trades: false,
         }
     }
 }
@@ -286,14 +290,102 @@ async fn run_loop(cfg: BinanceCfg, http: reqwest::Client, bus: Arc<dyn Bus>) {
     }
 }
 
+/// Parse a combined-stream aggTrade frame → traded qty (base units).
+fn parse_agg_trade_qty(txt: &str) -> Option<f64> {
+    let v: Value = serde_json::from_str(txt).ok()?;
+    let d = v.get("data").unwrap_or(&v); // combined stream wraps in {stream,data}
+    d.get("q")?.as_str()?.parse().ok()
+}
+
+/// aggTrade session: accumulate perp taker volume into a MONOTONE cumulative
+/// counter and publish it (throttled) on the `.vol` instrument. The processor
+/// derives 60s/600s windows from cum(now)−cum(now−W), which is conflation-safe.
+async fn session_aggtrade(
+    cfg: &BinanceCfg,
+    bus: &Arc<dyn Bus>,
+    seq: &mut u64,
+    cum_vol: &mut f64,
+) -> anyhow::Result<()> {
+    let stream = format!("{}@aggTrade", cfg.symbol.to_lowercase());
+    let url = format!("{}/stream?streams={}", cfg.ws_base, stream);
+    let req = url.as_str().into_client_request()?;
+    let mut ws = match &cfg.socks_proxy {
+        Some(proxy) => {
+            let (host, port) = host_port(&cfg.ws_base);
+            let socks = Socks5Stream::connect(proxy.as_str(), (host.as_str(), port)).await?;
+            tokio_tungstenite::client_async_tls(req, socks.into_inner()).await?.0
+        }
+        None => tokio_tungstenite::connect_async(req).await?.0,
+    };
+    tracing::info!("ws connected (aggTrade): {}", stream);
+    let vol_inst = format!("{}.vol", cfg.instrument);
+    let topic = format!("market.binance.usdt_perp.{}.vol", cfg.symbol);
+    let stale = Duration::from_secs(cfg.stale_timeout_s.max(30)); // trades can be sparse
+    let mut last_pub = 0i64;
+    loop {
+        let msg = tokio::time::timeout(stale, ws.next())
+            .await
+            .map_err(|_| anyhow::anyhow!("stale aggTrade stream"))?;
+        match msg {
+            Some(Ok(Message::Text(t))) => {
+                if let Some(q) = parse_agg_trade_qty(t.as_str()) {
+                    *cum_vol += q;
+                    let now = now_ns();
+                    if now - last_pub >= 200_000_000 {
+                        // throttle to ~200ms; cumulative ⇒ no volume lost
+                        bus.publish(Event::new(
+                            topic.clone(),
+                            "collector-binance",
+                            now,
+                            nxt(seq),
+                            Payload::Trade(TradeTick {
+                                instrument: vol_inst.clone(),
+                                price: 0.0,
+                                qty: *cum_vol, // cumulative volume, not per-trade
+                                side: Side::Buy,
+                                exch_ts_ns: now,
+                                recv_ts_ns: now,
+                            }),
+                        ));
+                        last_pub = now;
+                    }
+                }
+            }
+            Some(Ok(Message::Ping(p))) => {
+                let _ = ws.send(Message::Pong(p)).await;
+            }
+            Some(Ok(Message::Close(_))) | None => anyhow::bail!("aggTrade ws closed"),
+            Some(Ok(_)) => {}
+            Some(Err(e)) => anyhow::bail!("aggTrade ws error: {e}"),
+        }
+    }
+}
+
+async fn run_agg_loop(cfg: BinanceCfg, bus: Arc<dyn Bus>) {
+    let mut backoff = cfg.reconnect_base_ms;
+    let mut seq = 0u64;
+    let mut cum_vol = 0.0f64; // persists across reconnects → stays monotone
+    loop {
+        match session_aggtrade(&cfg, &bus, &mut seq, &mut cum_vol).await {
+            Ok(()) => backoff = cfg.reconnect_base_ms,
+            Err(e) => {
+                tracing::warn!("aggTrade session ended ({e}) -> reconnect in {backoff}ms");
+                tokio::time::sleep(Duration::from_millis(backoff)).await;
+                backoff = (backoff * 2).min(cfg.reconnect_max_ms);
+            }
+        }
+    }
+}
+
 pub struct BinanceCollector {
     cfg: BinanceCfg,
     handle: Option<JoinHandle<()>>,
+    agg_handle: Option<JoinHandle<()>>,
 }
 
 impl BinanceCollector {
     pub fn new(cfg: BinanceCfg) -> Self {
-        BinanceCollector { cfg, handle: None }
+        BinanceCollector { cfg, handle: None, agg_handle: None }
     }
 }
 
@@ -309,12 +401,18 @@ impl Module for BinanceCollector {
             builder = builder.proxy(reqwest::Proxy::all(format!("socks5://{p}"))?);
         }
         let http = builder.build()?;
+        if self.cfg.agg_trades {
+            self.agg_handle = Some(tokio::spawn(run_agg_loop(self.cfg.clone(), bus.clone())));
+        }
         self.handle = Some(tokio::spawn(run_loop(self.cfg.clone(), http, bus)));
         Ok(())
     }
 
     async fn stop(&mut self) -> anyhow::Result<()> {
         if let Some(h) = self.handle.take() {
+            h.abort();
+        }
+        if let Some(h) = self.agg_handle.take() {
             h.abort();
         }
         Ok(())

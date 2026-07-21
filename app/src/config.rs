@@ -10,7 +10,7 @@ use arb_collector_databento::DatabentoCfg;
 use arb_collector_kalshi::KalshiCfg;
 use arb_collector_polymarket::PolyCfg;
 use arb_executor::ExecutorCfg;
-use arb_processor::{CalibCfg, ProcCfg};
+use arb_processor::{CalibCfg, FeatureProbeCfg, ProcCfg};
 use arb_recorder::RecorderCfg;
 
 #[derive(Clone, Deserialize)]
@@ -56,6 +56,8 @@ pub struct AppConfig {
     pub kalshi: KalshiCfg,
     pub processor: ProcCfg,
     pub calibrator: CalibCfg,
+    /// Optional log-only feature probe (shadow feature validation; no trading).
+    pub feature_probe: FeatureProbeCfg,
     pub recorder: RecorderCfg,
     pub executor: ExecutorCfg,
     pub run: RunCfg,
