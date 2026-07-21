@@ -307,7 +307,13 @@ async fn session_aggtrade(
     cum_vol: &mut f64,
 ) -> anyhow::Result<()> {
     let stream = format!("{}@aggTrade", cfg.symbol.to_lowercase());
-    let url = format!("{}/stream?streams={}", cfg.ws_base, stream);
+    // Binance USDT-M futures splits its WS endpoints: `/public` carries only the
+    // high-frequency book streams (@depth, @bookTicker); regular market data
+    // (@aggTrade, @forceOrder, @markPrice, …) is served on `/market`. Using the
+    // book's `/public` base here silently yields ZERO frames — the SUBSCRIBE is
+    // ACK'd but nothing ever pushes. Route aggTrade to the `/market` sibling.
+    let market_base = cfg.ws_base.replace("/public", "/market");
+    let url = format!("{}/stream?streams={}", market_base, stream);
     let req = url.as_str().into_client_request()?;
     let mut ws = match &cfg.socks_proxy {
         Some(proxy) => {
