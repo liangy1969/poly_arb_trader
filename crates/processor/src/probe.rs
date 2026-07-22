@@ -20,7 +20,12 @@ use crate::fair::{FairSurface, FeatureState};
 pub struct FeatureProbeCfg {
     pub enabled: bool,
     /// Model JSON whose `extras` list defines which features to reconstruct+log.
+    /// Ignored (may be empty) when `extras` is set explicitly below.
     pub model_path: String,
+    /// Explicit feature list to reconstruct+log; overrides the model's extras.
+    /// Use this to probe only features NOT already logged by the trading path
+    /// (the rule's own `featstats feats …` line covers the trading model's).
+    pub extras: Vec<String>,
     /// Price reference instrument (perp) — carries mom/imb1/vol.
     pub reference: String,
     /// Basis reference instrument (coinbase) — carries basis/dbasis.
@@ -37,6 +42,7 @@ impl Default for FeatureProbeCfg {
         FeatureProbeCfg {
             enabled: false,
             model_path: String::new(),
+            extras: Vec::new(),
             reference: "binance.usdt_perp.BTCUSDT".into(),
             basis_reference: "coinbase.BTC".into(),
             depth_reference: String::new(),
@@ -66,9 +72,14 @@ impl Module for FeatureProbe {
         if !self.cfg.enabled {
             return Ok(());
         }
-        // load the surface only to read its `extras` list (no fair/calib here).
-        let bytes = std::fs::read(&self.cfg.model_path)?;
-        let extras = FairSurface::from_json(std::str::from_utf8(&bytes)?)?.extras.clone();
+        // explicit `extras` wins; else load the surface only to read its list
+        // (no fair/calib here either way).
+        let extras = if !self.cfg.extras.is_empty() {
+            self.cfg.extras.clone()
+        } else {
+            let bytes = std::fs::read(&self.cfg.model_path)?;
+            FairSurface::from_json(std::str::from_utf8(&bytes)?)?.extras.clone()
+        };
         let mut feats = FeatureState::new(extras.clone());
         let reference = self.cfg.reference.clone();
         let basis_reference = self.cfg.basis_reference.clone();
@@ -77,9 +88,9 @@ impl Module for FeatureProbe {
         let flush_ns = (self.cfg.flush_s.max(1) as i64) * 1_000_000_000;
         let sub = bus.subscribe("market.#", 1024, Policy::Conflate(key_by_instrument));
         tracing::info!(
-            "feature-probe up: model={} extras={:?}",
-            self.cfg.model_path,
-            extras
+            "feature-probe up: extras={:?} ({})",
+            extras,
+            if self.cfg.extras.is_empty() { &self.cfg.model_path } else { "explicit cfg" }
         );
         self.handle = Some(tokio::spawn(async move {
             let mut sub = sub;
