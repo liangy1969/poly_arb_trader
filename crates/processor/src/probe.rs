@@ -25,6 +25,9 @@ pub struct FeatureProbeCfg {
     pub reference: String,
     /// Basis reference instrument (coinbase) — carries basis/dbasis.
     pub basis_reference: String,
+    /// DEEP-book instrument (the @depth collector) — carries band{k}. Empty =
+    /// no depth feed (band features will never be ready).
+    pub depth_reference: String,
     /// featstats log cadence (seconds).
     pub flush_s: u64,
 }
@@ -36,6 +39,7 @@ impl Default for FeatureProbeCfg {
             model_path: String::new(),
             reference: "binance.usdt_perp.BTCUSDT".into(),
             basis_reference: "coinbase.BTC".into(),
+            depth_reference: String::new(),
             flush_s: 60,
         }
     }
@@ -68,6 +72,7 @@ impl Module for FeatureProbe {
         let mut feats = FeatureState::new(extras.clone());
         let reference = self.cfg.reference.clone();
         let basis_reference = self.cfg.basis_reference.clone();
+        let depth_reference = self.cfg.depth_reference.clone();
         let vol_inst = format!("{}.vol", reference);
         let flush_ns = (self.cfg.flush_s.max(1) as i64) * 1_000_000_000;
         let sub = bus.subscribe("market.#", 1024, Policy::Conflate(key_by_instrument));
@@ -81,6 +86,12 @@ impl Module for FeatureProbe {
             let mut last_flush = 0i64;
             while let Some(ev) = sub.recv().await {
                 match &ev.payload {
+                    Payload::Book(b)
+                        if !depth_reference.is_empty() && b.instrument == depth_reference =>
+                    {
+                        // deep perp book (@depth top-N) → band{k}
+                        feats.on_depth(b.recv_ts_ns, &b.bids, &b.asks);
+                    }
                     Payload::Book(b) if b.instrument == reference => {
                         if let (Some(&(bid, bsz)), Some(&(ask, asz))) =
                             (b.bids.first(), b.asks.first())

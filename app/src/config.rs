@@ -50,6 +50,10 @@ pub struct AppConfig {
     /// Optional second Binance feed (e.g. SPOT bookTicker) for the sampler's
     /// settlement-chain columns. None = not spawned.
     pub binance_spot: Option<BinanceCfg>,
+    /// Optional DEEP perp book feed (`@depth@100ms` + snapshot resync, top-N
+    /// levels) for the band{k} features. Publish under a distinct instrument
+    /// (e.g. `binance.usdt_perp.BTCUSDT.depth`). None = not spawned.
+    pub binance_depth: Option<BinanceCfg>,
     pub databento: DatabentoCfg,
     pub cryptospot: CryptoSpotCfg,
     pub polymarket: PolyCfg,

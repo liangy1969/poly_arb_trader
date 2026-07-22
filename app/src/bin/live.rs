@@ -379,6 +379,7 @@ async fn main() -> anyhow::Result<()> {
     let mut kalshi = KalshiCollector::new(cfg.kalshi.clone());
     let mut binance = BinanceCollector::new(cfg.binance.clone());
     let mut binance_spot = cfg.binance_spot.clone().map(BinanceCollector::new);
+    let mut binance_depth = cfg.binance_depth.clone().map(BinanceCollector::new);
     let mut databento = DatabentoCollector::new(cfg.databento.clone());
     let mut cryptospot = CryptoSpotCollector::new(cfg.cryptospot.clone());
     let mut processor = Processor::new(cfg.processor.clone());
@@ -400,6 +401,10 @@ async fn main() -> anyhow::Result<()> {
     if let Some(c) = binance_spot.as_mut() {
         c.start(bus.clone()).await?;
         tracing::info!("binance spot feed up");
+    }
+    if let Some(c) = binance_depth.as_mut() {
+        c.start(bus.clone()).await?;
+        tracing::info!("binance depth feed up (band features)");
     }
     if cfg.databento.enabled {
         databento.start(bus.clone()).await?;
@@ -443,6 +448,9 @@ async fn main() -> anyhow::Result<()> {
         databento.stop().await?;
     }
     if let Some(c) = binance_spot.as_mut() {
+        c.stop().await?;
+    }
+    if let Some(c) = binance_depth.as_mut() {
         c.stop().await?;
     }
     binance.stop().await?;

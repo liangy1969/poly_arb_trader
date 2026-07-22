@@ -265,6 +265,11 @@ pub struct FeatureState {
     mid_ring: std::collections::VecDeque<(i64, f64)>,
     /// (ts_ns, qty) perp trade volume for surge windows; pruned to `VOL_HORIZON_NS`.
     trade_ring: std::collections::VecDeque<(i64, f64)>,
+    /// Latest DEEP perp book (from the @depth stream, top-N levels) for the
+    /// band{k} features; empty until the depth feed delivers.
+    depth_bids: Vec<(f64, f64)>,
+    depth_asks: Vec<(f64, f64)>,
+    depth_ts: i64,
     horizon_ns: i64,
 }
 
@@ -280,6 +285,9 @@ impl FeatureState {
             basis_ring: std::collections::VecDeque::new(),
             mid_ring: std::collections::VecDeque::new(),
             trade_ring: std::collections::VecDeque::new(),
+            depth_bids: Vec::new(),
+            depth_asks: Vec::new(),
+            depth_ts: 0,
             horizon_ns: 130_000_000_000, // 130s — covers dbasis60 + mom120 + slack
         }
     }
@@ -288,6 +296,8 @@ impl FeatureState {
     const CB_STALE_NS: i64 = 5_000_000_000;
     /// Trade-volume ring horizon — covers vsurge's 600s window + slack.
     const VOL_HORIZON_NS: i64 = 620_000_000_000;
+    /// Depth-book staleness gate (@depth@100ms cadence ⇒ 2s is generous).
+    const DEPTH_STALE_NS: i64 = 2_000_000_000;
 
     /// Any extra features to build? (false for the cb surface.)
     pub fn active(&self) -> bool {
@@ -363,6 +373,46 @@ impl FeatureState {
         None
     }
 
+    /// Feed the DEEP perp book (top-N levels from the @depth stream). Sorted
+    /// best-first as published by the collector.
+    pub fn on_depth(&mut self, ts_ns: i64, bids: &[(f64, f64)], asks: &[(f64, f64)]) {
+        if !bids.is_empty() && !asks.is_empty() {
+            self.depth_bids.clear();
+            self.depth_bids.extend_from_slice(bids);
+            self.depth_asks.clear();
+            self.depth_asks.extend_from_slice(asks);
+            self.depth_ts = ts_ns;
+        }
+    }
+
+    /// band{k}: qty imbalance within ±k bps of the DEPTH book's own mid,
+    /// replicating extract_l2_features exactly: lo=mid(1−k/1e4), hi=mid(1+k/1e4),
+    /// band=(Σ bid qty px≥lo − Σ ask qty px≤hi)/(sum). `None` when the depth
+    /// feed is stale/absent or the published levels don't reach the band edge
+    /// (a truncated book would silently under-count vs the offline full-depth
+    /// lake — better to drop the sample than skew the feature).
+    fn band(&self, now_ns: i64, k_bps: f64) -> Option<f64> {
+        if self.depth_bids.is_empty()
+            || self.depth_asks.is_empty()
+            || now_ns - self.depth_ts > Self::DEPTH_STALE_NS
+        {
+            return None;
+        }
+        let mid = 0.5 * (self.depth_bids[0].0 + self.depth_asks[0].0);
+        let (lo, hi) = (mid * (1.0 - k_bps / 1e4), mid * (1.0 + k_bps / 1e4));
+        // coverage: the deepest published level must lie beyond the band edge
+        if self.depth_bids.last()?.0 > lo || self.depth_asks.last()?.0 < hi {
+            return None;
+        }
+        let bs: f64 = self.depth_bids.iter().take_while(|&&(p, _)| p >= lo).map(|&(_, q)| q).sum();
+        let asum: f64 = self.depth_asks.iter().take_while(|&&(p, _)| p <= hi).map(|&(_, q)| q).sum();
+        if bs + asum > 0.0 {
+            Some((bs - asum) / (bs + asum))
+        } else {
+            Some(0.0) // matches the extractor's 0.0-on-empty
+        }
+    }
+
     /// Feed the perp CUMULATIVE traded volume (monotone). Conflation-safe: the
     /// latest cumulative captures every trade even if intermediate events drop.
     pub fn on_perp_trade(&mut self, ts_ns: i64, cum_vol: f64) {
@@ -408,6 +458,11 @@ impl FeatureState {
                 n if n.starts_with("dbasis") => {
                     let k: i64 = n[6..].parse().ok()?;
                     basis - self.basis_lag(now_ns, k)?
+                }
+                n if n.starts_with("band") => {
+                    // ±k bps banded qty imbalance from the deep perp book
+                    let k: f64 = n[4..].parse().ok()?;
+                    self.band(now_ns, k)?
                 }
                 n if n.starts_with("pmom") => {
                     // PERCENT perp-mid change over k seconds (the 2p model's
