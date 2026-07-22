@@ -127,7 +127,7 @@ impl CalibCore {
                         self.ref_px = mid;
                         self.ref_ns = b.recv_ts_ns;
                         // the price reference (perp for px2imb) also carries imb1 sizes
-                        if self.feats.active() {
+                        if self.feats.active() || self.surface.two_price() {
                             self.feats.on_perp(b.recv_ts_ns, mid, bsz, asz);
                         }
                     }
@@ -139,7 +139,10 @@ impl CalibCore {
             {
                 self.feats.on_perp_trade(t.recv_ts_ns, t.qty); // qty carries cumulative volume
             }
-            Payload::Book(b) if self.feats.active() && b.instrument == self.cfg.basis_reference => {
+            Payload::Book(b)
+                if (self.feats.active() || self.surface.two_price())
+                    && b.instrument == self.cfg.basis_reference =>
+            {
                 if let (Some(&(bid, _)), Some(&(ask, _))) = (b.bids.first(), b.asks.first()) {
                     if bid > 0.0 && ask > 0.0 {
                         self.feats.on_cb(b.recv_ts_ns, 0.5 * (bid + ask));
@@ -206,8 +209,16 @@ impl CalibCore {
                     // still consume the 1s slot and fall through to the boundary
                     // fit, which uses previously-collected rows).
                     let feats = if self.feats.active() { self.feats.feats(now) } else { Some([0.0; MAX_EXTRA]) };
-                    if let Some(feats) = feats {
-                        st.rows.push(FitRow { tte_s, px: self.ref_px, mid: 0.5 * (st.ybid + st.yask), feats });
+                    // Two-price surface: the coinbase mid is a PRICE INPUT, not
+                    // a feature — a stale cb (> 5s) drops the sample the same
+                    // way a missing feature does (the sim drops NaN-cb rows).
+                    let px2 = if self.surface.two_price() {
+                        self.feats.cb_price(now)
+                    } else {
+                        Some(f64::NAN)
+                    };
+                    if let (Some(feats), Some(px2)) = (feats, px2) {
+                        st.rows.push(FitRow { tte_s, px: self.ref_px, px2, mid: 0.5 * (st.ybid + st.yask), feats });
                     }
                     st.last_sample_ns = now;
                 }

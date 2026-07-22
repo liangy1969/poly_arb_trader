@@ -318,18 +318,21 @@ impl Default for FairRideCfg {
 
 struct RideState {
     calib: Option<CalibUpdate>,
-    /// (ts_ns, reference px mid, kalshi YES mid, raw extra features) — raw,
-    /// params-free, so the 1s lookback re-evaluates BOTH ends under the current
-    /// (Δb,Δρ). Feats are the px2imb extras captured at that sample (all-zero
-    /// for cb). `fair_then` uses these so refit jumps can't masquerade as pushes.
-    ring: VecDeque<(i64, f64, f64, [f64; MAX_EXTRA])>,
+    /// (ts_ns, reference px mid, px2 (coinbase mid; NAN on one-price surfaces),
+    /// kalshi YES mid, raw extra features) — raw, params-free, so the 1s
+    /// lookback re-evaluates BOTH ends under the current (Δb,Δρ). Feats are the
+    /// extras captured at that sample (all-zero for cb). `fair_then` uses these
+    /// so refit jumps can't masquerade as pushes.
+    ring: VecDeque<(i64, f64, f64, f64, [f64; MAX_EXTRA])>,
     entries: u8,
     armed: bool,
+    /// last `fairlog` sample time for this event (online-vs-offline check).
+    fairlog_ns: i64,
 }
 
 impl RideState {
     fn new() -> Self {
-        RideState { calib: None, ring: VecDeque::new(), entries: 0, armed: true }
+        RideState { calib: None, ring: VecDeque::new(), entries: 0, armed: true, fairlog_ns: 0 }
     }
 }
 
@@ -458,12 +461,23 @@ impl FairRideRule {
             self.feat_flush_ns = now;
         }
 
+        // two-price surface: the coinbase mid is a PRICE INPUT — stale cb (>5s)
+        // ⇒ not a valid scan point (mirror the sim dropping NaN-cb rows).
+        let px2_now = if self.surface.two_price() {
+            match self.feats.cb_price(now) {
+                Some(c) => c,
+                None => return None,
+            }
+        } else {
+            f64::NAN
+        };
+
         let st = self.evs.entry(inst.to_string()).or_insert_with(RideState::new);
         // ring upkeep (always, so history exists before the first calib)
-        while st.ring.front().map_or(false, |&(ts, _, _, _)| now - ts > cfg.lookback_max_ms * 1_200_000) {
+        while st.ring.front().map_or(false, |&(ts, _, _, _, _)| now - ts > cfg.lookback_max_ms * 1_200_000) {
             st.ring.pop_front();
         }
-        let push = (now, ref_mid, mid, feats_now);
+        let push = (now, ref_mid, px2_now, mid, feats_now);
 
         // calib gates
         let c = match st.calib.as_ref() {
@@ -483,8 +497,20 @@ impl FairRideRule {
         }
         let (d_b, d_rho) = (c.d_b, c.d_rho);
 
-        let fair = self.surface.fair(ref_mid, tte_s, strike, d_b, d_rho, &feats_now);
+        let fair = self.surface.fair(ref_mid, px2_now, tte_s, strike, d_b, d_rho, &feats_now);
         let gap = fair - mid;
+
+        // periodic fairlog: one full input/output sample per event every 10s so
+        // the ONLINE fair can be replayed offline (same px/cb/tte/db/dr) and
+        // asserted equal — the online-vs-offline consistency check.
+        if now - st.fairlog_ns >= 10_000_000_000 {
+            st.fairlog_ns = now;
+            tracing::info!(
+                target: "fairlog",
+                "{} tte={:.1} px={:.2} cb={:.2} mid={:.4} fair={:.4} db={:+.5} dr={:+.5}",
+                inst, tte_s, ref_mid, px2_now, mid, fair, d_b, d_rho
+            );
+        }
 
         // record the gap for the periodic distribution log (every fair-model
         // invocation, before any gate — so it captures the FULL |fair−mid|
@@ -524,8 +550,8 @@ impl FairRideRule {
         // ride gate: youngest ring sample >= lookback_min old
         let lo = now - cfg.lookback_max_ms * 1_000_000;
         let hi = now - cfg.lookback_min_ms * 1_000_000;
-        let then = st.ring.iter().rev().find(|&&(ts, _, _, _)| ts <= hi && ts >= lo).copied();
-        let (ts_then, px_then, mid_then, feats_then) = match then {
+        let then = st.ring.iter().rev().find(|&&(ts, _, _, _, _)| ts <= hi && ts >= lo).copied();
+        let (ts_then, px_then, px2_then, mid_then, feats_then) = match then {
             Some(x) => x,
             None => {
                 st.ring.push_back(push);
@@ -533,7 +559,7 @@ impl FairRideRule {
             }
         };
         let tte_then = (expiry - ts_then) as f64 / 1e9;
-        let fair_then = self.surface.fair(px_then, tte_then, strike, d_b, d_rho, &feats_then);
+        let fair_then = self.surface.fair(px_then, px2_then, tte_then, strike, d_b, d_rho, &feats_then);
         let side = if gap > 0.0 { 1.0 } else { -1.0 };
         let mp = side * (fair - fair_then);
         let xp = -side * (mid - mid_then);
@@ -582,7 +608,7 @@ impl Rule for FairRideRule {
                 // reference (price) moved: refresh features FIRST (perp mid +
                 // imb1 sizes) so this tick's eval sees the current snapshot,
                 // then evaluate every tracked event.
-                if self.feats.active() {
+                if self.feats.active() || self.surface.two_price() {
                     if let (Some(&(bid, bsz)), Some(&(ask, asz))) = (b.bids.first(), b.asks.first()) {
                         if bid > 0.0 && ask > 0.0 {
                             self.feats.on_perp(b.recv_ts_ns, 0.5 * (bid + ask), bsz, asz);
@@ -601,8 +627,11 @@ impl Rule for FairRideRule {
                 self.feats.on_perp_trade(t.recv_ts_ns, t.qty);
                 Vec::new()
             }
-            Payload::Book(b) if self.feats.active() && b.instrument == self.cfg.basis_reference => {
-                // coinbase moved: update basis; no eval (perp/YES ticks drive it)
+            Payload::Book(b)
+                if (self.feats.active() || self.surface.two_price())
+                    && b.instrument == self.cfg.basis_reference =>
+            {
+                // coinbase moved: update basis/px2; no eval (perp/YES ticks drive it)
                 if let (Some(&(bid, _)), Some(&(ask, _))) = (b.bids.first(), b.asks.first()) {
                     if bid > 0.0 && ask > 0.0 {
                         self.feats.on_cb(b.recv_ts_ns, 0.5 * (bid + ask));

@@ -244,7 +244,9 @@ fn main() -> anyhow::Result<()> {
                     if tte_s > 0.0 && price > 0.0 {
                         if let Some(feats) = feats_opt {
                             *last = ts_ms;
-                            let fair = surface.fair(price, tte_s, strike, u.d_b, u.d_rho, &feats);
+                            // two-price surfaces: cb mid as px2 (NAN otherwise)
+                            let px2 = if surface.two_price() { 0.5 * (cb_b + cb_a) } else { f64::NAN };
+                            let fair = surface.fair(price, px2, tte_s, strike, u.d_b, u.d_rho, &feats);
                             writeln!(
                                 fairs,
                                 "{},{},{:.3},{:.6},{:.4},{:.6},{:.6},{}",

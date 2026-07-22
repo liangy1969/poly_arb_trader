@@ -38,6 +38,11 @@ struct ArchJson {
 struct ModelJson {
     arch: ArchJson,
     rho_bar: f64,
+    /// TWO-PRICE surface (type "px2cb_mom"): the coinbase channel's global
+    /// vol-scale. Present ⇒ input is [z′_perp, z′_cb, ln τ] + extras, with
+    /// z′_v = ((px_v − b)/s_v)/√τ, s_v = exp(rho_v + Δρ) — shared (b, Δρ).
+    #[serde(default)]
+    rho_cb: Option<f64>,
     b_scale: f64,
     layers: Vec<LayerJson>,
     #[serde(default)]
@@ -55,8 +60,10 @@ pub struct FairSurface {
     b: Vec<Vec<f64>>,
     dims: Vec<(usize, usize)>, // (in, out) per layer
     pub rho_bar: f64,
+    /// `Some(rho_cb)` ⇒ two-price surface: input [z′_perp, z′_cb, ln τ] + extras.
+    pub rho_cb: Option<f64>,
     pub b_scale: f64,
-    /// Extra-feature names in input order (after [z′, ln τ]); empty for cb.
+    /// Extra-feature names in input order (after the price/time channels).
     pub extras: Vec<String>,
     mu: Vec<f64>,
     sd: Vec<f64>,
@@ -69,6 +76,9 @@ pub struct FairSurface {
 pub struct FitRow {
     pub tte_s: f64,
     pub px: f64,
+    /// Second price channel (coinbase mid) for a two-price surface; NAN and
+    /// ignored on single-price surfaces.
+    pub px2: f64,
     pub mid: f64,
     pub feats: [f64; MAX_EXTRA],
 }
@@ -76,7 +86,7 @@ pub struct FitRow {
 impl FitRow {
     /// Convenience constructor for the cb (no-extra) path.
     pub fn new(tte_s: f64, px: f64, mid: f64) -> Self {
-        FitRow { tte_s, px, mid, feats: [0.0; MAX_EXTRA] }
+        FitRow { tte_s, px, px2: f64::NAN, mid, feats: [0.0; MAX_EXTRA] }
     }
 }
 
@@ -92,9 +102,10 @@ impl FairSurface {
             js.mu.len() == n_extra && js.sd.len() == n_extra,
             "mu/sd length must match extras ({n_extra})"
         );
+        let n_chan = if js.rho_cb.is_some() { 3 } else { 2 }; // [z′(,z′_cb), lnτ]
         anyhow::ensure!(
-            js.layers[0].w[0].len() == 2 + n_extra,
-            "input dim {} != 2 + {n_extra} extras",
+            js.layers[0].w[0].len() == n_chan + n_extra,
+            "input dim {} != {n_chan} channels + {n_extra} extras",
             js.layers[0].w[0].len()
         );
         let mut w = Vec::new();
@@ -118,6 +129,7 @@ impl FairSurface {
             b,
             dims,
             rho_bar: js.rho_bar,
+            rho_cb: js.rho_cb,
             b_scale: js.b_scale,
             extras: js.extras,
             mu: js.mu,
@@ -134,13 +146,25 @@ impl FairSurface {
         self.extras.len()
     }
 
-    /// Raw model logit for (px, tte) under event params (b, s). `feats` are the
-    /// RAW extra features (only the first `n_extra` are read; z-scored here).
-    pub fn logit(&self, px: f64, tte_s: f64, b: f64, s: f64, feats: &[f64]) -> f64 {
+    /// Two-price surface? (needs the coinbase mid as `px2` on every call.)
+    pub fn two_price(&self) -> bool {
+        self.rho_cb.is_some()
+    }
+
+    /// Raw model logit for (px[, px2], tte) under event params (b, s). `s` is
+    /// the PERP scale exp(rho_bar + Δρ); on a two-price surface the cb scale is
+    /// derived as s·exp(rho_cb − rho_bar) = exp(rho_cb + Δρ) (shared Δρ, b).
+    /// `px2` is ignored on single-price surfaces. `feats` are the RAW extra
+    /// features (only the first `n_extra` are read; z-scored here).
+    pub fn logit(&self, px: f64, px2: f64, tte_s: f64, b: f64, s: f64, feats: &[f64]) -> f64 {
         let tau = (tte_s / 900.0).clamp(1e-4, 1.0);
         let zp = ((px - b) / s) / tau.sqrt();
-        let mut h = Vec::with_capacity(2 + self.extras.len());
+        let mut h = Vec::with_capacity(3 + self.extras.len());
         h.push(zp);
+        if let Some(rho_cb) = self.rho_cb {
+            let s_cb = s * (rho_cb - self.rho_bar).exp();
+            h.push(((px2 - b) / s_cb) / tau.sqrt());
+        }
         h.push(tau.ln());
         for i in 0..self.extras.len() {
             // z-score + clip to ±5, matching the sim's np.clip((X-mu)/sd,-5,5)
@@ -163,11 +187,12 @@ impl FairSurface {
     }
 
     /// Fair probability under event params (Δb, Δρ) with the strike prior.
-    /// `feats` are the RAW extra features (empty slice for cb).
-    pub fn fair(&self, px: f64, tte_s: f64, strike: f64, d_b: f64, d_rho: f64, feats: &[f64]) -> f64 {
+    /// `feats` are the RAW extra features (empty slice for cb); `px2` = the
+    /// coinbase mid on a two-price surface (NAN/ignored otherwise).
+    pub fn fair(&self, px: f64, px2: f64, tte_s: f64, strike: f64, d_b: f64, d_rho: f64, feats: &[f64]) -> f64 {
         let b = strike + self.b_scale * d_b;
         let s = (self.rho_bar + d_rho).exp();
-        sigmoid(self.logit(px, tte_s, b, s, feats))
+        sigmoid(self.logit(px, px2, tte_s, b, s, feats))
     }
 
     /// Mean BCE(σ(logit), clip(mid)) over rows for params (Δb, Δρ). Each row's
@@ -177,7 +202,7 @@ impl FairSurface {
         let s = (self.rho_bar + d_rho).exp();
         let mut acc = 0.0;
         for r in rows {
-            let l = self.logit(r.px, r.tte_s, b, s, &r.feats);
+            let l = self.logit(r.px, r.px2, r.tte_s, b, s, &r.feats);
             let y = r.mid.clamp(P_CLIP, 1.0 - P_CLIP);
             // stable BCE-with-logits: max(l,0) − l·y + ln(1 + e^{−|l|})
             acc += l.max(0.0) - l * y + (-l.abs()).exp().ln_1p();
@@ -267,6 +292,15 @@ impl FeatureState {
     /// Any extra features to build? (false for the cb surface.)
     pub fn active(&self) -> bool {
         !self.extras.is_empty()
+    }
+
+    /// Fresh coinbase mid (≤ 5s old), for the two-price surface's px2 channel.
+    pub fn cb_price(&self, now_ns: i64) -> Option<f64> {
+        if self.cb_mid > 0.0 && now_ns - self.cb_ts <= Self::CB_STALE_NS {
+            Some(self.cb_mid)
+        } else {
+            None
+        }
     }
 
     pub fn on_perp(&mut self, ts_ns: i64, mid: f64, bid_sz: f64, ask_sz: f64) {
@@ -375,6 +409,16 @@ impl FeatureState {
                     let k: i64 = n[6..].parse().ok()?;
                     basis - self.basis_lag(now_ns, k)?
                 }
+                n if n.starts_with("pmom") => {
+                    // PERCENT perp-mid change over k seconds (the 2p model's
+                    // %mom: (p − p_lag)/p_lag, z-scored by the surface)
+                    let k: i64 = n[4..].parse().ok()?;
+                    let lag = self.mid_lag(now_ns, k)?;
+                    if lag <= 0.0 {
+                        return None;
+                    }
+                    (self.perp_mid - lag) / lag
+                }
                 n if n.starts_with("mom") => {
                     // perp mid change over k seconds (matches the trainer's mom{k})
                     let k: i64 = n[3..].parse().ok()?;
@@ -431,7 +475,7 @@ mod tests {
         assert!(v.rows.len() >= 500);
         let mut worst = 0.0f64;
         for r in &v.rows {
-            let l = m.logit(r.px, r.tte_s, r.b, r.s, &[]);
+            let l = m.logit(r.px, f64::NAN, r.tte_s, r.b, r.s, &[]);
             worst = worst.max((l - r.logit).abs());
         }
         assert!(worst < 1e-4, "max |Δlogit| = {worst}");
@@ -465,10 +509,46 @@ mod tests {
         assert!(v.rows.len() >= 500);
         let mut worst = 0.0f64;
         for r in &v.rows {
-            let l = m.logit(r.px, r.tte_s, r.b, r.s, &r.feats);
+            let l = m.logit(r.px, f64::NAN, r.tte_s, r.b, r.s, &r.feats);
             worst = worst.max((l - r.logit).abs());
         }
         assert!(worst < 1e-4, "px2imb max |Δlogit| = {worst}");
+    }
+
+    #[derive(Deserialize)]
+    struct PVecs {
+        rows: Vec<PVecRow>,
+    }
+    #[derive(Deserialize)]
+    struct PVecRow {
+        px: f64,
+        px2: f64,
+        tte_s: f64,
+        b: f64,
+        s: f64,
+        feats: Vec<f64>,
+        logit: f64,
+    }
+
+    /// Gate 1 for the TWO-PRICE surface (px2cb_mom): [z′_perp, z′_cb, ln τ] +
+    /// z-scored %mom extras == torch, with s_cb derived from the shared Δρ.
+    #[test]
+    fn surface_parity_2p_vs_torch() {
+        let m = FairSurface::load(&format!(
+            "{}/../../models/fair-2pmom-cbbasis-btc.json",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap();
+        assert!(m.two_price());
+        assert_eq!(m.n_extra(), 2);
+        let v: PVecs = serde_json::from_str(&testdata("surface_vectors_2p.json")).unwrap();
+        assert!(v.rows.len() >= 500);
+        let mut worst = 0.0f64;
+        for r in &v.rows {
+            let l = m.logit(r.px, r.px2, r.tte_s, r.b, r.s, &r.feats);
+            worst = worst.max((l - r.logit).abs());
+        }
+        assert!(worst < 1e-4, "2p max |Δlogit| = {worst}");
     }
 
     #[derive(Deserialize)]
@@ -498,7 +578,7 @@ mod tests {
     fn max_fair_diff(m: &FairSurface, case: &FitCase, db: f64, dr: f64, torch_curve: &[f64]) -> f64 {
         let mut worst = 0.0f64;
         for (r, tf) in case.core_rows.iter().zip(torch_curve) {
-            let f = m.fair(r.px, r.tte_s, case.strike, db, dr, &[]);
+            let f = m.fair(r.px, f64::NAN, r.tte_s, case.strike, db, dr, &[]);
             worst = worst.max((f - tf).abs());
         }
         worst
