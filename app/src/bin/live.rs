@@ -63,7 +63,15 @@ async fn main() -> anyhow::Result<()> {
                         .with_target("exec", LevelFilter::INFO)
                         .with_target("signal", LevelFilter::INFO)
                         .with_target("hold", LevelFilter::INFO)
-                        .with_target("maker", LevelFilter::INFO),
+                        .with_target("maker", LevelFilter::INFO)
+                        // analysis series that must SURVIVE RESTARTS (the stdout
+                        // log is truncated by start_collectors.sh): the probe's
+                        // feature series (band5 validation), the fairlog
+                        // online-vs-offline replay stream, calib fits, gapstats.
+                        .with_target("featstats", LevelFilter::INFO)
+                        .with_target("fairlog", LevelFilter::INFO)
+                        .with_target("fit", LevelFilter::INFO)
+                        .with_target("gapstats", LevelFilter::INFO),
                 );
             tracing_subscriber::registry().with(stdout_layer).with(events_layer).init();
             tracing::info!("trader events -> {events_path} (append; survives relaunches)");
