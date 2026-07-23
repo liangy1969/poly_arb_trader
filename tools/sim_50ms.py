@@ -110,25 +110,44 @@ FIT_WINDOW_S = float(os.environ.get("FIT_WINDOW_S", "0"))
 KALSHI = "https://api.elections.kalshi.com/trade-api/v2"
 
 
+def _meta_ok(v):
+    """A cache entry counts as 'done' only if it has a strike AND a yes/no
+    settlement, so transient-failure placeholders get RE-FETCHED, not skipped."""
+    return isinstance(v, dict) and v.get("strike") is not None and v.get("result") in ("yes", "no")
+
+
 def fetch_meta(tickers, cache_path):
     cache = {}
     if os.path.exists(cache_path):
         cache = json.load(open(cache_path))
-    for t in tickers:
-        if t in cache:
-            continue
-        try:
-            with urllib.request.urlopen(f"{KALSHI}/markets/{t}", timeout=15) as r:
-                m = json.load(r)["market"]
-            cache[t] = {
-                "strike": m.get("floor_strike"),
-                "result": m.get("result", ""),
-                "close_ts": m.get("close_time", ""),
-            }
-        except Exception as e:  # noqa: BLE001
-            print(f"  meta fetch {t}: {e}")
-            cache[t] = {"strike": None, "result": "", "close_ts": ""}
-        time.sleep(0.1)
+    # only re-fetch what isn't resolved (heals stuck empty entries from prior runs)
+    todo = [t for t in tickers if not _meta_ok(cache.get(t))]
+    if todo:
+        print(f"  fetching meta for {len(todo)} unresolved markets (retry+backoff) ...")
+    hdr = {"User-Agent": "poly-arb-analysis/1.0 (research)", "Accept": "application/json"}
+    got = 0
+    for t in todo:
+        for attempt in range(4):
+            try:
+                req = urllib.request.Request(f"{KALSHI}/markets/{t}", headers=hdr)
+                with urllib.request.urlopen(req, timeout=20) as r:
+                    m = json.load(r)["market"]
+                cache[t] = {
+                    "strike": m.get("floor_strike"),
+                    "result": m.get("result", ""),
+                    "close_ts": m.get("close_time", ""),
+                }
+                got += 1
+                break
+            except Exception as e:  # noqa: BLE001
+                if attempt == 3:
+                    # give up for now but DO NOT cache the failure -> retried next run
+                    print(f"  meta fetch {t}: {e} (gave up; not cached, will retry)")
+                else:
+                    time.sleep(0.5 * (attempt + 1))  # 0.5s, 1.0s, 1.5s backoff
+        time.sleep(0.15)
+        if got and got % 200 == 0:
+            json.dump(cache, open(cache_path, "w"))  # periodic checkpoint
     json.dump(cache, open(cache_path, "w"))
     return cache
 
@@ -183,7 +202,9 @@ def load_samples(path):
 def build_surface(js):
     hid = js["arch"]["hidden"]
     n_extra = len(js.get("extras", []))
-    net = nn.Sequential(nn.Linear(2 + n_extra, hid), nn.Tanh(), nn.Linear(hid, hid), nn.Tanh(), nn.Linear(hid, 1))
+    # two-price surface (px2cb_mom): input [z'_perp, z'_cb, ln tau] + extras
+    n_chan = 3 if js.get("rho_cb") is not None else 2
+    net = nn.Sequential(nn.Linear(n_chan + n_extra, hid), nn.Tanh(), nn.Linear(hid, hid), nn.Tanh(), nn.Linear(hid, 1))
     lin = [m for m in net if isinstance(m, nn.Linear)]
     for m, lw in zip(lin, js["layers"]):
         m.weight.data = torch.tensor(lw["w"], dtype=torch.float32)
@@ -192,8 +213,11 @@ def build_surface(js):
 
 
 def make_fwd(net, mode, clamp):
-    def fwd(zp, log_tau, extra=None):
-        cols = [zp.unsqueeze(-1), log_tau.unsqueeze(-1)]
+    def fwd(zp, log_tau, extra=None, zp2=None):
+        cols = [zp.unsqueeze(-1)]
+        if zp2 is not None:
+            cols.append(zp2.unsqueeze(-1))
+        cols.append(log_tau.unsqueeze(-1))
         if extra is not None and extra.shape[-1] > 0:
             cols.append(extra)
         x = torch.cat(cols, dim=-1)
@@ -206,10 +230,16 @@ def make_fwd(net, mode, clamp):
     return fwd
 
 
-def logit_of(fwd, spot, tte, b, s, extra=None):
+def logit_of(fwd, spot, tte, b, s, extra=None, cb=None, cb_mult=None):
+    """Single-price: (spot, b, s). Two-price (cb + cb_mult given): the second
+    channel is z'_cb = ((cb - b)/(s*cb_mult))/sqrt(tau) — cb_mult =
+    exp(rho_cb - rho_bar), so shared (b, dr) exactly as in training."""
     tau = (tte / 900.0).clamp(1e-4, 1.0)
     zp = ((spot - b) / s) / tau.sqrt()
-    return fwd(zp, tau.log(), extra)
+    zp2 = None
+    if cb is not None:
+        zp2 = ((cb - b) / (s * cb_mult)) / tau.sqrt()
+    return fwd(zp, tau.log(), extra, zp2)
 
 
 def load_feat_file(path):
@@ -238,17 +268,18 @@ def fee(p):
     return FEE_RATE * p * (1.0 - p)
 
 
-def fit_event(fwd, spot, tte, target, strike, rho_bar, b_scale, steps=FIT_STEPS, init=None, extra=None):
+def fit_event(fwd, spot, tte, target, strike, rho_bar, b_scale, steps=FIT_STEPS, init=None, extra=None, cb=None, cb_mult=None):
     db = torch.tensor([init[0]] if init else [0.0], requires_grad=True)
     dr = torch.tensor([init[1]] if init else [0.0], requires_grad=True)
     opt = torch.optim.Adam([db, dr], lr=FIT_LR)
     ts = torch.tensor(spot, dtype=torch.float32)
     tt = torch.tensor(tte, dtype=torch.float32)
     xx = torch.tensor(extra, dtype=torch.float32) if extra is not None else None
+    cc = torch.tensor(cb, dtype=torch.float32) if cb is not None else None
     y = torch.tensor(np.clip(target, P_CLIP, 1 - P_CLIP), dtype=torch.float32)
     for _ in range(steps):
         opt.zero_grad()
-        lo = logit_of(fwd, ts, tt, strike + b_scale * db, torch.exp(rho_bar + dr), xx)
+        lo = logit_of(fwd, ts, tt, strike + b_scale * db, torch.exp(rho_bar + dr), xx, cc, cb_mult)
         nn.functional.binary_cross_entropy_with_logits(lo, y).backward()
         opt.step()
     return db.detach(), dr.detach()
@@ -286,28 +317,41 @@ def main():
             kept += int(ok.sum())
         print(f"native cb price: kept {kept:,} rows, dropped {dropped:,} (no fresh cb quote)")
     if NATIVE_MOM:
-        moms_wanted = [int(c[3:]) for c in extras_names if c.startswith("mom")]
-        assert moms_wanted and len(moms_wanted) == len(extras_names), "NATIVE_MOM expects mom-only extras"
+        # generalized native reconstruction: mom{k} from the model price,
+        # basis (=cbmid - price) and dbasis{k} from cbmid + price history.
         mu = np.array(js.get("mu", [0.0] * len(extras_names)))
         sd = np.array(js.get("sd", [1.0] * len(extras_names)))
+        needs_cb = any(c.startswith("basis") or c.startswith("dbasis") for c in extras_names)
         kept = dropped = 0
         for t, d in ev.items():
             ts = d["ts"]
-            X = np.full((len(ts), len(moms_wanted)), np.nan)
-            for ci, k in enumerate(moms_wanted):
-                idx = np.searchsorted(ts, ts - k * 1000.0, side="right") - 1
+            def lag(series, k_s):
+                idx = np.searchsorted(ts, ts - k_s * 1000.0, side="right") - 1
                 okk = idx >= 0
-                okk[okk] &= (ts[okk] - ts[idx[okk]]) <= (k * 1000.0 + 2000.0)
+                okk[okk] &= (ts[okk] - ts[idx[okk]]) <= (k_s * 1000.0 + 2000.0)
                 col = np.full(len(ts), np.nan)
-                col[okk] = d["spot"][okk] - d["spot"][idx[okk]]
-                X[:, ci] = col
+                col[okk] = series[idx[okk]]
+                return col
+            bas = d["cbmid"] - d["spot"] if needs_cb else None
+            X = np.full((len(ts), len(extras_names)), np.nan)
+            for ci, name in enumerate(extras_names):
+                if name.startswith("mom"):
+                    X[:, ci] = d["spot"] - lag(d["spot"], int(name[3:]))
+                elif name == "basis":
+                    X[:, ci] = bas
+                elif name.startswith("dbasis"):
+                    X[:, ci] = bas - lag(bas, int(name[6:]))
+                elif name == "imb1":
+                    X[:, ci] = d["imb1n"]
+                else:
+                    raise SystemExit(f"NATIVE_MOM cannot reconstruct {name}")
             ok = ~np.isnan(X).any(axis=1)
             d["X"] = np.clip((X - mu) / sd, -5, 5)
             for kcol in list(d):
                 d[kcol] = d[kcol][ok]
             dropped += int((~ok).sum())
             kept += int(ok.sum())
-        print(f"native mom: kept {kept:,} rows, dropped {dropped:,} (no lookback)")
+        print(f"native feats {extras_names}: kept {kept:,} rows, dropped {dropped:,}")
     if FEAT_NATIVE:
         if [c for c in extras_names if c != "imb1"]:
             sys.exit(f"FEAT_NATIVE only provides imb1; model wants {extras_names}")
