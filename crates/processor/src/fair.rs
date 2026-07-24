@@ -294,8 +294,9 @@ impl FeatureState {
 
     /// Coinbase quote staleness gate (the sim only uses cb aged ≤ 5s).
     const CB_STALE_NS: i64 = 5_000_000_000;
-    /// Trade-volume ring horizon — covers vsurge's 600s window + slack.
-    const VOL_HORIZON_NS: i64 = 620_000_000_000;
+    /// Trade-volume ring horizon — covers the slowest vsurge long window
+    /// (vsurge120_1200 ⇒ 1200s) + slack.
+    const VOL_HORIZON_NS: i64 = 1_260_000_000_000;
     /// Depth-book staleness gate (@depth@100ms cadence ⇒ 2s is generous).
     const DEPTH_STALE_NS: i64 = 2_000_000_000;
 
@@ -479,16 +480,24 @@ impl FeatureState {
                     let k: i64 = n[3..].parse().ok()?;
                     self.perp_mid - self.mid_lag(now_ns, k)?
                 }
-                "vsurge" => {
-                    // 60s / 600s taker volume from the cumulative counter:
-                    // vol(W) = cum(now) − cum(now − W). None until 600s of history.
+                n if n.starts_with("vsurge") => {
+                    // Taker-volume surge vol(S)/vol(L) from the cumulative
+                    // counter: vol(W) = cum(now) − cum(now − W). Parameterized
+                    // as `vsurge{S}_{L}` (e.g. vsurge120_1200); bare "vsurge"
+                    // = the legacy 60/600. None until L s of history.
+                    let (s_w, l_w) = if n.len() > 6 {
+                        let mut it = n[6..].splitn(2, '_');
+                        (it.next()?.parse().ok()?, it.next()?.parse().ok()?)
+                    } else {
+                        (60, 600)
+                    };
                     let cum_now = self.trade_ring.back().map(|&(_, c)| c)?;
-                    let v60 = cum_now - self.cum_lag(now_ns, 60)?;
-                    let v600 = cum_now - self.cum_lag(now_ns, 600)?;
-                    if v600 <= 0.0 {
+                    let vs = cum_now - self.cum_lag(now_ns, s_w)?;
+                    let vl = cum_now - self.cum_lag(now_ns, l_w)?;
+                    if vl <= 0.0 {
                         return None;
                     }
-                    v60 / v600
+                    vs / vl
                 }
                 _ => return None, // unknown feature name — fail loud via caller
             };
