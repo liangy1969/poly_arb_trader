@@ -874,7 +874,7 @@ def main():
     p.add_argument("--model", action="append", required=True, metavar="label=path[:px=cb|perp]",
                    help="repeatable; price input defaults from surface train.venue")
     p.add_argument("--deltas", default="0.03,0.05", help="entry |gap| thresholds")
-    p.add_argument("--tte", default="300:120", metavar="MAX:MIN",
+    p.add_argument("--tte", default="300:60", metavar="MAX:MIN",
                    help="entry window in seconds to expiry")
     p.add_argument("--fit-window", type=float, default=120.0,
                    help="rolling (db,dr) fit window in s (0 = expanding)")
