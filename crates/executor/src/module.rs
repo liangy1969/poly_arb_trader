@@ -259,7 +259,6 @@ impl Module for Executor {
                 &self.cfg.venue.key_id,
                 &self.cfg.venue.private_key_path,
                 &self.cfg.venue.network,
-                self.cfg.venue.max_order_usdc,
             )?),
             other => anyhow::bail!(
                 "venue adapter '{other}' not implemented (have: sim, kalshi; polymarket_clob is P2)"

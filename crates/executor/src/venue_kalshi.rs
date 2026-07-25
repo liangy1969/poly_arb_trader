@@ -84,13 +84,15 @@ pub struct KalshiVenue {
     http: reqwest::Client,
     signer: Signer,
     base: String,
-    /// Hard per-order USDC cap (validation safety).
-    max_order_usdc: f64,
 }
 
 impl KalshiVenue {
     /// `network`: "mainnet" -> production, anything else -> demo (safe default).
-    pub fn new(key_id: &str, pem_path: &str, network: &str, max_order_usdc: f64) -> Result<Self> {
+    /// Per-order exposure is bounded naturally by `sizing.size_shares` ×
+    /// the $1 contract price ceiling (the old max_order_usdc cap was removed
+    /// 2026-07-25 after it silently blocked the [0.5,0.8] half of the band
+    /// when size went 1→2).
+    pub fn new(key_id: &str, pem_path: &str, network: &str) -> Result<Self> {
         if key_id.is_empty() || pem_path.is_empty() {
             anyhow::bail!("kalshi adapter needs venue.key_id + venue.private_key_path");
         }
@@ -101,8 +103,8 @@ impl KalshiVenue {
             .tcp_keepalive(Duration::from_secs(15))  // keep the socket alive through NAT/LB
             .build()
             .context("building reqwest client")?;
-        tracing::info!("kalshi venue: base={base} max_order_usdc={max_order_usdc}");
-        Ok(KalshiVenue { http, signer: Signer::load(key_id, pem_path)?, base, max_order_usdc })
+        tracing::info!("kalshi venue: base={base}");
+        Ok(KalshiVenue { http, signer: Signer::load(key_id, pem_path)?, base })
     }
 }
 
@@ -203,13 +205,6 @@ impl TradingVenue for KalshiVenue {
         let count = intent.size.floor().max(0.0) as i64; // integer contracts
         if count < 1 {
             return VenueOutcome::Rejected(format!("size {:.2} < 1 contract", intent.size));
-        }
-        if (ko.cents * count) as f64 / 100.0 > self.max_order_usdc {
-            return VenueOutcome::Rejected(format!(
-                "notional {:.2} > max_order_usdc {:.2}",
-                (ko.cents * count) as f64 / 100.0,
-                self.max_order_usdc
-            ));
         }
         let Some(ticker) = market_id_of(&intent.instrument) else {
             return VenueOutcome::Rejected(format!("no ticker in {}", intent.instrument));

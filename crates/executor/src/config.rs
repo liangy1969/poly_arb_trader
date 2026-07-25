@@ -85,8 +85,6 @@ pub struct VenueCfg {
     pub adapter: String,
     /// Polymarket: "testnet"/"mainnet". Kalshi: "demo" (default) / "mainnet".
     pub network: String,
-    /// Hard per-order USDC cap while validating on mainnet.
-    pub max_order_usdc: f64,
     /// Kalshi adapter: access-key id (or empty → unused for sim).
     pub key_id: String,
     /// Kalshi adapter: RSA private-key PEM path (PKCS#8/#1).
@@ -212,7 +210,6 @@ impl Default for VenueCfg {
             market: "polymarket".into(),
             adapter: "sim".into(),
             network: "testnet".into(),
-            max_order_usdc: 1.0,
             key_id: String::new(),
             private_key_path: String::new(),
         }
