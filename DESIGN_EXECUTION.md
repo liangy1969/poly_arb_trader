@@ -748,7 +748,6 @@ executor:
   venue:
     adapter: polymarket_clob    # only adapter; no paper venue
     network: testnet            # testnet (Amoy, chainId 80002) | mainnet (137)
-    max_order_usdc: 1.0         # hard cap while validating on mainnet
   sizing:
     size_shares: 20             # fixed target size, v1
     depth_frac: 0.5             # cap vs displayed top-of-book size
