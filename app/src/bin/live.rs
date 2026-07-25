@@ -236,6 +236,23 @@ async fn main() -> anyhow::Result<()> {
         }))
     };
 
+    // The feature probe's features ALWAYS ride along in the 50ms sampler rows
+    // (dense simulation-grade series, not just the 1/min featstats log).
+    // Same extras resolution as the probe: explicit cfg list wins, else the
+    // probe model's extras; empty when the probe is disabled.
+    let sampler_extras: Vec<String> = if cfg.feature_probe.enabled {
+        if !cfg.feature_probe.extras.is_empty() {
+            cfg.feature_probe.extras.clone()
+        } else if !cfg.feature_probe.model_path.is_empty() {
+            arb_processor::FairSurface::load(&cfg.feature_probe.model_path)
+                .map(|s| s.extras.clone())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
     let _sampler = if cfg.run.sample_dir.is_empty() {
         None
     } else {
@@ -244,6 +261,9 @@ async fn main() -> anyhow::Result<()> {
         let cbq = cb_quote.clone();
         let perp_inst = cfg.run.perp_instrument.clone();
         let spot_inst = cfg.binance_spot.as_ref().map(|c| c.instrument.clone()).unwrap_or_default();
+        let feat_extras = sampler_extras.clone();
+        let depth_ref = cfg.feature_probe.depth_reference.clone();
+        let vol_inst = format!("{}.vol", cfg.feature_probe.reference);
         let mut sub = bus.subscribe("market.#", 8192, Policy::Conflate(key_by_instrument));
         Some(tokio::spawn(async move {
             use std::collections::HashMap;
@@ -264,6 +284,10 @@ async fn main() -> anyhow::Result<()> {
             let mut perp: Option<(f64, f64, f64, f64, i64)> = None; // bid, ask, bid_sz, ask_sz, exch_ns
             // binance SPOT top (settlement-chain sibling): same shape as perp
             let mut spotq: (f64, f64, f64, f64, i64) = (f64::NAN, f64::NAN, 0.0, 0.0, 0);
+            // probe features (band5/vsurge/...) reconstructed in-sampler so
+            // every 50ms row carries them (empty extras = no extra columns).
+            let mut feats = arb_processor::FeatureState::new(feat_extras.clone());
+            let mut last_cb_push: i64 = 0;
             let mut books: HashMap<String, KTop> = HashMap::new();
             let mut expiry: HashMap<String, i64> = HashMap::new();
             let mut out: Option<(String, std::io::BufWriter<std::fs::File>)> = None;
@@ -279,7 +303,16 @@ async fn main() -> anyhow::Result<()> {
                             Payload::Book(b) if b.instrument == perp_inst => {
                                 if let (Some(&(pb, pbs)), Some(&(pa, pas))) = (b.bids.first(), b.asks.first()) {
                                     perp = Some((pb, pa, pbs, pas, b.exch_ts_ns));
+                                    if !feat_extras.is_empty() && pb > 0.0 && pa > 0.0 {
+                                        feats.on_perp(b.recv_ts_ns, 0.5 * (pb + pa), pbs, pas);
+                                    }
                                 }
+                            }
+                            Payload::Book(b) if !feat_extras.is_empty() && !depth_ref.is_empty() && b.instrument == depth_ref => {
+                                feats.on_depth(b.recv_ts_ns, &b.bids, &b.asks);
+                            }
+                            Payload::Trade(t) if !feat_extras.is_empty() && t.instrument == vol_inst => {
+                                feats.on_perp_trade(t.recv_ts_ns, t.qty); // cumulative volume
                             }
                             Payload::Book(b) if !spot_inst.is_empty() && b.instrument == spot_inst => {
                                 if let (Some(&(sb, sbs)), Some(&(sa, sas))) = (b.bids.first(), b.asks.first()) {
@@ -336,7 +369,12 @@ async fn main() -> anyhow::Result<()> {
                                 Ok(f) => {
                                     let mut w = std::io::BufWriter::new(f);
                                     if fresh {
-                                        let _ = writeln!(w, "ts_ms,ticker,tte_ms,perp_bid,perp_ask,ybid,yask,ybid_sz,yask_sz,cb_bid,cb_ask,cb_age_ms,perp_bid_sz,perp_ask_sz,cb_bid_sz,cb_ask_sz,perp_age_ms,cb_srv_age_ms,spot_bid,spot_ask,spot_bid_sz,spot_ask_sz,spot_age_ms");
+                                        let mut hdr = String::from("ts_ms,ticker,tte_ms,perp_bid,perp_ask,ybid,yask,ybid_sz,yask_sz,cb_bid,cb_ask,cb_age_ms,perp_bid_sz,perp_ask_sz,cb_bid_sz,cb_ask_sz,perp_age_ms,cb_srv_age_ms,spot_bid,spot_ask,spot_bid_sz,spot_ask_sz,spot_age_ms");
+                                        for n in &feat_extras {
+                                            hdr.push(',');
+                                            hdr.push_str(n);
+                                        }
+                                        let _ = writeln!(w, "{hdr}");
                                     }
                                     out = Some((day, w));
                                 }
@@ -352,6 +390,26 @@ async fn main() -> anyhow::Result<()> {
                         let cb_srv_age_ms = if cb_srv_ns > 0 { (now - cb_srv_ns) / 1_000_000 } else { -1 };
                         let (sp_b, sp_a, sp_bs, sp_as, sp_exch_ns) = spotq;
                         let spot_age_ms = if sp_exch_ns > 0 { (now - sp_exch_ns) / 1_000_000 } else { -1 };
+                        // probe features, once per tick (market-independent).
+                        // NaN column = feature not ready (warmup / stale feed).
+                        let feat_cols = if feat_extras.is_empty() {
+                            String::new()
+                        } else {
+                            if cb_ts > last_cb_push && cb_b > 0.0 && cb_a > 0.0 {
+                                feats.on_cb(cb_ts, 0.5 * (cb_b + cb_a));
+                                last_cb_push = cb_ts;
+                            }
+                            let vals = feats.feats(now);
+                            let mut s = String::new();
+                            for i in 0..feat_extras.len() {
+                                s.push(',');
+                                match vals {
+                                    Some(v) => s.push_str(&format!("{:.6}", v[i])),
+                                    None => s.push_str("nan"),
+                                }
+                            }
+                            s
+                        };
                         for (mid, k) in &books {
                             if k.expiry_ns == 0 || (k.yask <= 0.0 && k.ybid <= 0.0) {
                                 continue;
@@ -362,10 +420,10 @@ async fn main() -> anyhow::Result<()> {
                             }
                             let _ = writeln!(
                                 w,
-                                "{},{},{},{:.2},{:.2},{:.3},{:.3},{:.1},{:.1},{:.2},{:.2},{},{:.3},{:.3},{:.4},{:.4},{},{},{:.2},{:.2},{:.4},{:.4},{}",
+                                "{},{},{},{:.2},{:.2},{:.3},{:.3},{:.1},{:.1},{:.2},{:.2},{},{:.3},{:.3},{:.4},{:.4},{},{},{:.2},{:.2},{:.4},{:.4},{}{}",
                                 now / 1_000_000, mid, tte_ms, pb, pa, k.ybid, k.yask, k.ybsz, k.yasz,
                                 cb_b, cb_a, cb_age_ms, pbs, pas, cb_bs, cb_as, perp_age_ms, cb_srv_age_ms,
-                                sp_b, sp_a, sp_bs, sp_as, spot_age_ms
+                                sp_b, sp_a, sp_bs, sp_as, spot_age_ms, feat_cols
                             );
                         }
                         n_since_flush += 1;
