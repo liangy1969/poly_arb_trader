@@ -10,7 +10,7 @@ use arb_collector_databento::DatabentoCfg;
 use arb_collector_kalshi::KalshiCfg;
 use arb_collector_polymarket::PolyCfg;
 use arb_executor::ExecutorCfg;
-use arb_processor::{CalibCfg, FeatureProbeCfg, ProcCfg};
+use arb_processor::{CalibCfg, ProcCfg};
 use arb_recorder::RecorderCfg;
 
 #[derive(Clone, Deserialize)]
@@ -29,6 +29,13 @@ pub struct RunCfg {
     pub perp_instrument: String,
     /// Coinbase product for the sampler's settlement-chain quote feed.
     pub cb_product: String,
+    /// Extra features the sampler reconstructs and appends to every 50ms row
+    /// (e.g. ["band5", "vsurge120_1200"]); names as understood by
+    /// `FeatureState::feats`. Empty = no extra columns.
+    pub feature_extras: Vec<String>,
+    /// Deep-book bus instrument for band{k} features (the `binance_depth`
+    /// collector's instrument). Empty = no depth routing.
+    pub depth_instrument: String,
 }
 
 impl Default for RunCfg {
@@ -39,6 +46,8 @@ impl Default for RunCfg {
             sample_ms: 50,
             perp_instrument: "binance.usdt_perp.BTCUSDT".into(),
             cb_product: "BTC-USD".into(),
+            feature_extras: Vec::new(),
+            depth_instrument: String::new(),
         }
     }
 }
@@ -60,8 +69,6 @@ pub struct AppConfig {
     pub kalshi: KalshiCfg,
     pub processor: ProcCfg,
     pub calibrator: CalibCfg,
-    /// Optional log-only feature probe (shadow feature validation; no trading).
-    pub feature_probe: FeatureProbeCfg,
     pub recorder: RecorderCfg,
     pub executor: ExecutorCfg,
     pub run: RunCfg,

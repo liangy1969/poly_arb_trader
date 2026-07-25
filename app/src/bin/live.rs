@@ -236,23 +236,6 @@ async fn main() -> anyhow::Result<()> {
         }))
     };
 
-    // The feature probe's features ALWAYS ride along in the 50ms sampler rows
-    // (dense simulation-grade series, not just the 1/min featstats log).
-    // Same extras resolution as the probe: explicit cfg list wins, else the
-    // probe model's extras; empty when the probe is disabled.
-    let sampler_extras: Vec<String> = if cfg.feature_probe.enabled {
-        if !cfg.feature_probe.extras.is_empty() {
-            cfg.feature_probe.extras.clone()
-        } else if !cfg.feature_probe.model_path.is_empty() {
-            arb_processor::FairSurface::load(&cfg.feature_probe.model_path)
-                .map(|s| s.extras.clone())
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        }
-    } else {
-        Vec::new()
-    };
     let _sampler = if cfg.run.sample_dir.is_empty() {
         None
     } else {
@@ -261,9 +244,10 @@ async fn main() -> anyhow::Result<()> {
         let cbq = cb_quote.clone();
         let perp_inst = cfg.run.perp_instrument.clone();
         let spot_inst = cfg.binance_spot.as_ref().map(|c| c.instrument.clone()).unwrap_or_default();
-        let feat_extras = sampler_extras.clone();
-        let depth_ref = cfg.feature_probe.depth_reference.clone();
-        let vol_inst = format!("{}.vol", cfg.feature_probe.reference);
+        // extra feature columns (band5/vsurge/...) — sampler-owned config
+        let feat_extras = cfg.run.feature_extras.clone();
+        let depth_ref = cfg.run.depth_instrument.clone();
+        let vol_inst = format!("{}.vol", cfg.run.perp_instrument);
         let mut sub = bus.subscribe("market.#", 8192, Policy::Conflate(key_by_instrument));
         Some(tokio::spawn(async move {
             use std::collections::HashMap;
@@ -450,7 +434,6 @@ async fn main() -> anyhow::Result<()> {
     let mut cryptospot = CryptoSpotCollector::new(cfg.cryptospot.clone());
     let mut processor = Processor::new(cfg.processor.clone());
     let mut calibrator = arb_processor::Calibrator::new(cfg.calibrator.clone());
-    let mut feature_probe = arb_processor::FeatureProbe::new(cfg.feature_probe.clone());
     let mut executor = Executor::new(cfg.executor.clone());
 
     // Single active prediction venue (DESIGN_MULTI_VENUE): start only its
@@ -481,7 +464,6 @@ async fn main() -> anyhow::Result<()> {
     if cfg.calibrator.enabled {
         calibrator.start(bus.clone()).await?;
     }
-    feature_probe.start(bus.clone()).await?; // self-gates on feature_probe.enabled
     processor.start(bus.clone()).await?;
     executor.start(bus.clone()).await?;
     tracing::info!("active prediction venue = {active_venue}");
@@ -505,7 +487,6 @@ async fn main() -> anyhow::Result<()> {
     if cfg.calibrator.enabled {
         calibrator.stop().await?;
     }
-    feature_probe.stop().await?;
     processor.stop().await?;
     if cfg.cryptospot.enabled {
         cryptospot.stop().await?;
