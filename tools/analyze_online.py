@@ -148,6 +148,10 @@ def prepare(ev, m):
                     X[:, ci] = bas - lag(bas, int(name[6:]))
                 elif name == "imb1":
                     X[:, ci] = d["imb1n"]
+                elif name in d:
+                    # sampler-native column (band5, vsurge120_1200, ...): the
+                    # ONLINE-computed feature value, fed by name.
+                    X[:, ci] = d[name]
                 else:
                     sys.exit(f"{m['label']}: cannot reconstruct feature {name!r} "
                              f"from sampler columns")

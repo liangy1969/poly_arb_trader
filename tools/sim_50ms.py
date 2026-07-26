@@ -152,6 +152,12 @@ def fetch_meta(tickers, cache_path):
     return cache
 
 
+# Sampler-native feature columns (run.feature_extras in the live config): carried
+# through by NAME when present in the CSV header, nan otherwise. Models whose
+# extras match a column name get the ONLINE-computed value fed directly.
+FEAT_COLS = ("band5", "vsurge120_1200")
+
+
 def load_samples(path):
     """-> per-ticker dict of numpy arrays (ts_ms, tte_s, perp_mid, ybid, yask)."""
     ev = {}
@@ -177,6 +183,13 @@ def load_samples(path):
                     b_px, a_px, age = float(cb_b), float(cb_a), float(cb_age)
                     if b_px > 0 and a_px > 0 and 0 <= age <= 5000:
                         cbmid = (b_px + a_px) / 2.0
+                fx = []
+                for c in FEAT_COLS:
+                    v = r.get(c)
+                    try:
+                        fx.append(float(v))
+                    except (TypeError, ValueError):
+                        fx.append(float("nan"))
                 e = ev.setdefault(r["ticker"], [])
                 e.append(
                     (
@@ -188,6 +201,7 @@ def load_samples(path):
                         imb1,
                         cbmid,
                     )
+                    + tuple(fx)
                 )
             except (ValueError, KeyError, TypeError):
                 continue
@@ -196,6 +210,8 @@ def load_samples(path):
         rows.sort()
         a = np.array(rows, dtype=np.float64)
         out[t] = {"ts": a[:, 0], "tte": a[:, 1], "spot": a[:, 2], "ybid": a[:, 3], "yask": a[:, 4], "imb1n": a[:, 5], "cbmid": a[:, 6]}
+        for i, c in enumerate(FEAT_COLS):
+            out[t][c] = a[:, 7 + i]
     return out
 
 
@@ -343,6 +359,9 @@ def main():
                     X[:, ci] = bas - lag(bas, int(name[6:]))
                 elif name == "imb1":
                     X[:, ci] = d["imb1n"]
+                elif name in d:
+                    # sampler-native column (band5, vsurge120_1200, ...)
+                    X[:, ci] = d[name]
                 else:
                     raise SystemExit(f"NATIVE_MOM cannot reconstruct {name}")
             ok = ~np.isnan(X).any(axis=1)
