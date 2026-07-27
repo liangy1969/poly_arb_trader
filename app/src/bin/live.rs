@@ -71,7 +71,11 @@ async fn main() -> anyhow::Result<()> {
                         .with_target("featstats", LevelFilter::INFO)
                         .with_target("fairlog", LevelFilter::INFO)
                         .with_target("fit", LevelFilter::INFO)
-                        .with_target("gapstats", LevelFilter::INFO),
+                        .with_target("gapstats", LevelFilter::INFO)
+                        // ride episode state transitions (arm/disarm/gate-reject/
+                        // re-arm w/ margins) — lets a live-vs-sim divergence be read
+                        // from the log instead of reconstructed offline.
+                        .with_target("episode", LevelFilter::INFO),
                 );
             tracing_subscriber::registry().with(stdout_layer).with(events_layer).init();
             tracing::info!("trader events -> {events_path} (append; survives relaunches)");

@@ -527,6 +527,15 @@ impl FairRideRule {
         if !st.armed {
             if gap.abs() <= cfg.rearm_eps {
                 st.armed = true;
+                // episode transition log (target "episode"): re-arm, with how much
+                // slack there was to the threshold — a small margin means the arm
+                // state is knife-edge and could diverge from the offline replay on
+                // sub-cent fair differences.
+                tracing::info!(
+                    target: "episode",
+                    "{} RE-ARM tte={:.1} gap={:+.4} margin={:+.4}",
+                    inst, tte_s, gap, cfg.rearm_eps - gap.abs()
+                );
             }
             st.ring.push_back(push);
             return None;
@@ -554,6 +563,11 @@ impl FairRideRule {
         let (ts_then, px_then, px2_then, mid_then, feats_then) = match then {
             Some(x) => x,
             None => {
+                tracing::info!(
+                    target: "episode",
+                    "{} DISARM tte={:.1} gap={:+.4} entry#{} gate=NO-LOOKBACK",
+                    inst, tte_s, gap, entry_no
+                );
                 st.ring.push_back(push);
                 return None;
             }
@@ -564,14 +578,27 @@ impl FairRideRule {
         let mp = side * (fair - fair_then);
         let xp = -side * (mid - mid_then);
         let tot = mp + xp;
-        if !(tot > cfg.open_min && mp / tot > cfg.share_min) {
+        let share = if tot != 0.0 { mp / tot } else { 0.0 };
+        // episode transition log: a δ-crossing consumed the armed state (DISARM);
+        // record the ride-gate outcome so a live gate REJECT (which fires no
+        // signal but still disarms) is visible in the log instead of inferred.
+        if !(tot > cfg.open_min && share > cfg.share_min) {
+            tracing::info!(
+                target: "episode",
+                "{} DISARM tte={:.1} gap={:+.4} entry#{} gate=REJECT tot={:+.4} share={:.2} (open_min={:.3} share_min={:.2})",
+                inst, tte_s, gap, entry_no, tot, share, cfg.open_min, cfg.share_min
+            );
             st.ring.push_back(push);
             return None;
         }
+        tracing::info!(
+            target: "episode",
+            "{} DISARM tte={:.1} gap={:+.4} entry#{} gate=PASS tot={:+.4} share={:.2}",
+            inst, tte_s, gap, entry_no, tot, share
+        );
 
         // ── SIGNAL ──
         st.ring.push_back(push);
-        let share = mp / tot;
         Some(TradeSignal {
             strategy: "fair_ride".into(),
             ts_ns: now,
