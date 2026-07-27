@@ -55,7 +55,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import sim_50ms as sim  # noqa: E402  (fit/forward math: one source of truth)
 
 BUCKETS = [(300, 240), (240, 180), (180, 120), (120, 60), (60, 0)]
-SCAN_STRIDE = int(os.environ.get("SCAN_STRIDE", "5"))   # 250ms trigger grid (1 = 50ms)
+SCAN_STRIDE = int(os.environ.get("SCAN_STRIDE", "1"))   # 50ms trigger grid (default since
+# 2026-07-26: closest to the live tick-driven rule — live/sim count ratio ~1.2x vs 1.6x at
+# the old 250ms default of 5; sub-250ms whipsaw crossings are where live diverged)
 FIT_STRIDE = 20   # 1s fit grid
 
 
