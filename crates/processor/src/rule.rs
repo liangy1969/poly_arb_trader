@@ -533,8 +533,8 @@ impl FairRideRule {
                 // sub-cent fair differences.
                 tracing::info!(
                     target: "episode",
-                    "{} RE-ARM tte={:.1} gap={:+.4} margin={:+.4}",
-                    inst, tte_s, gap, cfg.rearm_eps - gap.abs()
+                    "{} RE-ARM tte={:.1} fair={:.4} mid={:.4} gap={:+.4} margin={:+.4}",
+                    inst, tte_s, fair, mid, gap, cfg.rearm_eps - gap.abs()
                 );
             }
             st.ring.push_back(push);
@@ -565,8 +565,8 @@ impl FairRideRule {
             None => {
                 tracing::info!(
                     target: "episode",
-                    "{} DISARM tte={:.1} gap={:+.4} entry#{} gate=NO-LOOKBACK",
-                    inst, tte_s, gap, entry_no
+                    "{} DISARM tte={:.1} fair={:.4} mid={:.4} gap={:+.4} entry#{} gate=NO-LOOKBACK",
+                    inst, tte_s, fair, mid, gap, entry_no
                 );
                 st.ring.push_back(push);
                 return None;
@@ -580,21 +580,25 @@ impl FairRideRule {
         let tot = mp + xp;
         let share = if tot != 0.0 { mp / tot } else { 0.0 };
         // episode transition log: a δ-crossing consumed the armed state (DISARM);
-        // record the ride-gate outcome so a live gate REJECT (which fires no
-        // signal but still disarms) is visible in the log instead of inferred.
+        // record the fair/mid, the 1s-lookback reference (fair_then/mid_then), the
+        // gate decomposition (push = model's fair move toward the trade, pull =
+        // market's mid retreat) and the outcome. A live gate REJECT fires no
+        // signal but still disarms — now fully visible instead of inferred, and
+        // reconcilable line-for-line with the offline replay's gate.
+        let back_ms = (now - ts_then) as f64 / 1e6;
         if !(tot > cfg.open_min && share > cfg.share_min) {
             tracing::info!(
                 target: "episode",
-                "{} DISARM tte={:.1} gap={:+.4} entry#{} gate=REJECT tot={:+.4} share={:.2} (open_min={:.3} share_min={:.2})",
-                inst, tte_s, gap, entry_no, tot, share, cfg.open_min, cfg.share_min
+                "{} DISARM tte={:.1} fair={:.4} mid={:.4} gap={:+.4} entry#{} gate=REJECT fair_then={:.4} mid_then={:.4} back_ms={:.0} push={:+.4} pull={:+.4} tot={:+.4} share={:.2} (open_min={:.3} share_min={:.2})",
+                inst, tte_s, fair, mid, gap, entry_no, fair_then, mid_then, back_ms, mp, xp, tot, share, cfg.open_min, cfg.share_min
             );
             st.ring.push_back(push);
             return None;
         }
         tracing::info!(
             target: "episode",
-            "{} DISARM tte={:.1} gap={:+.4} entry#{} gate=PASS tot={:+.4} share={:.2}",
-            inst, tte_s, gap, entry_no, tot, share
+            "{} DISARM tte={:.1} fair={:.4} mid={:.4} gap={:+.4} entry#{} gate=PASS fair_then={:.4} mid_then={:.4} back_ms={:.0} push={:+.4} pull={:+.4} tot={:+.4} share={:.2}",
+            inst, tte_s, fair, mid, gap, entry_no, fair_then, mid_then, back_ms, mp, xp, tot, share
         );
 
         // ── SIGNAL ──
