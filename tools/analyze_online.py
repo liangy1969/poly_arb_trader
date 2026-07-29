@@ -463,8 +463,10 @@ def generate_trades(sig, m_label, gap, fair, mid_p, tte_p, ybid_p, yask_p, ts_p,
             # changing its mind).
             close_s = close_df = close_dm = mkt_sh = fair_sh = float("nan")
             close_df_fx = float("nan")
+            jj_close = None
             for jj in range(k + 1, len(tte_p)):
                 if abs(gap[jj]) < a.close_eps:
+                    jj_close = jj
                     close_s = float(tte_p[k] - tte_p[jj])
                     close_df = float(fair[jj] - fair[k])
                     close_dm = float(mid_p[jj] - mid_p[k])
@@ -477,6 +479,26 @@ def generate_trades(sig, m_label, gap, fair, mid_p, tte_p, ybid_p, yask_p, ts_p,
                         mkt_sh = close_dm / g0
                         fair_sh = -close_df / g0
                     break
+            # capped variant: measure at min(closure, close_cap) — a FIXED horizon,
+            # so the measurement isn't conditioned on the endogenous closure time,
+            # and never-closed trades are included (measured at the cap).
+            cap_s = cap_df = cap_dm = cap_df_fx = float("nan")
+            if a.close_cap > 0:
+                jc = None
+                for jj in range(k + 1, len(tte_p)):
+                    if tte_p[k] - tte_p[jj] > a.close_cap:
+                        break
+                    jc = jj
+                    if jj_close is not None and jj >= jj_close:
+                        break
+                if jc is not None:
+                    cap_s = float(tte_p[k] - tte_p[jc])
+                    cap_df = float(fair[jc] - fair[k])
+                    cap_dm = float(mid_p[jc] - mid_p[k])
+                    if fx_fair is not None:
+                        f_fx = fx_fair(jc, k)
+                        if not math.isnan(f_fx):
+                            cap_df_fx = float(f_fx - fair[k])
 
             out.append({
                 "model": m_label, "delta": dl, "ticker": t,
@@ -491,6 +513,8 @@ def generate_trades(sig, m_label, gap, fair, mid_p, tte_p, ybid_p, yask_p, ts_p,
                 "is_ride": int(is_ride), "close_s": close_s,
                 "close_dfair": close_df, "close_dmid": close_dm,
                 "close_dfair_fx": close_df_fx,
+                "cap_s": cap_s, "cap_dfair": cap_df, "cap_dmid": cap_dm,
+                "cap_dfair_fx": cap_df_fx,
                 "mkt_share": mkt_sh, "fair_share": fair_sh,
             })
             k += 1
@@ -853,6 +877,23 @@ def report(trades, bce_rows, a, models):
               f"(the refit-absorbed {rf_mv:+.2f}c is the calibrator being pulled to the "
               f"mid at each refit, not the model changing its mind)")
 
+    if a.close_cap > 0:
+        Rc = [t for t in trades if not math.isnan(t.get("cap_s", float("nan")))]
+        if Rc:
+            s = np.array([1.0 if r["side_yes"] else -1.0 for r in Rc])
+            mkc = (100 * s * np.array([r["cap_dmid"] for r in Rc])).mean()
+            frc = (100 * s * np.array([r["cap_dfair"] for r in Rc])).mean()
+            Rf = [r for r in Rc if not math.isnan(r["cap_dfair_fx"])]
+            sf = np.array([1.0 if r["side_yes"] else -1.0 for r in Rf])
+            fxc = (100 * sf * np.array([r["cap_dfair_fx"] for r in Rf])).mean() if Rf else float("nan")
+            rfc = (100 * sf * np.array([r["cap_dfair"] - r["cap_dfair_fx"] for r in Rf])).mean() if Rf else float("nan")
+            g0c = (100 * np.array([r["gap"] for r in Rc])).mean()
+            resid = g0c - (mkc - frc)
+            print(f"\n--- 5c. CAPPED @ {a.close_cap:.0f}s: moves at min(closure, cap); "
+                  f"includes never-closed (n={len(Rc)} of {len(trades)}) ---")
+            print(f"  gap0={g0c:+.2f}c   MARKET {mkc:+.2f}c   FAIR {frc:+.2f}c "
+                  f"(inputs-only {fxc:+.2f}c, refit {rfc:+.2f}c)   residual gap at horizon {resid:+.2f}c")
+
     print(f"\n--- 5b. same two moves, BY ENTRY PRICE BUCKET  (* = live ATM [0.30,0.70]) ---")
     for lo, hi in PRICE_BUCKETS:
         lab = f"{lo:.2f}-{hi:.2f}"
@@ -966,6 +1007,10 @@ def main():
                    help="overreact gate: the gap must have been >= this on the OTHER side 1s ago")
     p.add_argument("--rearm-eps", type=float, default=0.02,
                    help="gap must fall below this to re-arm (one trade/episode)")
+    p.add_argument("--close-cap", type=float, default=0.0, metavar="SECONDS",
+                   help="also measure fair/mid moves at min(closure, cap) — a fixed "
+                        "horizon uncorrelated with the endogenous closure time; "
+                        "includes never-closed trades. 0 = off")
     p.add_argument("--close-eps", type=float, default=0.01,
                    help="closure threshold for analysis 5")
     p.add_argument("--latency-ms", type=float, default=0.0,
