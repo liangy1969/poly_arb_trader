@@ -194,6 +194,13 @@ def fair_series(d, m, strike, rho, b_scale, fwd, tte_max, fit_window, refit_step
     cb_p = d["cbmid"][scan][ss] if cbm is not None else None
     fair = np.full(len(tte_p), np.nan)
     gbar = np.full(len(tte_p), np.nan)
+    # per-row calibration in effect (db, dr) — lets the closure analysis
+    # recompute a FROZEN-params fair and split the fair move into
+    # input-driven vs refit-absorbed (the refit is fit TO the mid, so each
+    # boundary mechanically pulls fair toward the mid; counting that as
+    # "capitulation" overstates the model's retreat).
+    dbs = np.full(len(tte_p), np.nan)
+    drs = np.full(len(tte_p), np.nan)
     init = None
     for B in range(int(tte_max), 0, -int(refit_step)):
         fitm = d["tte"] > B
@@ -222,6 +229,8 @@ def fair_series(d, m, strike, rho, b_scale, fwd, tte_max, fit_window, refit_step
                     cbm,
                 )
                 fair[seg] = torch.sigmoid(lo).numpy()
+                dbs[seg] = float(db)
+                drs[seg] = float(dr)
             if demean_window > 0:
                 # baseline gap: recompute (fair-mid) on a low-freq (1s) grid over
                 # the past-window + segment tte range using the CURRENT (db,dr),
@@ -266,7 +275,8 @@ def fair_series(d, m, strike, rho, b_scale, fwd, tte_max, fit_window, refit_step
         fill_ybid, fill_yask = ybid_p, yask_p
     ok = ~np.isnan(fair)
     return (ts_p[ok], tte_p[ok], ybid_p[ok], yask_p[ok], fair[ok], gbar[ok],
-            fill_ybid[ok], fill_yask[ok])
+            fill_ybid[ok], fill_yask[ok], dbs[ok], drs[ok],
+            spot_p[ok], x_p[ok], cb_p[ok] if cbm is not None else None)
 
 
 # ── trade generation ─────────────────────────────────────────────────────────
@@ -366,7 +376,7 @@ def event_calib_report(a, models):
 
 
 def generate_trades(sig, m_label, gap, fair, mid_p, tte_p, ybid_p, yask_p, ts_p, outc, t, a,
-                    fill_ybid, fill_yask):
+                    fill_ybid, fill_yask, fx_fair=None):
     """Arm/gate/entry episode loop for ONE entry signal on ONE event -> trade
     dicts labeled `m_label`. `sig` (raw gap or demeaned gap) drives the threshold,
     direction and re-arm; the ride gate and closure use the RAW fair/mid/gap."""
@@ -446,12 +456,22 @@ def generate_trades(sig, m_label, gap, fair, mid_p, tte_p, ybid_p, yask_p, ts_p,
             won = int(outc == 1 if side_yes else outc == 0)
 
             # closure: first raw |fair-mid| < eps after entry, and who traveled.
+            # close_df_fx = the fair move with the ENTRY calibration frozen
+            # (inputs-only); close_df - close_df_fx = the refit-absorbed part
+            # (each refit is fit to the mid, mechanically closing the gap from
+            # the fair side — that is calibration absorption, not the model
+            # changing its mind).
             close_s = close_df = close_dm = mkt_sh = fair_sh = float("nan")
+            close_df_fx = float("nan")
             for jj in range(k + 1, len(tte_p)):
                 if abs(gap[jj]) < a.close_eps:
                     close_s = float(tte_p[k] - tte_p[jj])
                     close_df = float(fair[jj] - fair[k])
                     close_dm = float(mid_p[jj] - mid_p[k])
+                    if fx_fair is not None:
+                        f_fx = fx_fair(jj, k)
+                        if not math.isnan(f_fx):
+                            close_df_fx = float(f_fx - fair[k])
                     g0 = gap[k]
                     if abs(g0) > 1e-9:
                         mkt_sh = close_dm / g0
@@ -470,6 +490,7 @@ def generate_trades(sig, m_label, gap, fair, mid_p, tte_p, ybid_p, yask_p, ts_p,
                 "dfair1s": dfair1, "dmid1s": dmid1, "ride_share": share,
                 "is_ride": int(is_ride), "close_s": close_s,
                 "close_dfair": close_df, "close_dmid": close_dm,
+                "close_dfair_fx": close_df_fx,
                 "mkt_share": mkt_sh, "fair_share": fair_sh,
             })
             k += 1
@@ -493,13 +514,34 @@ def simulate(m, ev, meta, a):
             continue  # need calibration history + trade-window coverage
         outc = 1 if mm["result"] == "yes" else 0
         strike = float(mm["strike"])
-        ts_p, tte_p, ybid_p, yask_p, fair, gbar, fill_ybid, fill_yask = fair_series(
+        (ts_p, tte_p, ybid_p, yask_p, fair, gbar, fill_ybid, fill_yask,
+         dbs_p, drs_p, spot_p, x_p, cb_p) = fair_series(
             d, m, strike, rho, b_scale, fwd, a.tte_max, a.fit_window, a.refit_step,
             a.demean_window, a.latency_ms)
         if len(tte_p) < 50:
             continue
         mid_p = (ybid_p + yask_p) / 2.0
         gap = fair - mid_p
+        cbm = m["cb_mult"]
+        rho_f = float(rho)
+
+        def fx_fair(jj, kk):
+            """fair at row jj recomputed under row kk's (db, dr) — the
+            frozen-calibration fair used to strip refit jumps from closure."""
+            if math.isnan(dbs_p[kk]):
+                return float("nan")
+            with torch.no_grad():
+                lo = sim.logit_of(
+                    fwd,
+                    torch.tensor(spot_p[jj:jj + 1], dtype=torch.float32),
+                    torch.tensor(tte_p[jj:jj + 1], dtype=torch.float32),
+                    strike + b_scale * float(dbs_p[kk]),
+                    math.exp(rho_f + float(drs_p[kk])),
+                    torch.tensor(x_p[jj:jj + 1], dtype=torch.float32),
+                    torch.tensor(cb_p[jj:jj + 1], dtype=torch.float32) if cb_p is not None else None,
+                    cbm,
+                )
+                return float(torch.sigmoid(lo)[0])
 
         # gap distribution by moneyness (offline analogue of the live `gapstats`
         # log): every fair-model row in the entry window, bucketed by mid level.
@@ -579,7 +621,7 @@ def simulate(m, ev, meta, a):
         for suffix, sig in strats:
             trades += generate_trades(sig, m["label"] + suffix, gap, fair, mid_p,
                                       tte_p, ybid_p, yask_p, ts_p, outc, t, a,
-                                      fill_ybid, fill_yask)
+                                      fill_ybid, fill_yask, fx_fair=fx_fair)
     return trades, bce_rows
 
 
@@ -779,6 +821,17 @@ def report(trades, bce_rows, a, models):
         g0 = 100 * np.array([r["gap"] for r in R])
         return mk.mean(), fr.mean(), g0.mean()
 
+    def fair_split(R):
+        """Split the mean fair move into (inputs-only, refit-absorbed) cents,
+        over the subset with a frozen-params recompute available."""
+        Rf = [r for r in R if not math.isnan(r.get("close_dfair_fx", float("nan")))]
+        if not Rf:
+            return float("nan"), float("nan"), 0
+        s = np.array([1.0 if r["side_yes"] else -1.0 for r in Rf])
+        fx = 100 * s * np.array([r["close_dfair_fx"] for r in Rf])
+        rf = 100 * s * np.array([r["close_dfair"] - r["close_dfair_fx"] for r in Rf])
+        return fx.mean(), rf.mean(), len(Rf)
+
     print(f"\n{'=' * 100}\n### 5. CLOSURE: who moved, entry -> first |fair-mid| < "
           f"{100 * a.close_eps:.0f}c\n{'=' * 100}")
     mk, fr, g0 = moves(C_all)
@@ -788,9 +841,17 @@ def report(trades, bce_rows, a, models):
     print()
     print(f"  mean MARKET move  : {mk:+6.2f}c   (toward the trade)")
     print(f"  mean FAIR   move  : {fr:+6.2f}c   (away from the trade)")
+    fx_mv, rf_mv, n_fx = fair_split(C_all)
+    if n_fx:
+        print(f"      of which  inputs-only (frozen calib): {fx_mv:+6.2f}c"
+              f"   refit-absorbed: {rf_mv:+6.2f}c   (n={n_fx})")
     print()
     print(f"  -> the market did {100 * mk / (abs(mk) + abs(fr) + 1e-9):.0f}% of the closing, "
           f"the model capitulated the rest.  (identity: mkt - fair = gap)")
+    if n_fx:
+        print(f"  -> refit-excluded: market {mk:+.2f}c vs model-opinion {fx_mv:+.2f}c "
+              f"(the refit-absorbed {rf_mv:+.2f}c is the calibrator being pulled to the "
+              f"mid at each refit, not the model changing its mind)")
 
     print(f"\n--- 5b. same two moves, BY ENTRY PRICE BUCKET  (* = live ATM [0.30,0.70]) ---")
     for lo, hi in PRICE_BUCKETS:
@@ -820,7 +881,8 @@ def report(trades, bce_rows, a, models):
     for tag, T in panels(trades, a.fresh_from):
         print(f"\n{tag}")
         print(f"{'model':12s} {'delta':>6s} {'n':>5s} {'closed%':>8s} {'med_s':>6s} "
-              f"{'gap0':>6s} {'mkt_mv':>7s} {'fair_mv':>8s} | {'net|WON':>9s} {'net|LOST':>9s}")
+              f"{'gap0':>6s} {'mkt_mv':>7s} {'fair_mv':>8s} {'fx_mv':>7s} {'refit':>7s} "
+              f"| {'net|WON':>9s} {'net|LOST':>9s}")
         for lb in labels:
             for dl in a.deltas:
                 R = [t for t in T if t["model"] == lb and t["delta"] == dl]
@@ -828,12 +890,13 @@ def report(trades, bce_rows, a, models):
                 if not R or not C:
                     continue
                 mk, fr, g0 = moves(C)
+                fx_mv, rf_mv, _ = fair_split(C)
                 w = [r["net"] for r in C if r["won"]]
                 l = [r["net"] for r in C if not r["won"]]
                 print(f"{lb:12s} {dl:>6.3f} {len(R):>5d} "
                       f"{100 * len(C) / len(R):>7.0f}% "
                       f"{np.median([r['close_s'] for r in C]):>6.1f} {g0:>6.2f} "
-                      f"{mk:>+7.2f} {fr:>+8.2f} | "
+                      f"{mk:>+7.2f} {fr:>+8.2f} {fx_mv:>+7.2f} {rf_mv:>+7.2f} | "
                       f"{100 * np.mean(w) if w else float('nan'):>+8.1f}c "
                       f"{100 * np.mean(l) if l else float('nan'):>+8.1f}c")
     print("\n(a real convergence edge would show market >> |fair|: the market comes to a")
