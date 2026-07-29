@@ -288,6 +288,15 @@ pub struct FairRideCfg {
     pub ref_max_age_ms: i64,
     pub hold_ms: u64,
     pub ttl_ms: u64,
+    /// Demeaned trigger (0 = off = raw gap, unchanged behavior): entry fires on
+    /// gap MINUS its trailing mean over this window (s) — deviations from the
+    /// standing bias, not the bias itself (the sim's --demean-window). The
+    /// baseline is a ~1s-grain (ts, gap) ring kept per event; it is PREFILLED
+    /// (recomputed from the raw sample ring under the NEW params) on every
+    /// calib update, so the per-tick cost is one append + O(1) running mean —
+    /// no per-tick surface recomputes, and the baseline is calibration-clean
+    /// (a refit shifts gap and baseline in lockstep, like the sim's gbar).
+    pub demean_window_s: f64,
 }
 
 impl Default for FairRideCfg {
@@ -312,6 +321,7 @@ impl Default for FairRideCfg {
             ref_max_age_ms: 5000,
             hold_ms: 0,
             ttl_ms: 500,
+            demean_window_s: 0.0,
         }
     }
 }
@@ -328,11 +338,26 @@ struct RideState {
     armed: bool,
     /// last `fairlog` sample time for this event (online-vs-offline check).
     fairlog_ns: i64,
+    /// demeaned-trigger baseline: (ts_ns, gap) at ~1s grain under the CURRENT
+    /// params (prefilled from `ring` on every calib update); `base_sum` keeps
+    /// the running sum so the mean is O(1) per eval.
+    base_hist: VecDeque<(i64, f64)>,
+    base_sum: f64,
+    base_last_ns: i64,
 }
 
 impl RideState {
     fn new() -> Self {
-        RideState { calib: None, ring: VecDeque::new(), entries: 0, armed: true, fairlog_ns: 0 }
+        RideState {
+            calib: None,
+            ring: VecDeque::new(),
+            entries: 0,
+            armed: true,
+            fairlog_ns: 0,
+            base_hist: VecDeque::new(),
+            base_sum: 0.0,
+            base_last_ns: 0,
+        }
     }
 }
 
@@ -473,8 +498,11 @@ impl FairRideRule {
         };
 
         let st = self.evs.entry(inst.to_string()).or_insert_with(RideState::new);
-        // ring upkeep (always, so history exists before the first calib)
-        while st.ring.front().map_or(false, |&(ts, _, _, _, _)| now - ts > cfg.lookback_max_ms * 1_200_000) {
+        // ring upkeep (always, so history exists before the first calib). With
+        // the demeaned trigger the raw ring must also span the demean window
+        // (the calib-update prefill recomputes the baseline from it).
+        let keep_ms = cfg.lookback_max_ms.max((cfg.demean_window_s * 1000.0) as i64);
+        while st.ring.front().map_or(false, |&(ts, _, _, _, _)| now - ts > keep_ms * 1_200_000) {
             st.ring.pop_front();
         }
         let push = (now, ref_mid, px2_now, mid, feats_now);
@@ -523,9 +551,35 @@ impl FairRideRule {
             self.gap_flush_ns = now;
         }
 
-        // hysteresis / cap
+        // demeaned trigger: `sig` = gap − trailing mean (raw gap when off).
+        // Baseline upkeep is O(1): evict beyond the window, append at ~1s
+        // grain; the heavy recompute happens only at calib updates (prefill).
+        let mut sig = gap;
+        if cfg.demean_window_s > 0.0 {
+            let win_ns = (cfg.demean_window_s * 1e9) as i64;
+            while st.base_hist.front().map_or(false, |&(ts, _)| now - ts > win_ns) {
+                if let Some((_, g0)) = st.base_hist.pop_front() {
+                    st.base_sum -= g0;
+                }
+            }
+            if now - st.base_last_ns >= 1_000_000_000 {
+                st.base_hist.push_back((now, gap));
+                st.base_sum += gap;
+                st.base_last_ns = now;
+            }
+            if st.base_hist.len() < 5 {
+                // baseline not established (event start / post-restart) —
+                // mirror the sim's NaN semantics: no trigger activity at all.
+                st.ring.push_back(push);
+                return None;
+            }
+            sig = gap - st.base_sum / st.base_hist.len() as f64;
+        }
+
+        // hysteresis / cap (on the TRIGGER signal `sig`; raw gap still drives
+        // gapstats/fairlog above and the ride gate below)
         if !st.armed {
-            if gap.abs() <= cfg.rearm_eps {
+            if sig.abs() <= cfg.rearm_eps {
                 st.armed = true;
                 // episode transition log (target "episode"): re-arm, with how much
                 // slack there was to the threshold — a small margin means the arm
@@ -534,13 +588,13 @@ impl FairRideRule {
                 tracing::info!(
                     target: "episode",
                     "{} RE-ARM tte={:.1} fair={:.4} mid={:.4} gap={:+.4} margin={:+.4}",
-                    inst, tte_s, fair, mid, gap, cfg.rearm_eps - gap.abs()
+                    inst, tte_s, fair, mid, sig, cfg.rearm_eps - sig.abs()
                 );
             }
             st.ring.push_back(push);
             return None;
         }
-        if st.entries >= cfg.max_entries_per_event || gap.abs() < cfg.delta {
+        if st.entries >= cfg.max_entries_per_event || sig.abs() < cfg.delta {
             st.ring.push_back(push);
             return None;
         }
@@ -566,7 +620,7 @@ impl FairRideRule {
                 tracing::info!(
                     target: "episode",
                     "{} DISARM tte={:.1} fair={:.4} mid={:.4} gap={:+.4} entry#{} gate=NO-LOOKBACK",
-                    inst, tte_s, fair, mid, gap, entry_no
+                    inst, tte_s, fair, mid, sig, entry_no
                 );
                 st.ring.push_back(push);
                 return None;
@@ -574,7 +628,7 @@ impl FairRideRule {
         };
         let tte_then = (expiry - ts_then) as f64 / 1e9;
         let fair_then = self.surface.fair(px_then, px2_then, tte_then, strike, d_b, d_rho, &feats_then);
-        let side = if gap > 0.0 { 1.0 } else { -1.0 };
+        let side = if sig > 0.0 { 1.0 } else { -1.0 };
         let mp = side * (fair - fair_then);
         let xp = -side * (mid - mid_then);
         let tot = mp + xp;
@@ -590,7 +644,7 @@ impl FairRideRule {
             tracing::info!(
                 target: "episode",
                 "{} DISARM tte={:.1} fair={:.4} mid={:.4} gap={:+.4} entry#{} gate=REJECT fair_then={:.4} mid_then={:.4} back_ms={:.0} push={:+.4} pull={:+.4} tot={:+.4} share={:.2} (open_min={:.3} share_min={:.2})",
-                inst, tte_s, fair, mid, gap, entry_no, fair_then, mid_then, back_ms, mp, xp, tot, share, cfg.open_min, cfg.share_min
+                inst, tte_s, fair, mid, sig, entry_no, fair_then, mid_then, back_ms, mp, xp, tot, share, cfg.open_min, cfg.share_min
             );
             st.ring.push_back(push);
             return None;
@@ -598,7 +652,7 @@ impl FairRideRule {
         tracing::info!(
             target: "episode",
             "{} DISARM tte={:.1} fair={:.4} mid={:.4} gap={:+.4} entry#{} gate=PASS fair_then={:.4} mid_then={:.4} back_ms={:.0} push={:+.4} pull={:+.4} tot={:+.4} share={:.2}",
-            inst, tte_s, fair, mid, gap, entry_no, fair_then, mid_then, back_ms, mp, xp, tot, share
+            inst, tte_s, fair, mid, sig, entry_no, fair_then, mid_then, back_ms, mp, xp, tot, share
         );
 
         // ── SIGNAL ──
@@ -607,15 +661,15 @@ impl FairRideRule {
             strategy: "fair_ride".into(),
             ts_ns: now,
             reason: format!(
-                "gap={gap:+.4} share={share:.2} fair={fair:.4} mid={mid:.4} tte={tte_s:.1}s px={ref_mid:.2} entry#{entry_no}"
+                "gap={sig:+.4} share={share:.2} fair={fair:.4} mid={mid:.4} tte={tte_s:.1}s px={ref_mid:.2} entry#{entry_no}"
             ),
             reference: cfg.reference.clone(),
             target: inst.to_string(),
-            direction: if gap > 0.0 { 1 } else { -1 },
+            direction: if sig > 0.0 { 1 } else { -1 },
             trigger: Trigger {
                 move_bps: mp * 100.0,          // model push, in cents
                 window_ms: cfg.lookback_min_ms as u64,
-                yes_price: if gap > 0.0 { yask } else { 1.0 - ybid },
+                yes_price: if sig > 0.0 { yask } else { 1.0 - ybid },
                 target_move_c: (mid - mid_then) * 100.0,
             },
             hold_ms: cfg.hold_ms,
@@ -632,7 +686,36 @@ impl Rule for FairRideRule {
     fn on_event(&mut self, ev: &Event, state: &MarketState) -> Vec<TradeSignal> {
         match &ev.payload {
             Payload::Calib(c) if c.reference == self.cfg.reference => {
-                self.evs.entry(c.instrument.clone()).or_insert_with(RideState::new).calib = Some(c.clone());
+                let st = self.evs.entry(c.instrument.clone()).or_insert_with(RideState::new);
+                st.calib = Some(c.clone());
+                // demeaned trigger: PREFILL the baseline under the NEW params —
+                // recompute (fair - mid) from the raw sample ring at ~1s grain
+                // so the trailing mean is calibration-clean (the refit shifts
+                // gap and baseline in lockstep; the sim's gbar semantics) and
+                // the per-tick eval never recomputes history. ~window_s
+                // surface forwards once per refit — microseconds.
+                if self.cfg.demean_window_s > 0.0 {
+                    st.base_hist.clear();
+                    st.base_sum = 0.0;
+                    st.base_last_ns = 0;
+                    if let Some(t) = state.get(&c.instrument) {
+                        if let (Some(strike), Some(expiry)) = (t.strike, t.expiry_ts_ns) {
+                            for &(ts, px, px2, mid, feats) in st.ring.iter() {
+                                if ts - st.base_last_ns < 1_000_000_000 {
+                                    continue;
+                                }
+                                let tte = (expiry - ts) as f64 / 1e9;
+                                if tte <= 0.0 {
+                                    continue;
+                                }
+                                let f = self.surface.fair(px, px2, tte, strike, c.d_b, c.d_rho, &feats);
+                                st.base_hist.push_back((ts, f - mid));
+                                st.base_sum += f - mid;
+                                st.base_last_ns = ts;
+                            }
+                        }
+                    }
+                }
                 Vec::new()
             }
             Payload::Book(b) if b.instrument == self.cfg.reference => {
