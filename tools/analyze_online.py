@@ -403,12 +403,21 @@ def generate_trades(sig, m_label, gap, fair, mid_p, tte_p, ybid_p, yask_p, ts_p,
             side_yes = sig[k] > 0
             s = 1.0 if side_yes else -1.0
 
-            # 1s-lookback RIDE gate (on the raw fair/mid dynamics).
+            # 1s-lookback RIDE gate — LIVE SEMANTICS (rule.rs): the lookback
+            # reference is the youngest sample >= lookback_min (1s) old, up to
+            # lookback_max (10s); fair_then is RECOMPUTED from the lookback
+            # row's raw inputs under the CURRENT calibration (refit-jump
+            # immune), not read from the stored causal series. Before this,
+            # a refit landing inside the lookback injected a fair jump into
+            # the push term and flipped near-threshold gate decisions vs live.
             j = k - 1
-            while j > 0 and (tte_p[j] - tte_p[k]) < 1.0 and (k - j) < 40:
+            while j > 0 and (tte_p[j] - tte_p[k]) < 1.0 and (k - j) < 400:
                 j -= 1
             if j >= 0 and 1.0 <= (tte_p[j] - tte_p[k]) <= 10.0:
-                dfair1, dmid1 = fair[k] - fair[j], mid_p[k] - mid_p[j]
+                fair_then = fx_fair(j, k) if fx_fair is not None else float("nan")
+                if math.isnan(fair_then):
+                    fair_then = fair[j]
+                dfair1, dmid1 = fair[k] - fair_then, mid_p[k] - mid_p[j]
             else:
                 dfair1 = dmid1 = float("nan")
             push, pull = s * dfair1, -s * dmid1
