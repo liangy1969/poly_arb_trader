@@ -413,66 +413,108 @@ def generate_trades(sig, m_label, gap, fair, mid_p, tte_p, ybid_p, yask_p, ts_p,
                     fill_ybid, fill_yask, fx_fair=None):
     """Arm/gate/entry episode loop for ONE entry signal on ONE event -> trade
     dicts labeled `m_label`. `sig` (raw gap or demeaned gap) drives the threshold,
-    direction and re-arm; the ride gate and closure use the RAW fair/mid/gap."""
+    direction and re-arm; the ride gate and closure use the RAW fair/mid/gap.
+
+    --trigger move: a DIFFERENT trigger — fire when the 1s FAIR move
+    |dfair_1s| >= delta AND |dfair_1s| >= move_k * |dmid_1s| (the fair moved,
+    the market hasn't followed), direction = sign(dfair_1s). No level-gap
+    requirement, no ride gate (the dominance test IS the gate). Episode:
+    disarm on fire, re-arm when |dfair_1s| <= delta * move_rearm."""
     out = []
+    dfair_arr = dmid_arr = None
+    if a.trigger == "move":
+        # vectorized 1s-lookback moves: youngest j with tte_j >= tte_k + 1s
+        # (<= +10s). NOTE: uses the stored causal fair at both endpoints — a
+        # refit inside the lookback (~7% of rows at 15s cadence) leaks a
+        # param jump into dfair, same caveat as the pre-43bea62 ride gate.
+        idx = np.searchsorted(-tte_p, -(tte_p + 1.0), side="right") - 1
+        okl = (idx >= 0) & ((tte_p[np.clip(idx, 0, None)] - tte_p) <= 10.0)
+        dfair_arr = np.full(len(tte_p), np.nan)
+        dmid_arr = np.full(len(tte_p), np.nan)
+        ii = np.clip(idx, 0, None)
+        dfair_arr[okl] = (fair - fair[ii])[okl]
+        dmid_arr[okl] = (mid_p - mid_p[ii])[okl]
     for dl in a.deltas:
         armed, run, k, n_ent = True, 0, 0, 0
         while k < len(sig):
-            ag = abs(sig[k])
-            if not armed:
-                if ag <= a.rearm_eps:
-                    armed, run = True, 0
-                k += 1
-                continue
-            run = run + 1 if ag >= dl else 0
-            if run < 1:
-                k += 1
-                continue
-            if tte_p[k] <= a.tte_min:
-                break            # entry window closed
-            if a.cap and n_ent >= a.cap:
-                break            # per-event exposure cap
-            n_ent += 1
-            run, armed = 0, False
-            side_yes = sig[k] > 0
-            s = 1.0 if side_yes else -1.0
-
-            # 1s-lookback RIDE gate — LIVE SEMANTICS (rule.rs): the lookback
-            # reference is the youngest sample >= lookback_min (1s) old, up to
-            # lookback_max (10s); fair_then is RECOMPUTED from the lookback
-            # row's raw inputs under the CURRENT calibration (refit-jump
-            # immune), not read from the stored causal series. Before this,
-            # a refit landing inside the lookback injected a fair jump into
-            # the push term and flipped near-threshold gate decisions vs live.
-            j = k - 1
-            while j > 0 and (tte_p[j] - tte_p[k]) < 1.0 and (k - j) < 400:
-                j -= 1
-            if j >= 0 and 1.0 <= (tte_p[j] - tte_p[k]) <= 10.0:
-                fair_then = fx_fair(j, k) if fx_fair is not None else float("nan")
-                if math.isnan(fair_then):
-                    fair_then = fair[j]
-                dfair1, dmid1 = fair[k] - fair_then, mid_p[k] - mid_p[j]
-            else:
-                dfair1 = dmid1 = float("nan")
-            push, pull = s * dfair1, -s * dmid1
-            tot = push + pull
-            share = push / tot if tot and not math.isnan(tot) else float("nan")
-            is_ride = bool(tot > a.ride_open and share > a.ride_share)
-            if a.gate == "ride" and not is_ride:
-                k += 1
-                continue
-            if a.gate == "fade" and is_ride:
-                k += 1
-                continue
-            if a.gate == "overreact":
-                gap_then = gap[k] - dfair1 + dmid1  # = fair[j] - mid[j]
-                ok = (not math.isnan(dfair1)
-                      and dfair1 * dmid1 > 0
-                      and abs(dmid1) >= a.overreact_k * abs(dfair1)
-                      and s * gap_then <= -a.overreact_flip)
-                if not ok:
+            if a.trigger == "move":
+                mv, dm = dfair_arr[k], dmid_arr[k]
+                ag = 0.0 if math.isnan(mv) else abs(mv)
+                if not armed:
+                    if ag <= dl * a.move_rearm:
+                        armed, run = True, 0
                     k += 1
                     continue
+                if not (ag >= dl and not math.isnan(dm) and ag >= a.move_k * abs(dm)):
+                    k += 1
+                    continue
+                if tte_p[k] <= a.tte_min:
+                    break
+                if a.cap and n_ent >= a.cap:
+                    break
+                n_ent += 1
+                armed = False
+                side_yes = mv > 0
+                s = 1.0 if side_yes else -1.0
+                dfair1, dmid1 = mv, dm
+                push, pull = s * dfair1, -s * dmid1
+                tot = push + pull
+                share = push / tot if tot and not math.isnan(tot) else float("nan")
+                is_ride = True
+            else:
+                ag = abs(sig[k])
+                if not armed:
+                    if ag <= a.rearm_eps:
+                        armed, run = True, 0
+                    k += 1
+                    continue
+                run = run + 1 if ag >= dl else 0
+                if run < 1:
+                    k += 1
+                    continue
+                if tte_p[k] <= a.tte_min:
+                    break            # entry window closed
+                if a.cap and n_ent >= a.cap:
+                    break            # per-event exposure cap
+                n_ent += 1
+                run, armed = 0, False
+                side_yes = sig[k] > 0
+                s = 1.0 if side_yes else -1.0
+
+                # 1s-lookback RIDE gate — LIVE SEMANTICS (rule.rs): the lookback
+                # reference is the youngest sample >= lookback_min (1s) old, up
+                # to lookback_max (10s); fair_then is RECOMPUTED from the
+                # lookback row's raw inputs under the CURRENT calibration
+                # (refit-jump immune), not read from the stored causal series.
+                j = k - 1
+                while j > 0 and (tte_p[j] - tte_p[k]) < 1.0 and (k - j) < 400:
+                    j -= 1
+                if j >= 0 and 1.0 <= (tte_p[j] - tte_p[k]) <= 10.0:
+                    fair_then = fx_fair(j, k) if fx_fair is not None else float("nan")
+                    if math.isnan(fair_then):
+                        fair_then = fair[j]
+                    dfair1, dmid1 = fair[k] - fair_then, mid_p[k] - mid_p[j]
+                else:
+                    dfair1 = dmid1 = float("nan")
+                push, pull = s * dfair1, -s * dmid1
+                tot = push + pull
+                share = push / tot if tot and not math.isnan(tot) else float("nan")
+                is_ride = bool(tot > a.ride_open and share > a.ride_share)
+                if a.gate == "ride" and not is_ride:
+                    k += 1
+                    continue
+                if a.gate == "fade" and is_ride:
+                    k += 1
+                    continue
+                if a.gate == "overreact":
+                    gap_then = gap[k] - dfair1 + dmid1  # = fair[j] - mid[j]
+                    ok = (not math.isnan(dfair1)
+                          and dfair1 * dmid1 > 0
+                          and abs(dmid1) >= a.overreact_k * abs(dfair1)
+                          and s * gap_then <= -a.overreact_flip)
+                    if not ok:
+                        k += 1
+                        continue
 
             # fill price: signal-instant ask, or (with latency) the post-latency
             # ask — but MISS if it ran more than the chase budget above the
@@ -1053,6 +1095,16 @@ def main():
                    help="overreact gate: the gap must have been >= this on the OTHER side 1s ago")
     p.add_argument("--rearm-eps", type=float, default=0.02,
                    help="gap must fall below this to re-arm (one trade/episode)")
+    p.add_argument("--trigger", choices=("gap", "move"), default="gap",
+                   help="gap = level trigger |fair-mid| >= delta (default). "
+                        "move = 1s-DYNAMICS trigger: fire when |dfair_1s| >= delta "
+                        "AND |dfair_1s| >= move-k * |dmid_1s| (fair moved, market "
+                        "hasn't followed), direction = sign(dfair_1s); no level-gap "
+                        "requirement, --gate ignored")
+    p.add_argument("--move-k", type=float, default=2.0,
+                   help="move trigger: fair-vs-mid 1s move dominance ratio")
+    p.add_argument("--move-rearm", type=float, default=0.5,
+                   help="move trigger: re-arm when |dfair_1s| <= delta * this")
     p.add_argument("--calib-from-live", default="", metavar="PATH",
                    help="consistency mode: read the LIVE calibrator's fit: records "
                         "(trader-events.log extract) and use its (db,dr) per boundary "
