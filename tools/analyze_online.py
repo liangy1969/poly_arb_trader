@@ -178,7 +178,28 @@ def prepare(ev, m):
     return out
 
 
-def fair_series(d, m, strike, rho, b_scale, fwd, tte_max, fit_window, refit_step=60, demean_window=0.0, latency_ms=0.0):
+def load_live_calib(path):
+    """Parse the live calibrator's `fit:` records (trader-events.log extract)
+    -> {ticker: sorted [(tte_boundary_s, db, dr)]}. Used by --calib-from-live
+    to run the sim on the LIVE calibration instead of refitting offline —
+    for consistency evaluation, this removes fit-protocol divergence (the
+    fairlog replay shows fair agreement ~4e-5 with logged params vs ~1e-3
+    with offline refits)."""
+    import re as _re
+    pat = _re.compile(r"fit: calib kalshi\.(KXBTC15M-\S+?)\.YES tte=(\d+)s rows=\d+ "
+                      r"db=([+-][\d.]+) dr=([+-][\d.]+)")
+    out = {}
+    for ln in open(path, errors="ignore"):
+        mm = pat.search(ln)
+        if mm:
+            out.setdefault(mm.group(1), []).append(
+                (float(mm.group(2)), float(mm.group(3)), float(mm.group(4))))
+    for k in out:
+        out[k].sort(key=lambda x: -x[0])
+    return out
+
+
+def fair_series(d, m, strike, rho, b_scale, fwd, tte_max, fit_window, refit_step=60, demean_window=0.0, latency_ms=0.0, live_cal=None):
     """Windowed refit at each `refit_step`-second boundary; returns the causal
     fair series on the scan grid (the live Calibrator's semantics). If
     `demean_window>0`, also returns `gbar` = the trailing mean of (fair-mid) over
@@ -203,19 +224,32 @@ def fair_series(d, m, strike, rho, b_scale, fwd, tte_max, fit_window, refit_step
     drs = np.full(len(tte_p), np.nan)
     init = None
     for B in range(int(tte_max), 0, -int(refit_step)):
-        fitm = d["tte"] > B
-        if fit_window > 0:
-            fitm &= d["tte"] <= B + fit_window
-        if fitm[fit_sl].sum() < (30 if fit_window > 0 else 60):
-            continue
-        mid_f = ((d["ybid"] + d["yask"]) / 2.0)[fitm][fit_sl]
-        db, dr = sim.fit_event(
-            fwd, d["spot"][fitm][fit_sl], d["tte"][fitm][fit_sl], mid_f, strike,
-            rho, b_scale, steps=sim.FIT_STEPS if init is None else 60, init=init,
-            extra=d["X"][fitm][fit_sl],
-            cb=d["cbmid"][fitm][fit_sl] if cbm is not None else None, cb_mult=cbm,
-        )
-        init = (float(db), float(dr))
+        if live_cal is not None:
+            # consistency mode: take the LIVE calibrator's logged fit at this
+            # boundary (nearest within half a step); no fit here -> live had
+            # none either (warmup/grace) -> carry the previous params, or skip
+            # the segment entirely if live never calibrated yet.
+            cand = [c for c in live_cal if abs(c[0] - B) <= refit_step / 2.0]
+            if cand:
+                nearest = min(cand, key=lambda c: abs(c[0] - B))
+                init = (nearest[1], nearest[2])
+            if init is None:
+                continue
+            db, dr = init
+        else:
+            fitm = d["tte"] > B
+            if fit_window > 0:
+                fitm &= d["tte"] <= B + fit_window
+            if fitm[fit_sl].sum() < (30 if fit_window > 0 else 60):
+                continue
+            mid_f = ((d["ybid"] + d["yask"]) / 2.0)[fitm][fit_sl]
+            db, dr = sim.fit_event(
+                fwd, d["spot"][fitm][fit_sl], d["tte"][fitm][fit_sl], mid_f, strike,
+                rho, b_scale, steps=sim.FIT_STEPS if init is None else 60, init=init,
+                extra=d["X"][fitm][fit_sl],
+                cb=d["cbmid"][fitm][fit_sl] if cbm is not None else None, cb_mult=cbm,
+            )
+            init = (float(db), float(dr))
         seg = (tte_p <= B) & (tte_p > B - int(refit_step))
         if seg.any():
             with torch.no_grad():
@@ -547,10 +581,13 @@ def simulate(m, ev, meta, a):
             continue  # need calibration history + trade-window coverage
         outc = 1 if mm["result"] == "yes" else 0
         strike = float(mm["strike"])
+        lc = a.live_calib.get(t) if getattr(a, "live_calib", None) else None
+        if getattr(a, "live_calib", None) and lc is None:
+            continue  # consistency mode: live never calibrated this event
         (ts_p, tte_p, ybid_p, yask_p, fair, gbar, fill_ybid, fill_yask,
          dbs_p, drs_p, spot_p, x_p, cb_p) = fair_series(
             d, m, strike, rho, b_scale, fwd, a.tte_max, a.fit_window, a.refit_step,
-            a.demean_window, a.latency_ms)
+            a.demean_window, a.latency_ms, live_cal=lc)
         if len(tte_p) < 50:
             continue
         mid_p = (ybid_p + yask_p) / 2.0
@@ -1016,6 +1053,11 @@ def main():
                    help="overreact gate: the gap must have been >= this on the OTHER side 1s ago")
     p.add_argument("--rearm-eps", type=float, default=0.02,
                    help="gap must fall below this to re-arm (one trade/episode)")
+    p.add_argument("--calib-from-live", default="", metavar="PATH",
+                   help="consistency mode: read the LIVE calibrator's fit: records "
+                        "(trader-events.log extract) and use its (db,dr) per boundary "
+                        "instead of refitting offline; events live never calibrated "
+                        "are skipped")
     p.add_argument("--close-cap", type=float, default=0.0, metavar="SECONDS",
                    help="also measure fair/mid moves at min(closure, cap) — a fixed "
                         "horizon uncorrelated with the endogenous closure time; "
@@ -1048,6 +1090,12 @@ def main():
                    help="also write the causal fair series (ticker,ts_ms,tte_s,"
                         "fair,mid) here — for replay-parity checks")
     a = p.parse_args()
+
+    a.live_calib = None
+    if a.calib_from_live:
+        a.live_calib = load_live_calib(a.calib_from_live)
+        print(f"live-calib mode: {len(a.live_calib)} events with logged fits "
+              f"from {a.calib_from_live}")
 
     a.fair_rows = []
     a.gap_dist = {}
