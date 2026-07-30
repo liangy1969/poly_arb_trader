@@ -55,6 +55,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import sim_50ms as sim  # noqa: E402  (fit/forward math: one source of truth)
 
 BUCKETS = [(300, 240), (240, 180), (180, 120), (120, 60), (60, 0)]
+# extended pre-window buckets, prepended in main() when --tte MAX > 300
+BUCKETS_EARLY = [(900, 600), (600, 450), (450, 300)]
 SCAN_STRIDE = int(os.environ.get("SCAN_STRIDE", "1"))   # 50ms trigger grid (default since
 # 2026-07-26: closest to the live tick-driven rule — live/sim count ratio ~1.2x vs 1.6x at
 # the old 250ms default of 5; sub-250ms whipsaw crossings are where live diverged)
@@ -1156,6 +1158,8 @@ def main():
     a.misses = []   # signals blocked by the chase cap (post-latency ask ran away)
     a.deltas = [float(x) for x in a.deltas.split(",")]
     a.tte_max, a.tte_min = (float(x) for x in a.tte.split(":"))
+    if a.tte_max > 300:
+        BUCKETS[:0] = [b for b in BUCKETS_EARLY if b[1] < a.tte_max]
     paths = a.samples.split(",")
     models = [parse_model(s) for s in a.model]
 
