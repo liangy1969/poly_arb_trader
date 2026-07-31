@@ -438,6 +438,7 @@ def generate_trades(sig, m_label, gap, fair, mid_p, tte_p, ybid_p, yask_p, ts_p,
         dmid_arr[okl] = (mid_p - mid_p[ii])[okl]
     for dl in a.deltas:
         armed, run, k, n_ent = True, 0, 0, 0
+        dis_dir = 0.0   # sign of the disarming crossing (directional re-arm)
         while k < len(sig):
             if a.trigger == "move":
                 mv, dm = dfair_arr[k], dmid_arr[k]
@@ -466,7 +467,9 @@ def generate_trades(sig, m_label, gap, fair, mid_p, tte_p, ybid_p, yask_p, ts_p,
             else:
                 ag = abs(sig[k])
                 if not armed:
-                    if ag <= a.rearm_eps:
+                    # DIRECTIONAL re-arm (live semantics): same-direction re-fires
+                    # revert to within rearm_eps; a sign flip re-arms immediately.
+                    if sig[k] * dis_dir <= a.rearm_eps:
                         armed, run = True, 0
                     k += 1
                     continue
@@ -481,6 +484,7 @@ def generate_trades(sig, m_label, gap, fair, mid_p, tte_p, ybid_p, yask_p, ts_p,
                 n_ent += 1
                 run, armed = 0, False
                 side_yes = sig[k] > 0
+                dis_dir = 1.0 if side_yes else -1.0
                 s = 1.0 if side_yes else -1.0
 
                 # 1s-lookback RIDE gate — LIVE SEMANTICS (rule.rs): the lookback

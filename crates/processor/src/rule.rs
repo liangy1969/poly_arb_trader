@@ -344,6 +344,13 @@ struct RideState {
     base_hist: VecDeque<(i64, f64)>,
     base_sum: f64,
     base_last_ns: i64,
+    /// Sign of the trigger signal at the last disarm (+1/-1; 0 before any).
+    /// Re-arm is DIRECTIONAL: `sig * disarm_dir <= rearm_eps` — same-direction
+    /// re-fires must revert to within rearm_eps, but a SIGN FLIP re-arms
+    /// immediately (an opposite-direction dislocation is a new episode; the
+    /// old |sig| band skipped fast flips, e.g. +0.037 -> -0.05 in one tick
+    /// stayed disarmed through the whole opposite move).
+    disarm_dir: f64,
 }
 
 impl RideState {
@@ -357,6 +364,7 @@ impl RideState {
             base_hist: VecDeque::new(),
             base_sum: 0.0,
             base_last_ns: 0,
+            disarm_dir: 0.0,
         }
     }
 }
@@ -579,7 +587,10 @@ impl FairRideRule {
         // hysteresis / cap (on the TRIGGER signal `sig`; raw gap still drives
         // gapstats/fairlog above and the ride gate below)
         if !st.armed {
-            if sig.abs() <= cfg.rearm_eps {
+            // DIRECTIONAL re-arm: same-direction re-fires must revert to within
+            // rearm_eps of zero, but a sign flip vs the disarming crossing
+            // re-arms immediately (sig * disarm_dir goes negative).
+            if sig * st.disarm_dir <= cfg.rearm_eps {
                 st.armed = true;
                 // episode transition log (target "episode"): re-arm, with how much
                 // slack there was to the threshold — a small margin means the arm
@@ -588,7 +599,7 @@ impl FairRideRule {
                 tracing::info!(
                     target: "episode",
                     "{} RE-ARM tte={:.1} fair={:.4} mid={:.4} gap={:+.4} margin={:+.4}",
-                    inst, tte_s, fair, mid, sig, cfg.rearm_eps - sig.abs()
+                    inst, tte_s, fair, mid, sig, cfg.rearm_eps - sig * st.disarm_dir
                 );
             }
             st.ring.push_back(push);
@@ -608,6 +619,7 @@ impl FairRideRule {
         // fire, which re-fired far more often than the sim.)
         st.entries += 1;
         st.armed = false;
+        st.disarm_dir = if sig > 0.0 { 1.0 } else { -1.0 };
         let entry_no = st.entries;
 
         // ride gate: youngest ring sample >= lookback_min old
