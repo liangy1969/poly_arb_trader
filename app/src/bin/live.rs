@@ -272,6 +272,12 @@ async fn main() -> anyhow::Result<()> {
             let mut perp: Option<(f64, f64, f64, f64, i64)> = None; // bid, ask, bid_sz, ask_sz, exch_ns
             // binance SPOT top (settlement-chain sibling): same shape as perp
             let mut spotq: (f64, f64, f64, f64, i64) = (f64::NAN, f64::NAN, 0.0, 0.0, 0);
+            // BRTI-constituent venue tops (kraken / bitstamp / gemini) — the
+            // settlement index is a depth-weighted consolidated mid of these
+            // books + coinbase's; logged for anchor-density research.
+            let mut krq: (f64, f64, f64, f64, i64) = (f64::NAN, f64::NAN, 0.0, 0.0, 0);
+            let mut bsq: (f64, f64, f64, f64, i64) = (f64::NAN, f64::NAN, 0.0, 0.0, 0);
+            let mut gmq: (f64, f64, f64, f64, i64) = (f64::NAN, f64::NAN, 0.0, 0.0, 0);
             // probe features (band5/vsurge/...) reconstructed in-sampler so
             // every 50ms row carries them (empty extras = no extra columns).
             let mut feats = arb_processor::FeatureState::new(feat_extras.clone());
@@ -305,6 +311,16 @@ async fn main() -> anyhow::Result<()> {
                             Payload::Book(b) if !spot_inst.is_empty() && b.instrument == spot_inst => {
                                 if let (Some(&(sb, sbs)), Some(&(sa, sas))) = (b.bids.first(), b.asks.first()) {
                                     spotq = (sb, sa, sbs, sas, b.exch_ts_ns);
+                                }
+                            }
+                            Payload::Book(b) if b.instrument == "kraken.BTC" || b.instrument == "bitstamp.BTC" || b.instrument == "gemini.BTC" => {
+                                if let (Some(&(vb, vbs)), Some(&(va, vas))) = (b.bids.first(), b.asks.first()) {
+                                    let q = (vb, va, vbs, vas, b.exch_ts_ns);
+                                    match b.instrument.as_str() {
+                                        "kraken.BTC" => krq = q,
+                                        "bitstamp.BTC" => bsq = q,
+                                        _ => gmq = q,
+                                    }
                                 }
                             }
                             Payload::Book(b) if b.instrument.starts_with("kalshi.") && b.instrument.ends_with(".YES") => {
@@ -357,7 +373,7 @@ async fn main() -> anyhow::Result<()> {
                                 Ok(f) => {
                                     let mut w = std::io::BufWriter::new(f);
                                     if fresh {
-                                        let mut hdr = String::from("ts_ms,ticker,tte_ms,perp_bid,perp_ask,ybid,yask,ybid_sz,yask_sz,cb_bid,cb_ask,cb_age_ms,perp_bid_sz,perp_ask_sz,cb_bid_sz,cb_ask_sz,perp_age_ms,cb_srv_age_ms,spot_bid,spot_ask,spot_bid_sz,spot_ask_sz,spot_age_ms");
+                                        let mut hdr = String::from("ts_ms,ticker,tte_ms,perp_bid,perp_ask,ybid,yask,ybid_sz,yask_sz,cb_bid,cb_ask,cb_age_ms,perp_bid_sz,perp_ask_sz,cb_bid_sz,cb_ask_sz,perp_age_ms,cb_srv_age_ms,spot_bid,spot_ask,spot_bid_sz,spot_ask_sz,spot_age_ms,kr_bid,kr_ask,kr_bid_sz,kr_ask_sz,kr_age_ms,bs_bid,bs_ask,bs_bid_sz,bs_ask_sz,bs_age_ms,gm_bid,gm_ask,gm_bid_sz,gm_ask_sz,gm_age_ms");
                                         for n in &feat_extras {
                                             hdr.push(',');
                                             hdr.push_str(n);
@@ -378,6 +394,12 @@ async fn main() -> anyhow::Result<()> {
                         let cb_srv_age_ms = if cb_srv_ns > 0 { (now - cb_srv_ns) / 1_000_000 } else { -1 };
                         let (sp_b, sp_a, sp_bs, sp_as, sp_exch_ns) = spotq;
                         let spot_age_ms = if sp_exch_ns > 0 { (now - sp_exch_ns) / 1_000_000 } else { -1 };
+                        let (kr_b, kr_a, kr_bs, kr_as, kr_ns) = krq;
+                        let kr_age_ms = if kr_ns > 0 { (now - kr_ns) / 1_000_000 } else { -1 };
+                        let (bs_b, bs_a, bs_bs, bs_as, bs_ns) = bsq;
+                        let bs_age_ms = if bs_ns > 0 { (now - bs_ns) / 1_000_000 } else { -1 };
+                        let (gm_b, gm_a, gm_bs, gm_as, gm_ns) = gmq;
+                        let gm_age_ms = if gm_ns > 0 { (now - gm_ns) / 1_000_000 } else { -1 };
                         // probe features, once per tick (market-independent).
                         // NaN column = feature not ready (warmup / stale feed).
                         let feat_cols = if feat_extras.is_empty() {
@@ -408,10 +430,13 @@ async fn main() -> anyhow::Result<()> {
                             }
                             let _ = writeln!(
                                 w,
-                                "{},{},{},{:.2},{:.2},{:.3},{:.3},{:.1},{:.1},{:.2},{:.2},{},{:.3},{:.3},{:.4},{:.4},{},{},{:.2},{:.2},{:.4},{:.4},{}{}",
+                                "{},{},{},{:.2},{:.2},{:.3},{:.3},{:.1},{:.1},{:.2},{:.2},{},{:.3},{:.3},{:.4},{:.4},{},{},{:.2},{:.2},{:.4},{:.4},{},{:.2},{:.2},{:.4},{:.4},{},{:.2},{:.2},{:.4},{:.4},{},{:.2},{:.2},{:.4},{:.4},{}{}",
                                 now / 1_000_000, mid, tte_ms, pb, pa, k.ybid, k.yask, k.ybsz, k.yasz,
                                 cb_b, cb_a, cb_age_ms, pbs, pas, cb_bs, cb_as, perp_age_ms, cb_srv_age_ms,
-                                sp_b, sp_a, sp_bs, sp_as, spot_age_ms, feat_cols
+                                sp_b, sp_a, sp_bs, sp_as, spot_age_ms,
+                                kr_b, kr_a, kr_bs, kr_as, kr_age_ms,
+                                bs_b, bs_a, bs_bs, bs_as, bs_age_ms,
+                                gm_b, gm_a, gm_bs, gm_as, gm_age_ms, feat_cols
                             );
                         }
                         n_since_flush += 1;

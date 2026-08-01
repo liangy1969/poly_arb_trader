@@ -158,8 +158,10 @@ def fetch_meta(tickers, cache_path):
 FEAT_COLS = ("band5", "vsurge120_1200")
 
 
-def load_samples(path):
-    """-> per-ticker dict of numpy arrays (ts_ms, tte_s, perp_mid, ybid, yask)."""
+def load_samples(path, cb_stale_ms=5000.0):
+    """-> per-ticker dict of numpy arrays (ts_ms, tte_s, perp_mid, ybid, yask).
+    `cb_stale_ms`: cb quotes older than this are NaN'd (2p models then drop the
+    row) — mirrors the live CB_STALE_NS input gate (5s default)."""
     ev = {}
     op = gzip.open if path.endswith(".gz") else open
     with op(path, "rt") as f:
@@ -178,10 +180,13 @@ def load_samples(path):
                     if b_sz + a_sz > 0:
                         imb1 = (b_sz - a_sz) / (b_sz + a_sz)
                 cbmid = float("nan")
+                age_out = float("nan")
                 cb_b, cb_a, cb_age = r.get("cb_bid"), r.get("cb_ask"), r.get("cb_age_ms")
                 if cb_b is not None and cb_a is not None and cb_age is not None:
                     b_px, a_px, age = float(cb_b), float(cb_a), float(cb_age)
-                    if b_px > 0 and a_px > 0 and 0 <= age <= 5000:
+                    if age >= 0:
+                        age_out = age
+                    if b_px > 0 and a_px > 0 and 0 <= age <= cb_stale_ms:
                         cbmid = (b_px + a_px) / 2.0
                 fx = []
                 for c in FEAT_COLS:
@@ -200,6 +205,7 @@ def load_samples(path):
                         yask,
                         imb1,
                         cbmid,
+                        age_out,
                     )
                     + tuple(fx)
                 )
@@ -209,9 +215,9 @@ def load_samples(path):
     for t, rows in ev.items():
         rows.sort()
         a = np.array(rows, dtype=np.float64)
-        out[t] = {"ts": a[:, 0], "tte": a[:, 1], "spot": a[:, 2], "ybid": a[:, 3], "yask": a[:, 4], "imb1n": a[:, 5], "cbmid": a[:, 6]}
+        out[t] = {"ts": a[:, 0], "tte": a[:, 1], "spot": a[:, 2], "ybid": a[:, 3], "yask": a[:, 4], "imb1n": a[:, 5], "cbmid": a[:, 6], "cb_age": a[:, 7]}
         for i, c in enumerate(FEAT_COLS):
-            out[t][c] = a[:, 7 + i]
+            out[t][c] = a[:, 8 + i]
     return out
 
 

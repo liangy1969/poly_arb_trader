@@ -45,7 +45,7 @@ import json
 import math
 import os
 import sys
-from collections import defaultdict
+from collections import defaultdict, Counter
 from datetime import datetime, timezone
 
 import numpy as np
@@ -215,6 +215,7 @@ def fair_series(d, m, strike, rho, b_scale, fwd, tte_max, fit_window, refit_step
     # two-price surface: cb mid rides along everywhere spot does
     cbm = m["cb_mult"]
     cb_p = d["cbmid"][scan][ss] if cbm is not None else None
+    age_p = d["cb_age"][scan][ss] if "cb_age" in d else None
     fair = np.full(len(tte_p), np.nan)
     gbar = np.full(len(tte_p), np.nan)
     # per-row calibration in effect (db, dr) — lets the closure analysis
@@ -312,7 +313,8 @@ def fair_series(d, m, strike, rho, b_scale, fwd, tte_max, fit_window, refit_step
     ok = ~np.isnan(fair)
     return (ts_p[ok], tte_p[ok], ybid_p[ok], yask_p[ok], fair[ok], gbar[ok],
             fill_ybid[ok], fill_yask[ok], dbs[ok], drs[ok],
-            spot_p[ok], x_p[ok], cb_p[ok] if cbm is not None else None)
+            spot_p[ok], x_p[ok], cb_p[ok] if cbm is not None else None,
+            age_p[ok] if age_p is not None else None)
 
 
 # ── trade generation ─────────────────────────────────────────────────────────
@@ -412,7 +414,7 @@ def event_calib_report(a, models):
 
 
 def generate_trades(sig, m_label, gap, fair, mid_p, tte_p, ybid_p, yask_p, ts_p, outc, t, a,
-                    fill_ybid, fill_yask, fx_fair=None):
+                    fill_ybid, fill_yask, fx_fair=None, cb_age_p=None):
     """Arm/gate/entry episode loop for ONE entry signal on ONE event -> trade
     dicts labeled `m_label`. `sig` (raw gap or demeaned gap) drives the threshold,
     direction and re-arm; the ride gate and closure use the RAW fair/mid/gap.
@@ -439,6 +441,7 @@ def generate_trades(sig, m_label, gap, fair, mid_p, tte_p, ybid_p, yask_p, ts_p,
     for dl in a.deltas:
         armed, run, k, n_ent = True, 0, 0, 0
         dis_dir = 0.0   # sign of the disarming crossing (directional re-arm)
+        last_cross_ms = -1e18   # ts of the previous delta-crossing (any outcome)
         while k < len(sig):
             if a.trigger == "move":
                 mv, dm = dfair_arr[k], dmid_arr[k]
@@ -486,6 +489,9 @@ def generate_trades(sig, m_label, gap, fair, mid_p, tte_p, ybid_p, yask_p, ts_p,
                 side_yes = sig[k] > 0
                 dis_dir = 1.0 if side_yes else -1.0
                 s = 1.0 if side_yes else -1.0
+                prev_cross_ms = last_cross_ms
+                last_cross_ms = ts_p[k]   # EVERY crossing disarms + stamps, even
+                                          # gate-rejected/vetoed ones (live parity)
 
                 # 1s-lookback RIDE gate — LIVE SEMANTICS (rule.rs): the lookback
                 # reference is the youngest sample >= lookback_min (1s) old, up
@@ -521,6 +527,26 @@ def generate_trades(sig, m_label, gap, fair, mid_p, tte_p, ybid_p, yask_p, ts_p,
                     if not ok:
                         k += 1
                         continue
+
+                # trade-only vetoes: the crossing above already consumed the
+                # armed state (and stamped last_cross_ms), so unlike row-level
+                # exclusion these CANNOT unlock/relocate later episodes.
+                # (a) stale-signal veto: the fair at this row consumed a cb
+                #     quote older than the threshold -> disarm but don't trade.
+                if a.stale_veto_ms > 0 and cb_age_p is not None and \
+                        not math.isnan(cb_age_p[k]) and cb_age_p[k] > a.stale_veto_ms:
+                    a.vetoes.append({"model": m_label, "delta": dl, "why": "stale",
+                                     "date": utc_date(ts_p[k]), "ticker": t})
+                    k += 1
+                    continue
+                # (b) disarm cooldown: no trade within N s of the PREVIOUS
+                #     delta-crossing (any direction, traded or not) -> whipsaw
+                #     bursts push the stamp forward and stay untraded.
+                if a.disarm_cd_s > 0 and (ts_p[k] - prev_cross_ms) < a.disarm_cd_s * 1000.0:
+                    a.vetoes.append({"model": m_label, "delta": dl, "why": "cooldown",
+                                     "date": utc_date(ts_p[k]), "ticker": t})
+                    k += 1
+                    continue
 
             # fill price: signal-instant ask, or (with latency) the post-latency
             # ask — but MISS if it ran more than the chase budget above the
@@ -633,7 +659,7 @@ def simulate(m, ev, meta, a):
         if getattr(a, "live_calib", None) and lc is None:
             continue  # consistency mode: live never calibrated this event
         (ts_p, tte_p, ybid_p, yask_p, fair, gbar, fill_ybid, fill_yask,
-         dbs_p, drs_p, spot_p, x_p, cb_p) = fair_series(
+         dbs_p, drs_p, spot_p, x_p, cb_p, cb_age_p) = fair_series(
             d, m, strike, rho, b_scale, fwd, a.tte_max, a.fit_window, a.refit_step,
             a.demean_window, a.latency_ms, live_cal=lc)
         if len(tte_p) < 50:
@@ -739,7 +765,8 @@ def simulate(m, ev, meta, a):
         for suffix, sig in strats:
             trades += generate_trades(sig, m["label"] + suffix, gap, fair, mid_p,
                                       tte_p, ybid_p, yask_p, ts_p, outc, t, a,
-                                      fill_ybid, fill_yask, fx_fair=fx_fair)
+                                      fill_ybid, fill_yask, fx_fair=fx_fair,
+                                      cb_age_p=cb_age_p)
     return trades, bce_rows
 
 
@@ -1120,6 +1147,15 @@ def main():
                    help="also measure fair/mid moves at min(closure, cap) — a fixed "
                         "horizon uncorrelated with the endogenous closure time; "
                         "includes never-closed trades. 0 = off")
+    p.add_argument("--cb-stale-ms", type=float, default=5000.0,
+                   help="max age of the cb quote a fair may consume; staler rows "
+                        "are excluded for 2-price models (live CB_STALE_NS parity = 5000)")
+    p.add_argument("--stale-veto-ms", type=float, default=0.0,
+                   help="trade-only veto: suppress the ENTRY (crossing still "
+                        "disarms) when the fair's cb quote is older than this; 0=off")
+    p.add_argument("--disarm-cd-s", type=float, default=0.0,
+                   help="trade-only veto: no entry within N s of the previous "
+                        "delta-crossing (any direction, traded or not); 0=off")
     p.add_argument("--close-eps", type=float, default=0.01,
                    help="closure threshold for analysis 5")
     p.add_argument("--latency-ms", type=float, default=0.0,
@@ -1160,6 +1196,7 @@ def main():
     a.event_calib = {}
     a.win_signed = {}
     a.misses = []   # signals blocked by the chase cap (post-latency ask ran away)
+    a.vetoes = []   # trade-only vetoes (stale-signal / disarm-cooldown)
     a.deltas = [float(x) for x in a.deltas.split(",")]
     a.tte_max, a.tte_min = (float(x) for x in a.tte.split(":"))
     if a.tte_max > 300:
@@ -1170,7 +1207,7 @@ def main():
     print(f"loading {len(paths)} sample file(s)...")
     ev = {}
     for pth in paths:
-        for t, d in sim.load_samples(pth).items():
+        for t, d in sim.load_samples(pth, cb_stale_ms=a.cb_stale_ms).items():
             if t in ev:  # same event spanning a file boundary: concatenate,
                 ev[t] = {k: np.concatenate([ev[t][k], d[k]]) for k in d}  # then re-sort
             else:
@@ -1192,6 +1229,12 @@ def main():
         trades += tr
         bce_rows += bc
         print(f"  [{m['label']}] {len(tr)} trades, {len(bc)} event-bucket BCE rows")
+
+    if a.vetoes:
+        cnt = Counter((v["model"], v["delta"], v["why"]) for v in a.vetoes)
+        print("  trade-only vetoes (crossing still disarmed):")
+        for (ml, dl, why), n in sorted(cnt.items()):
+            print(f"    {ml:14s} d={dl:g} {why:9s} {n}")
 
     report(trades, bce_rows, a, models)
     sharpe_report(trades, a)
