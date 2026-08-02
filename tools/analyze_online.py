@@ -140,7 +140,12 @@ def prepare(ev, m):
             bas = d["cbmid"] - d["spot"] if needs_cb else None
             X = np.full((len(ts), len(extras)), np.nan)
             for ci, name in enumerate(extras):
-                if name.startswith("pmom"):
+                if name.startswith("pcbmom"):
+                    # PERCENT momentum of the CB mid (1s cb-tick impulse etc.);
+                    # same lag tolerance as offline emom (k+2s)
+                    lg = lag(d["cbmid"], int(name[6:]))
+                    X[:, ci] = (d["cbmid"] - lg) / lg
+                elif name.startswith("pmom"):
                     # PERCENT momentum (the 2p model's %mom)
                     lg = lag(d["spot"], int(name[4:]))
                     X[:, ci] = (d["spot"] - lg) / lg
@@ -769,7 +774,9 @@ def simulate(m, ev, meta, a):
             trades += generate_trades(sig, m["label"] + suffix, gap, fair, mid_p,
                                       tte_p, ybid_p, yask_p, ts_p, outc, t, a,
                                       fill_ybid, fill_yask, fx_fair=fx_fair,
-                                      cb_age_p=cb_age_p)
+                                      # live parity: the stale veto only guards
+                                      # 2-price surfaces (rule.rs two_price())
+                                      cb_age_p=cb_age_p if cbm is not None else None)
     return trades, bce_rows
 
 
@@ -1153,9 +1160,11 @@ def main():
     p.add_argument("--cb-stale-ms", type=float, default=5000.0,
                    help="max age of the cb quote a fair may consume; staler rows "
                         "are excluded for 2-price models (live CB_STALE_NS parity = 5000)")
-    p.add_argument("--stale-veto-ms", type=float, default=0.0,
+    p.add_argument("--stale-veto-ms", type=float, default=100.0,
                    help="trade-only veto: suppress the ENTRY (crossing still "
-                        "disarms) when the fair's cb quote is older than this; 0=off")
+                        "disarms) when the fair's cb quote is older than this; "
+                        "0=off. Default 100 = LIVE parity (stale_veto_ms: 100, "
+                        "2026-08-01); applies to 2-price models only, like live")
     p.add_argument("--disarm-cd-s", type=float, default=0.0,
                    help="trade-only veto: no entry within N s of the previous "
                         "delta-crossing (any direction, traded or not); 0=off")

@@ -179,7 +179,11 @@ comparing P&L, either re-slice sim `trades.csv` to the live-executable set
 
 **Before** (offline):
 1. Offline eval at LIVE cadence (`--refit-step 15`, w120) with `--fresh-from`;
-   headline the event-clustered t on the fresh panel only.
+   headline the event-clustered t on the fresh panel only. Keep TRADE-GATE
+   parity with the live rule: `--stale-veto-ms` (harness default 100 =
+   live `stale_veto_ms: 100`, 2026-08-01, 2p models only; crossing still
+   disarms), `--rearm-eps`, `--demean-window` must mirror the box config —
+   any run at other values must say so next to its numbers.
 2. Surface changed? → golden parity test + fresh export; note the model hash.
 3. `cargo build --workspace` + `cargo test` locally.
 
