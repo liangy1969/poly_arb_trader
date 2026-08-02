@@ -297,6 +297,13 @@ pub struct FairRideCfg {
     /// no per-tick surface recomputes, and the baseline is calibration-clean
     /// (a refit shifts gap and baseline in lockstep, like the sim's gbar).
     pub demean_window_s: f64,
+    /// Stale-signal veto (0 = off): suppress the ENTRY (the crossing still
+    /// disarms — trade-only veto, sim's --stale-veto-ms) when the cb quote the
+    /// current fair consumed is older than this many ms. A cb-CONFIRMATION
+    /// gate: only trade a dislocation the settlement-anchor venue has itself
+    /// just repriced (sweep 2026-08-01: interior optimum ~100ms; vetoed
+    /// entries = perp-led, fade-prone).
+    pub stale_veto_ms: f64,
 }
 
 impl Default for FairRideCfg {
@@ -322,6 +329,7 @@ impl Default for FairRideCfg {
             hold_ms: 0,
             ttl_ms: 500,
             demean_window_s: 0.0,
+            stale_veto_ms: 0.0,
         }
     }
 }
@@ -660,6 +668,21 @@ impl FairRideRule {
             );
             st.ring.push_back(push);
             return None;
+        }
+        // stale-signal veto (trade-only, sim parity): the crossing above
+        // already consumed the armed state; suppress only the ENTRY when the
+        // cb quote the fair consumed is older than stale_veto_ms.
+        if cfg.stale_veto_ms > 0.0 && self.surface.two_price() {
+            let cb_age = self.feats.cb_age_ms(now);
+            if cb_age as f64 > cfg.stale_veto_ms {
+                tracing::info!(
+                    target: "episode",
+                    "{} DISARM tte={:.1} fair={:.4} mid={:.4} gap={:+.4} entry#{} gate=PASS veto=STALE cb_age_ms={}",
+                    inst, tte_s, fair, mid, sig, entry_no, cb_age
+                );
+                st.ring.push_back(push);
+                return None;
+            }
         }
         tracing::info!(
             target: "episode",

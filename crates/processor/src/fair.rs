@@ -305,6 +305,12 @@ impl FeatureState {
         !self.extras.is_empty()
     }
 
+    /// Age (ms) of the cb quote the fair would consume right now; i64::MAX
+    /// before the first quote. Drives the rule's stale-signal veto.
+    pub fn cb_age_ms(&self, now_ns: i64) -> i64 {
+        if self.cb_ts > 0 { (now_ns - self.cb_ts) / 1_000_000 } else { i64::MAX }
+    }
+
     /// Fresh coinbase mid (≤ 5s old), for the two-price surface's px2 channel.
     pub fn cb_price(&self, now_ns: i64) -> Option<f64> {
         if self.cb_mid > 0.0 && now_ns - self.cb_ts <= Self::CB_STALE_NS {

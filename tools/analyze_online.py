@@ -633,6 +633,9 @@ def generate_trades(sig, m_label, gap, fair, mid_p, tte_p, ybid_p, yask_p, ts_p,
                 "cap_s": cap_s, "cap_dfair": cap_df, "cap_dmid": cap_dm,
                 "cap_dfair_fx": cap_df_fx,
                 "mkt_share": mkt_sh, "fair_share": fair_sh,
+                # cb quote age at entry: lets the stale-veto threshold curve be
+                # computed post-hoc (veto = strict subset, no state coupling)
+                "cb_age": float(cb_age_p[k]) if cb_age_p is not None else float("nan"),
             })
             k += 1
     return out
