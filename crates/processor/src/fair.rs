@@ -261,6 +261,8 @@ pub struct FeatureState {
     cb_ts: i64,
     /// (ts_ns, basis) history; pruned to `horizon_ns`.
     basis_ring: std::collections::VecDeque<(i64, f64)>,
+    /// (ts_ns, cb_mid) TICK history for pcbmom{k} lags; pruned to `horizon_ns`.
+    cb_ring: std::collections::VecDeque<(i64, f64)>,
     /// (ts_ns, perp_mid) history for momentum lags; pruned to `horizon_ns`.
     mid_ring: std::collections::VecDeque<(i64, f64)>,
     /// (ts_ns, qty) perp trade volume for surge windows; pruned to `VOL_HORIZON_NS`.
@@ -283,6 +285,7 @@ impl FeatureState {
             cb_mid: f64::NAN,
             cb_ts: 0,
             basis_ring: std::collections::VecDeque::new(),
+            cb_ring: std::collections::VecDeque::new(),
             mid_ring: std::collections::VecDeque::new(),
             trade_ring: std::collections::VecDeque::new(),
             depth_bids: Vec::new(),
@@ -334,8 +337,28 @@ impl FeatureState {
         if mid > 0.0 {
             self.cb_mid = mid;
             self.cb_ts = ts_ns;
+            self.cb_ring.push_back((ts_ns, mid));
+            let cutoff = ts_ns - self.horizon_ns;
+            while self.cb_ring.front().map_or(false, |&(t, _)| t < cutoff) {
+                self.cb_ring.pop_front();
+            }
             self.push_basis(ts_ns);
         }
+    }
+
+    /// cb mid as of `k_s` seconds ago, HARNESS/ffill semantics: the newest
+    /// tick at least k_s old, accepted while that tick would still pass the
+    /// 5s staleness gate AT THE LAG TIME (the sampler's carried-forward
+    /// cbmid). Quiet cb ⇒ lag == current tick ⇒ pcbmom = 0, row stays valid.
+    fn cb_lag(&self, now_ns: i64, k_s: i64) -> Option<f64> {
+        let target = now_ns - k_s * 1_000_000_000;
+        let lo = target - Self::CB_STALE_NS;
+        for &(t, m) in self.cb_ring.iter().rev() {
+            if t <= target {
+                return if t >= lo { Some(m) } else { None };
+            }
+        }
+        None
     }
 
     fn push_basis(&mut self, ts_ns: i64) {
@@ -470,6 +493,17 @@ impl FeatureState {
                     // ±k bps banded qty imbalance from the deep perp book
                     let k: f64 = n[4..].parse().ok()?;
                     self.band(now_ns, k)?
+                }
+                n if n.starts_with("pcbmom") => {
+                    // PERCENT cb-mid change over k seconds (1s cb-tick impulse).
+                    // Mirrors the harness lag on the sampler's carried-forward
+                    // cbmid (see cb_lag); z-scored by the surface.
+                    let k: i64 = n[6..].parse().ok()?;
+                    let lag = self.cb_lag(now_ns, k)?;
+                    if lag <= 0.0 {
+                        return None;
+                    }
+                    (self.cb_mid - lag) / lag
                 }
                 n if n.starts_with("pmom") => {
                     // PERCENT perp-mid change over k seconds (the 2p model's
