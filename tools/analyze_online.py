@@ -1188,11 +1188,11 @@ def main():
     p.add_argument("--cb-stale-ms", type=float, default=5000.0,
                    help="max age of the cb quote a fair may consume; staler rows "
                         "are excluded for 2-price models (live CB_STALE_NS parity = 5000)")
-    p.add_argument("--stale-veto-ms", type=float, default=50.0,
+    p.add_argument("--stale-veto-ms", type=float, default=100.0,
                    help="trade-only veto: suppress the ENTRY (crossing still "
                         "disarms) when the fair's cb quote is older than this; "
-                        "0=off. Default 50 = LIVE parity (stale_veto_ms: 50, "
-                        "2026-08-02; was 100); applies to 2-price models only")
+                        "0=off. Default 100 = LIVE parity (stale_veto_ms: 100, "
+                        "2026-08-03); applies to 2-price models only")
     p.add_argument("--disarm-cd-s", type=float, default=0.0,
                    help="trade-only veto: no entry within N s of the previous "
                         "delta-crossing (any direction, traded or not); 0=off")
