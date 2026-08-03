@@ -108,8 +108,11 @@ def parse_model(spec):
     # scaled by exp(rho_cb + dr) = s * cb_mult with the shared per-event (b, dr).
     rho_cb = js.get("rho_cb")
     cb_mult = math.exp(rho_cb - js["rho_bar"]) if rho_cb is not None else None
+    # three-price surface: kraken BBO mid as the THIRD channel
+    rho_kr = js.get("rho_kr")
+    kr_mult = math.exp(rho_kr - js["rho_bar"]) if rho_kr is not None else None
     return {"label": label, "path": path, "js": js, "px": px,
-            "extras": js.get("extras", []), "cb_mult": cb_mult}
+            "extras": js.get("extras", []), "cb_mult": cb_mult, "kr_mult": kr_mult}
 
 
 def prepare(ev, m):
@@ -125,6 +128,9 @@ def prepare(ev, m):
         d = {k: v.copy() for k, v in d0.items()}
         if px == "cb":
             d["spot"] = d["cbmid"]
+        elif px == "kr":
+            # kraken BBO mid (online venue columns) as the price input
+            d["spot"] = d["krmid"]
         ts = d["ts"]
 
         def lag(series, k_s):
@@ -145,6 +151,10 @@ def prepare(ev, m):
                     # same lag tolerance as offline emom (k+2s)
                     lg = lag(d["cbmid"], int(name[6:]))
                     X[:, ci] = (d["cbmid"] - lg) / lg
+                elif name.startswith("pkrmom"):
+                    # PERCENT momentum of the kraken BBO mid
+                    lg = lag(d["krmid"], int(name[6:]))
+                    X[:, ci] = (d["krmid"] - lg) / lg
                 elif name.startswith("pmom"):
                     # PERCENT momentum (the 2p model's %mom)
                     lg = lag(d["spot"], int(name[4:]))
@@ -172,6 +182,8 @@ def prepare(ev, m):
         if m["cb_mult"] is not None:
             # two-price surface: a fresh cb quote is a PRICE input on every row
             ok &= ~np.isnan(d["cbmid"])
+        if m.get("kr_mult") is not None:
+            ok &= ~np.isnan(d["krmid"])
         if extras:
             ok &= ~np.isnan(d["X"]).any(axis=1)
         for k in list(d):
@@ -220,6 +232,8 @@ def fair_series(d, m, strike, rho, b_scale, fwd, tte_max, fit_window, refit_step
     # two-price surface: cb mid rides along everywhere spot does
     cbm = m["cb_mult"]
     cb_p = d["cbmid"][scan][ss] if cbm is not None else None
+    krm = m.get("kr_mult")
+    kr_p = d["krmid"][scan][ss] if krm is not None else None
     age_p = d["cb_age"][scan][ss] if "cb_age" in d else None
     fair = np.full(len(tte_p), np.nan)
     gbar = np.full(len(tte_p), np.nan)
@@ -256,6 +270,7 @@ def fair_series(d, m, strike, rho, b_scale, fwd, tte_max, fit_window, refit_step
                 rho, b_scale, steps=sim.FIT_STEPS if init is None else 60, init=init,
                 extra=d["X"][fitm][fit_sl],
                 cb=d["cbmid"][fitm][fit_sl] if cbm is not None else None, cb_mult=cbm,
+                kr=d["krmid"][fitm][fit_sl] if krm is not None else None, kr_mult=krm,
             )
             init = (float(db), float(dr))
         seg = (tte_p <= B) & (tte_p > B - int(refit_step))
@@ -269,6 +284,8 @@ def fair_series(d, m, strike, rho, b_scale, fwd, tte_max, fit_window, refit_step
                     torch.tensor(x_p[seg], dtype=torch.float32),
                     torch.tensor(cb_p[seg], dtype=torch.float32) if cbm is not None else None,
                     cbm,
+                    torch.tensor(kr_p[seg], dtype=torch.float32) if krm is not None else None,
+                    krm,
                 )
                 fair[seg] = torch.sigmoid(lo).numpy()
                 dbs[seg] = float(db)
@@ -289,7 +306,9 @@ def fair_series(d, m, strike, rho, b_scale, fwd, tte_max, fit_window, refit_step
                             strike + b_scale * db, torch.exp(rho + dr),
                             torch.tensor(d["X"][gi], dtype=torch.float32),
                             torch.tensor(d["cbmid"][gi], dtype=torch.float32) if cbm is not None else None,
-                            cbm)
+                            cbm,
+                            torch.tensor(d["krmid"][gi], dtype=torch.float32) if krm is not None else None,
+                            krm)
                         g_fair = torch.sigmoid(glo).numpy()
                     g_gap = g_fair - (d["ybid"][gi] + d["yask"][gi]) / 2.0
                     order = np.argsort(g_tte)  # ascending tte = back in time
@@ -319,7 +338,8 @@ def fair_series(d, m, strike, rho, b_scale, fwd, tte_max, fit_window, refit_step
     return (ts_p[ok], tte_p[ok], ybid_p[ok], yask_p[ok], fair[ok], gbar[ok],
             fill_ybid[ok], fill_yask[ok], dbs[ok], drs[ok],
             spot_p[ok], x_p[ok], cb_p[ok] if cbm is not None else None,
-            age_p[ok] if age_p is not None else None)
+            age_p[ok] if age_p is not None else None,
+            kr_p[ok] if krm is not None else None)
 
 
 # ── trade generation ─────────────────────────────────────────────────────────
@@ -516,7 +536,10 @@ def generate_trades(sig, m_label, gap, fair, mid_p, tte_p, ybid_p, yask_p, ts_p,
                 push, pull = s * dfair1, -s * dmid1
                 tot = push + pull
                 share = push / tot if tot and not math.isnan(tot) else float("nan")
-                is_ride = bool(tot > a.ride_open and share > a.ride_share)
+                # open_min CONVENTION (user, 2026-08-03): defaults to the gap
+                # threshold (delta) unless explicitly overridden
+                open_eff = a.ride_open if a.ride_open is not None else dl
+                is_ride = bool(tot > open_eff and share > a.ride_share)
                 if a.gate == "ride" and not is_ride:
                     k += 1
                     continue
@@ -667,7 +690,7 @@ def simulate(m, ev, meta, a):
         if getattr(a, "live_calib", None) and lc is None:
             continue  # consistency mode: live never calibrated this event
         (ts_p, tte_p, ybid_p, yask_p, fair, gbar, fill_ybid, fill_yask,
-         dbs_p, drs_p, spot_p, x_p, cb_p, cb_age_p) = fair_series(
+         dbs_p, drs_p, spot_p, x_p, cb_p, cb_age_p, kr_p) = fair_series(
             d, m, strike, rho, b_scale, fwd, a.tte_max, a.fit_window, a.refit_step,
             a.demean_window, a.latency_ms, live_cal=lc)
         if len(tte_p) < 50:
@@ -675,6 +698,7 @@ def simulate(m, ev, meta, a):
         mid_p = (ybid_p + yask_p) / 2.0
         gap = fair - mid_p
         cbm = m["cb_mult"]
+        krm = m.get("kr_mult")
         rho_f = float(rho)
 
         def fx_fair(jj, kk):
@@ -692,6 +716,8 @@ def simulate(m, ev, meta, a):
                     torch.tensor(x_p[jj:jj + 1], dtype=torch.float32),
                     torch.tensor(cb_p[jj:jj + 1], dtype=torch.float32) if cb_p is not None else None,
                     cbm,
+                    torch.tensor(kr_p[jj:jj + 1], dtype=torch.float32) if kr_p is not None else None,
+                    krm,
                 )
                 return float(torch.sigmoid(lo)[0])
 
@@ -1131,7 +1157,9 @@ def main():
                         "overreact = fade a market overshoot (gap flipped past fair, "
                         "mid moved >> fair, same direction)")
     p.add_argument("--ride-share", type=float, default=0.75)
-    p.add_argument("--ride-open", type=float, default=0.005)
+    p.add_argument("--ride-open", type=float, default=None,
+                   help="ride-gate open_min; DEFAULT = the gap threshold (delta), "
+                        "per the 2026-08-03 convention (live open_min: 0.02 = delta)")
     p.add_argument("--overreact-k", type=float, default=2.0,
                    help="overreact gate: mid must have moved >= this x |fair move|")
     p.add_argument("--overreact-flip", type=float, default=0.01,
