@@ -443,6 +443,28 @@ impl FeatureState {
         }
     }
 
+    /// imb{k}: level-sum qty imbalance over the top k DEPTH levels — the
+    /// offline extractor's "depth-{5,20,100} level-sum imbalances". NOTE
+    /// `imb1` is NOT this: it comes from the bookTicker top-of-book sizes and
+    /// is matched earlier. `None` when the depth feed is stale or publishes
+    /// fewer than k levels (a truncated book would under-count vs the lake,
+    /// same reasoning as band{k}'s coverage gate).
+    fn imb_levels(&self, now_ns: i64, k: usize) -> Option<f64> {
+        if self.depth_bids.len() < k
+            || self.depth_asks.len() < k
+            || now_ns - self.depth_ts > Self::DEPTH_STALE_NS
+        {
+            return None;
+        }
+        let b: f64 = self.depth_bids.iter().take(k).map(|&(_, q)| q).sum();
+        let a: f64 = self.depth_asks.iter().take(k).map(|&(_, q)| q).sum();
+        if b + a > 0.0 {
+            Some((b - a) / (b + a))
+        } else {
+            Some(0.0) // matches the extractor's 0.0-on-empty
+        }
+    }
+
     /// Feed the perp CUMULATIVE traded volume (monotone). Conflation-safe: the
     /// latest cumulative captures every trade even if intermediate events drop.
     pub fn on_perp_trade(&mut self, ts_ns: i64, cum_vol: f64) {
@@ -484,6 +506,11 @@ impl FeatureState {
                         return None;
                     }
                     (self.perp_bsz - self.perp_asz) / s
+                }
+                // imb{k>1}: depth level-sum imbalance (imb1 matched above)
+                n if n.starts_with("imb") => {
+                    let k: usize = n[3..].parse().ok()?;
+                    self.imb_levels(now_ns, k)?
                 }
                 n if n.starts_with("dbasis") => {
                     let k: i64 = n[6..].parse().ok()?;
