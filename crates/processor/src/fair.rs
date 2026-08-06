@@ -265,6 +265,10 @@ pub struct FeatureState {
     cb_ring: std::collections::VecDeque<(i64, f64)>,
     /// (ts_ns, perp_mid) history for momentum lags; pruned to `horizon_ns`.
     mid_ring: std::collections::VecDeque<(i64, f64)>,
+    /// (ts_ns, imb1) history at 1s grain (first bookTicker observation per
+    /// second — the offline lake's 1s sampling) for imb1avg{W}; pruned to
+    /// `horizon_ns`.
+    imb1_ring: std::collections::VecDeque<(i64, f64)>,
     /// (ts_ns, qty) perp trade volume for surge windows; pruned to `VOL_HORIZON_NS`.
     trade_ring: std::collections::VecDeque<(i64, f64)>,
     /// Latest DEEP perp book (from the @depth stream, top-N levels) for the
@@ -287,6 +291,7 @@ impl FeatureState {
             basis_ring: std::collections::VecDeque::new(),
             cb_ring: std::collections::VecDeque::new(),
             mid_ring: std::collections::VecDeque::new(),
+            imb1_ring: std::collections::VecDeque::new(),
             trade_ring: std::collections::VecDeque::new(),
             depth_bids: Vec::new(),
             depth_asks: Vec::new(),
@@ -330,6 +335,18 @@ impl FeatureState {
             self.perp_asz = ask_sz;
             self.push_basis(ts_ns);
             self.push_mid(ts_ns, mid);
+            // imb1 at 1s grain: keep the FIRST observation of each second,
+            // mirroring the offline lake's 1s snapshot (imb1avg{W} input).
+            let s = bid_sz + ask_sz;
+            if s > 0.0
+                && self.imb1_ring.back().map_or(true, |&(t, _)| ts_ns / 1_000_000_000 > t / 1_000_000_000)
+            {
+                self.imb1_ring.push_back((ts_ns, (bid_sz - ask_sz) / s));
+                let cutoff = ts_ns - self.horizon_ns;
+                while self.imb1_ring.front().map_or(false, |&(t, _)| t < cutoff) {
+                    self.imb1_ring.pop_front();
+                }
+            }
         }
     }
 
@@ -506,6 +523,26 @@ impl FeatureState {
                         return None;
                     }
                     (self.perp_bsz - self.perp_asz) / s
+                }
+                // imb1avg{W}: mean of the 1s-grain imb1 ring over the last W
+                // seconds — the offline `roll_mean` (divide by samples present,
+                // no coverage gate; needs ≥1 sample). MUST match before the
+                // generic imb{k} branch ("1avg10" is not a level count).
+                n if n.starts_with("imb1avg") => {
+                    let w: i64 = n[7..].parse().ok()?;
+                    let cutoff = now_ns - w * 1_000_000_000;
+                    let (mut sum, mut cnt) = (0.0, 0u32);
+                    for &(t, v) in self.imb1_ring.iter().rev() {
+                        if t < cutoff {
+                            break;
+                        }
+                        sum += v;
+                        cnt += 1;
+                    }
+                    if cnt == 0 {
+                        return None;
+                    }
+                    sum / cnt as f64
                 }
                 // imb{k>1}: depth level-sum imbalance (imb1 matched above)
                 n if n.starts_with("imb") => {
