@@ -109,12 +109,14 @@ pub struct CalibCore {
     /// px2imb feature reconstruction (basis/dbasis/imb1); inactive for cb.
     feats: FeatureState,
     events: HashMap<String, EvState>,
+    /// throttle for the sample-drop diagnostic (at most one line / 60s).
+    last_drop_log_ns: i64,
 }
 
 impl CalibCore {
     pub fn new(cfg: CalibCfg, surface: Arc<FairSurface>, model_hash: u64) -> Self {
         let feats = FeatureState::new(surface.extras.clone());
-        CalibCore { cfg, surface, model_hash, ref_px: f64::NAN, ref_ns: 0, feats, events: HashMap::new() }
+        CalibCore { cfg, surface, model_hash, ref_px: f64::NAN, ref_ns: 0, feats, events: HashMap::new(), last_drop_log_ns: 0 }
     }
 
     /// Feed one bus event; returns any calibration updates produced.
@@ -219,6 +221,13 @@ impl CalibCore {
                     };
                     if let (Some(feats), Some(px2)) = (feats, px2) {
                         st.rows.push(FitRow { tte_s, px: self.ref_px, px2, mid: 0.5 * (st.ybid + st.yask), feats });
+                    } else if now - self.last_drop_log_ns > 60_000_000_000 {
+                        // throttled diagnostic: WHY are fit rows being dropped
+                        // (feature warmup vs missing/stale cb price channel)
+                        tracing::info!(target: "fit",
+                            "sample drop {inst}: feats={} cb_px={} cb_age_ms={}",
+                            feats.is_some(), px2.is_some(), self.feats.cb_age_ms(now));
+                        self.last_drop_log_ns = now;
                     }
                     st.last_sample_ns = now;
                 }

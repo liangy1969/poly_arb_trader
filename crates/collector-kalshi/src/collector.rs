@@ -370,7 +370,16 @@ async fn lifecycle_task(
             for (i, (close, _dist, ticker, title, open, strike)) in
                 cands.into_iter().take(cfg.n_windows).enumerate()
             {
-                if markets.contains_key(&ticker) {
+                if let Some(existing) = markets.get_mut(&ticker) {
+                    // 15m series set floor_strike only around window OPEN — a
+                    // market discovered while upcoming caches strike=None. When
+                    // a later discovery cycle sees the filled strike, update
+                    // and REPUBLISH so the calibrator/rule finally get it.
+                    if existing.strike.is_none() && strike.is_some() {
+                        existing.strike = strike;
+                        tracing::info!("strike late-filled {} = {:?}", existing.ticker, strike);
+                        publish_catalog(&*bus, existing, &cfg.kind, &mut seq);
+                    }
                     continue;
                 }
                 let phase = phase_of(now, open, close);
