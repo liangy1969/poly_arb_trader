@@ -111,12 +111,14 @@ pub struct CalibCore {
     events: HashMap<String, EvState>,
     /// throttle for the sample-drop diagnostic (at most one line / 60s).
     last_drop_log_ns: i64,
+    /// throttle for the state-dump diagnostic (at most one line / 60s).
+    last_state_log_ns: i64,
 }
 
 impl CalibCore {
     pub fn new(cfg: CalibCfg, surface: Arc<FairSurface>, model_hash: u64) -> Self {
         let feats = FeatureState::new(surface.extras.clone());
-        CalibCore { cfg, surface, model_hash, ref_px: f64::NAN, ref_ns: 0, feats, events: HashMap::new(), last_drop_log_ns: 0 }
+        CalibCore { cfg, surface, model_hash, ref_px: f64::NAN, ref_ns: 0, feats, events: HashMap::new(), last_drop_log_ns: 0, last_state_log_ns: 0 }
     }
 
     /// Feed one bus event; returns any calibration updates produced.
@@ -194,6 +196,19 @@ impl CalibCore {
     /// Sample + boundary-fit pass at time `now` (also callable from a timer).
     pub fn tick(&mut self, now: i64) -> Vec<CalibUpdate> {
         let mut out = Vec::new();
+        // throttled state dump: is the pipeline stuck at Meta (0 events),
+        // sampling (0 rows), or the boundary fit (rows but no fit)?
+        if now - self.last_state_log_ns > 60_000_000_000 {
+            let summ: Vec<String> = self.events.iter()
+                .map(|(k, st)| format!("{}:rows={} tte={:.0} y_ns={} fitted={}",
+                     k.rsplit('-').next().unwrap_or(k), st.rows.len(),
+                     (st.expiry_ns - now) as f64 / 1e9, st.y_ns > 0, st.fitted))
+                .collect();
+            tracing::info!(target: "fit", "calib state: {} events [{}] ref_fresh={}",
+                self.events.len(), summ.join(" | "),
+                self.ref_ns > 0 && now - self.ref_ns <= self.cfg.stale_ms * 1_000_000);
+            self.last_state_log_ns = now;
+        }
         let cfg = &self.cfg;
         for (inst, st) in self.events.iter_mut() {
             let tte_s = (st.expiry_ns - now) as f64 / 1e9;
