@@ -113,19 +113,19 @@ fn num(v: Option<&Value>) -> Option<f64> {
     v.and_then(|x| x.as_str().and_then(|s| s.parse().ok()).or_else(|| x.as_f64()))
 }
 
-fn publish(bus: &dyn Bus, venue: &'static str, bid: f64, bid_sz: f64, ask: f64, ask_sz: f64, recv: i64, seq: &mut u64) {
-    publish_ts(bus, venue, bid, bid_sz, ask, ask_sz, recv, recv, seq);
+fn publish(bus: &dyn Bus, venue: &'static str, symbol: &str, bid: f64, bid_sz: f64, ask: f64, ask_sz: f64, recv: i64, seq: &mut u64) {
+    publish_ts(bus, venue, symbol, bid, bid_sz, ask, ask_sz, recv, recv, seq);
 }
 
-fn publish_ts(bus: &dyn Bus, venue: &'static str, bid: f64, bid_sz: f64, ask: f64, ask_sz: f64, exch: i64, recv: i64, seq: &mut u64) {
+fn publish_ts(bus: &dyn Bus, venue: &'static str, symbol: &str, bid: f64, bid_sz: f64, ask: f64, ask_sz: f64, exch: i64, recv: i64, seq: &mut u64) {
     *seq += 1;
     bus.publish(Event::new(
-        format!("market.{venue}.BTC.book"),
+        format!("market.{venue}.{symbol}.book"),
         venue,
         recv,
         *seq,
         Payload::Book(BookUpdate {
-            instrument: format!("{venue}.BTC"),
+            instrument: format!("{venue}.{symbol}"),
             bids: vec![(bid, bid_sz)],
             asks: vec![(ask, ask_sz)],
             update_id: None,
@@ -173,7 +173,8 @@ async fn coinbase_session(cfg: &CryptoSpotCfg, bus: &Arc<dyn Bus>) -> anyhow::Re
                 let (Some(bid), Some(ask)) = (num(v.get("best_bid")), num(v.get("best_ask"))) else { continue };
                 let bsz = num(v.get("best_bid_size")).unwrap_or(0.0);
                 let asz = num(v.get("best_ask_size")).unwrap_or(0.0);
-                publish(&**bus, "coinbase", bid, bsz, ask, asz, now_ns(), &mut seq);
+                let sym = cfg.coinbase_product.split('-').next().unwrap_or("BTC");
+                publish(&**bus, "coinbase", sym, bid, bsz, ask, asz, now_ns(), &mut seq);
             }
             Some(Ok(Message::Ping(p))) => {
                 ws.send(Message::Pong(p)).await?;
@@ -215,7 +216,7 @@ async fn binanceus_session(cfg: &CryptoSpotCfg, bus: &Arc<dyn Bus>) -> anyhow::R
                 let (Some(bid), Some(ask)) = (num(v.get("b")), num(v.get("a"))) else { continue };
                 let bsz = num(v.get("B")).unwrap_or(0.0);
                 let asz = num(v.get("A")).unwrap_or(0.0);
-                publish(&**bus, "binanceus", bid, bsz, ask, asz, now_ns(), &mut seq);
+                publish(&**bus, "binanceus", "BTC", bid, bsz, ask, asz, now_ns(), &mut seq);
             }
             Some(Ok(Message::Ping(p))) => {
                 ws.send(Message::Pong(p)).await?;
@@ -272,7 +273,7 @@ async fn kraken_session(cfg: CryptoSpotCfg, bus: Arc<dyn Bus>) -> anyhow::Result
                 let (Some(bid), Some(ask)) = (num(d.get("bid")), num(d.get("ask"))) else { continue };
                 let bsz = num(d.get("bid_qty")).unwrap_or(0.0);
                 let asz = num(d.get("ask_qty")).unwrap_or(0.0);
-                publish(&*bus, "kraken", bid, bsz, ask, asz, now_ns(), &mut seq);
+                publish(&*bus, "kraken", "BTC", bid, bsz, ask, asz, now_ns(), &mut seq);
             }
             Some(Ok(Message::Ping(p))) => ws.send(Message::Pong(p)).await?,
             Some(Ok(Message::Close(_))) | None => anyhow::bail!("ws closed"),
@@ -315,7 +316,7 @@ async fn bitstamp_session(cfg: CryptoSpotCfg, bus: Arc<dyn Bus>) -> anyhow::Resu
                     .and_then(|x| x.as_str().and_then(|s| s.parse::<i64>().ok()))
                     .map(|us| us * 1_000)
                     .unwrap_or_else(now_ns);
-                publish_ts(&*bus, "bitstamp", bid, bsz, ask, asz, exch, now_ns(), &mut seq);
+                publish_ts(&*bus, "bitstamp", "BTC", bid, bsz, ask, asz, exch, now_ns(), &mut seq);
             }
             Some(Ok(Message::Ping(p))) => ws.send(Message::Pong(p)).await?,
             Some(Ok(Message::Close(_))) | None => anyhow::bail!("ws closed"),
@@ -361,7 +362,7 @@ async fn gemini_session(cfg: CryptoSpotCfg, bus: Arc<dyn Bus>) -> anyhow::Result
                     }
                 }
                 if changed && bid > 0.0 && ask > 0.0 {
-                    publish(&*bus, "gemini", bid, bsz, ask, asz, now_ns(), &mut seq);
+                    publish(&*bus, "gemini", "BTC", bid, bsz, ask, asz, now_ns(), &mut seq);
                 }
             }
             Some(Ok(Message::Ping(p))) => ws.send(Message::Pong(p)).await?,
