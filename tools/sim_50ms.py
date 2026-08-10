@@ -155,7 +155,7 @@ def fetch_meta(tickers, cache_path):
 # Sampler-native feature columns (run.feature_extras in the live config): carried
 # through by NAME when present in the CSV header, nan otherwise. Models whose
 # extras match a column name get the ONLINE-computed value fed directly.
-FEAT_COLS = ("band5", "vsurge120_1200")
+FEAT_COLS = ("band5", "vsurge120_1200", "imb20", "imb1", "imb5", "imb100", "imb1avg10")
 
 
 def load_samples(path, cb_stale_ms=5000.0):
@@ -188,6 +188,16 @@ def load_samples(path, cb_stale_ms=5000.0):
                         age_out = age
                     if b_px > 0 and a_px > 0 and 0 <= age <= cb_stale_ms:
                         cbmid = (b_px + a_px) / 2.0
+                # kraken BBO mid (venue columns since 2026-08-01 22:53Z).
+                # BBO semantics: the ticker pushes on CHANGE only — an old
+                # quote is an unchanged resting book, still the current state.
+                # Gate at 60s (feed-death guard), NOT the cb trade-quote 5s.
+                krmid = float("nan")
+                kr_b, kr_a, kr_age = r.get("kr_bid"), r.get("kr_ask"), r.get("kr_age_ms")
+                if kr_b is not None and kr_a is not None and kr_age is not None:
+                    b_px, a_px, age = float(kr_b), float(kr_a), float(kr_age)
+                    if b_px > 0 and a_px > 0 and 0 <= age <= 60_000:
+                        krmid = (b_px + a_px) / 2.0
                 fx = []
                 for c in FEAT_COLS:
                     v = r.get(c)
@@ -206,6 +216,7 @@ def load_samples(path, cb_stale_ms=5000.0):
                         imb1,
                         cbmid,
                         age_out,
+                        krmid,
                     )
                     + tuple(fx)
                 )
@@ -215,17 +226,18 @@ def load_samples(path, cb_stale_ms=5000.0):
     for t, rows in ev.items():
         rows.sort()
         a = np.array(rows, dtype=np.float64)
-        out[t] = {"ts": a[:, 0], "tte": a[:, 1], "spot": a[:, 2], "ybid": a[:, 3], "yask": a[:, 4], "imb1n": a[:, 5], "cbmid": a[:, 6], "cb_age": a[:, 7]}
+        out[t] = {"ts": a[:, 0], "tte": a[:, 1], "spot": a[:, 2], "ybid": a[:, 3], "yask": a[:, 4], "imb1n": a[:, 5], "cbmid": a[:, 6], "cb_age": a[:, 7], "krmid": a[:, 8]}
         for i, c in enumerate(FEAT_COLS):
-            out[t][c] = a[:, 8 + i]
+            out[t][c] = a[:, 9 + i]
     return out
 
 
 def build_surface(js):
     hid = js["arch"]["hidden"]
     n_extra = len(js.get("extras", []))
-    # two-price surface (px2cb_mom): input [z'_perp, z'_cb, ln tau] + extras
-    n_chan = 3 if js.get("rho_cb") is not None else 2
+    # two-price surface (px2cb_mom): input [z'_perp, z'_cb, ln tau] + extras;
+    # three-price (rho_kr present): [z'_perp, z'_cb, z'_kr, ln tau] + extras
+    n_chan = 2 + (js.get("rho_cb") is not None) + (js.get("rho_kr") is not None)
     net = nn.Sequential(nn.Linear(n_chan + n_extra, hid), nn.Tanh(), nn.Linear(hid, hid), nn.Tanh(), nn.Linear(hid, 1))
     lin = [m for m in net if isinstance(m, nn.Linear)]
     for m, lw in zip(lin, js["layers"]):
@@ -235,10 +247,12 @@ def build_surface(js):
 
 
 def make_fwd(net, mode, clamp):
-    def fwd(zp, log_tau, extra=None, zp2=None):
+    def fwd(zp, log_tau, extra=None, zp2=None, zp3=None):
         cols = [zp.unsqueeze(-1)]
         if zp2 is not None:
             cols.append(zp2.unsqueeze(-1))
+        if zp3 is not None:
+            cols.append(zp3.unsqueeze(-1))
         cols.append(log_tau.unsqueeze(-1))
         if extra is not None and extra.shape[-1] > 0:
             cols.append(extra)
@@ -252,16 +266,20 @@ def make_fwd(net, mode, clamp):
     return fwd
 
 
-def logit_of(fwd, spot, tte, b, s, extra=None, cb=None, cb_mult=None):
+def logit_of(fwd, spot, tte, b, s, extra=None, cb=None, cb_mult=None, kr=None, kr_mult=None):
     """Single-price: (spot, b, s). Two-price (cb + cb_mult given): the second
     channel is z'_cb = ((cb - b)/(s*cb_mult))/sqrt(tau) — cb_mult =
-    exp(rho_cb - rho_bar), so shared (b, dr) exactly as in training."""
+    exp(rho_cb - rho_bar), so shared (b, dr) exactly as in training. Third
+    channel (kr + kr_mult = exp(rho_kr - rho_bar)) analogous."""
     tau = (tte / 900.0).clamp(1e-4, 1.0)
     zp = ((spot - b) / s) / tau.sqrt()
     zp2 = None
     if cb is not None:
         zp2 = ((cb - b) / (s * cb_mult)) / tau.sqrt()
-    return fwd(zp, tau.log(), extra, zp2)
+    zp3 = None
+    if kr is not None:
+        zp3 = ((kr - b) / (s * kr_mult)) / tau.sqrt()
+    return fwd(zp, tau.log(), extra, zp2, zp3)
 
 
 def load_feat_file(path):
@@ -290,7 +308,7 @@ def fee(p):
     return FEE_RATE * p * (1.0 - p)
 
 
-def fit_event(fwd, spot, tte, target, strike, rho_bar, b_scale, steps=FIT_STEPS, init=None, extra=None, cb=None, cb_mult=None):
+def fit_event(fwd, spot, tte, target, strike, rho_bar, b_scale, steps=FIT_STEPS, init=None, extra=None, cb=None, cb_mult=None, kr=None, kr_mult=None):
     db = torch.tensor([init[0]] if init else [0.0], requires_grad=True)
     dr = torch.tensor([init[1]] if init else [0.0], requires_grad=True)
     opt = torch.optim.Adam([db, dr], lr=FIT_LR)
@@ -298,10 +316,11 @@ def fit_event(fwd, spot, tte, target, strike, rho_bar, b_scale, steps=FIT_STEPS,
     tt = torch.tensor(tte, dtype=torch.float32)
     xx = torch.tensor(extra, dtype=torch.float32) if extra is not None else None
     cc = torch.tensor(cb, dtype=torch.float32) if cb is not None else None
+    kk = torch.tensor(kr, dtype=torch.float32) if kr is not None else None
     y = torch.tensor(np.clip(target, P_CLIP, 1 - P_CLIP), dtype=torch.float32)
     for _ in range(steps):
         opt.zero_grad()
-        lo = logit_of(fwd, ts, tt, strike + b_scale * db, torch.exp(rho_bar + dr), xx, cc, cb_mult)
+        lo = logit_of(fwd, ts, tt, strike + b_scale * db, torch.exp(rho_bar + dr), xx, cc, cb_mult, kk, kr_mult)
         nn.functional.binary_cross_entropy_with_logits(lo, y).backward()
         opt.step()
     return db.detach(), dr.detach()
