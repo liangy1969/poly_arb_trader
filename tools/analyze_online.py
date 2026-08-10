@@ -141,6 +141,32 @@ def prepare(ev, m):
             col[ok] = series[idx[ok]]
             return col
 
+        # adj overlay: reconstruct the adj head's features and precompute the
+        # per-row logit shift d["ADJ"] = w·z + b. NaN rows (probe warmup /
+        # missing imb columns) stay NaN — the '+adj' twin simply cannot trade
+        # there; the BASE model's row mask is NOT affected.
+        ajs = m.get("adj_js")
+        if ajs is not None:
+            an = ajs["extras"]
+            amu = np.array(ajs["mu"]); asd = np.array(ajs["sd"])
+            Xa = np.full((len(ts), len(an)), np.nan)
+            for ci, name in enumerate(an):
+                if name.startswith("pmom"):
+                    lg = lag(d["spot"], int(name[4:]))
+                    Xa[:, ci] = (d["spot"] - lg) / lg
+                elif name.startswith("dmid"):
+                    q = np.clip((d["ybid"] + d["yask"]) / 2.0, 0.01, 0.99)
+                    lmid = np.log(q / (1.0 - q))
+                    Xa[:, ci] = lmid - lag(lmid, int(name[4:]))
+                elif name == "imb1":
+                    Xa[:, ci] = d["imb1n"]
+                elif name in d:
+                    Xa[:, ci] = d[name]
+                else:
+                    sys.exit(f"adj overlay: cannot reconstruct feature {name!r}")
+            Za = np.clip((Xa - amu) / asd, -5, 5)
+            d["ADJ"] = Za @ np.array(ajs["w"]) + float(ajs.get("b", 0.0))
+
         if extras:
             needs_cb = any(c.startswith(("basis", "dbasis")) for c in extras)
             bas = d["cbmid"] - d["spot"] if needs_cb else None
@@ -167,6 +193,12 @@ def prepare(ev, m):
                     X[:, ci] = bas - lag(bas, int(name[6:]))
                 elif name == "imb1":
                     X[:, ci] = d["imb1n"]
+                elif name.startswith("dmid"):
+                    # Kalshi-mid logit change over k seconds (adj-model input);
+                    # clip matches the offline P_CLIP=0.01
+                    q = np.clip((d["ybid"] + d["yask"]) / 2.0, 0.01, 0.99)
+                    lmid = np.log(q / (1.0 - q))
+                    X[:, ci] = lmid - lag(lmid, int(name[4:]))
                 elif name in d:
                     # sampler-native column (band5, vsurge120_1200, ...): the
                     # ONLINE-computed feature value, fed by name.
@@ -218,12 +250,13 @@ def load_live_calib(path):
     return out
 
 
-def fair_series(d, m, strike, rho, b_scale, fwd, tte_max, fit_window, refit_step=60, demean_window=0.0, latency_ms=0.0, live_cal=None):
+def fair_series(d, m, strike, rho, b_scale, fwd, tte_max, fit_window, refit_step=60, demean_window=0.0, latency_ms=0.0, live_cal=None, fit_stride=None):
     """Windowed refit at each `refit_step`-second boundary; returns the causal
     fair series on the scan grid (the live Calibrator's semantics). If
     `demean_window>0`, also returns `gbar` = the trailing mean of (fair-mid) over
     that past window, recomputed with the CURRENT params at 1s resolution."""
-    fit_sl = slice(None, None, FIT_STRIDE)
+    fs = fit_stride if fit_stride is not None else FIT_STRIDE
+    fit_sl = slice(None, None, fs)
     scan = d["tte"] <= tte_max
     ss = slice(None, None, SCAN_STRIDE)
     spot_p, tte_p = d["spot"][scan][ss], d["tte"][scan][ss]
@@ -296,7 +329,7 @@ def fair_series(d, m, strike, rho, b_scale, fwd, tte_max, fit_window, refit_step
                 # then a trailing mean per scan point = "the mean gap the model
                 # currently sees". Entry later fires on gap - gbar.
                 gm = (d["tte"] > B - int(refit_step)) & (d["tte"] <= B + demean_window)
-                gi = np.where(gm)[0][::FIT_STRIDE]
+                gi = np.where(gm)[0][::fs]
                 if len(gi) >= 5:
                     g_tte = d["tte"][gi]
                     with torch.no_grad():
@@ -524,9 +557,9 @@ def generate_trades(sig, m_label, gap, fair, mid_p, tte_p, ybid_p, yask_p, ts_p,
                 # lookback row's raw inputs under the CURRENT calibration
                 # (refit-jump immune), not read from the stored causal series.
                 j = k - 1
-                while j > 0 and (tte_p[j] - tte_p[k]) < 1.0 and (k - j) < 400:
+                while j > 0 and (tte_p[j] - tte_p[k]) < a.lookback_s and (k - j) < 400:
                     j -= 1
-                if j >= 0 and 1.0 <= (tte_p[j] - tte_p[k]) <= 10.0:
+                if j >= 0 and a.lookback_s <= (tte_p[j] - tte_p[k]) <= a.lookback_s + 9.0:
                     fair_then = fx_fair(j, k) if fx_fair is not None else float("nan")
                     if math.isnan(fair_then):
                         fair_then = fair[j]
@@ -669,8 +702,87 @@ def generate_trades(sig, m_label, gap, fair, mid_p, tte_p, ybid_p, yask_p, ts_p,
     return out
 
 
+def simulate_adj(m, ev, meta, a):
+    """adj-model path: fair = sigmoid(logit(mid) + w·z + b) — a LINEAR head on
+    market-observable features, NO surface, NO per-event (db, dr) calibration.
+    gap = fair − mid ≈ adj·p(1−p) = the predicted forward mid move, so the
+    standard |gap| > delta entry ladder IS "enter when adj > threshold" in
+    price units. Everything downstream (latency fills, fees, ride/none gate,
+    BCE, closure, price buckets) is the shared machinery."""
+    js = m["js"]
+    w = np.array(js["w"], dtype=np.float64)
+    b0 = float(js.get("b", 0.0))
+    pc = float(js.get("p_clip", 0.01))
+    trades, bce_rows = [], []
+    for t in sorted(ev, key=lambda x: ev[x]["ts"][0]):
+        d = ev[t]
+        mm = meta.get(t, {})
+        if mm.get("strike") is None or mm.get("result") not in ("yes", "no"):
+            continue
+        if (d["tte"] <= a.tte_max).sum() < 1000:
+            continue  # need trade-window coverage (no calibration history needed)
+        outc = 1 if mm["result"] == "yes" else 0
+        scan = d["tte"] <= a.tte_max
+        ss = slice(None, None, SCAN_STRIDE)
+        tte_p = d["tte"][scan][ss]
+        ybid_p, yask_p = d["ybid"][scan][ss], d["yask"][scan][ss]
+        ts_p, x_p = d["ts"][scan][ss], d["X"][scan][ss]
+        if len(tte_p) < 50:
+            continue
+        mid_p = (ybid_p + yask_p) / 2.0
+        q = np.clip(mid_p, pc, 1.0 - pc)
+        fair = 1.0 / (1.0 + np.exp(-(np.log(q / (1.0 - q)) + x_p @ w + b0)))
+        gap = fair - mid_p
+        # post-latency executable book (same semantics as fair_series)
+        if a.latency_ms > 0:
+            ts_full = d["ts"][scan]
+            yb_full, ya_full = d["ybid"][scan], d["yask"][scan]
+            idx = np.clip(np.searchsorted(ts_full, ts_p + a.latency_ms, side="left"),
+                          0, len(ts_full) - 1)
+            fill_ybid, fill_yask = yb_full[idx].copy(), ya_full[idx].copy()
+            elapsed = ts_full[idx] - ts_p
+            bad = (elapsed < a.latency_ms * 0.5) | (elapsed > a.latency_ms + 250.0)
+            fill_ybid[bad], fill_yask[bad] = ybid_p[bad], yask_p[bad]
+        else:
+            fill_ybid, fill_yask = ybid_p, yask_p
+
+        gd = a.gap_dist.setdefault(m["label"], {name: [] for name, _, _ in GAP_MID_BUCKETS})
+        win = (tte_p > GAP_TTE_MIN) & (tte_p <= a.tte_max)
+        for name, lomid, himid in GAP_MID_BUCKETS:
+            sel = win & (mid_p >= lomid) & (mid_p < himid)
+            if sel.any():
+                gd[name].extend(gap[sel].tolist())
+        span = (tte_p > GAP_TTE_MIN) & (tte_p <= a.tte_max)
+        if span.sum() >= 20:
+            a.event_calib.setdefault(m["label"], []).append(
+                (float(fair[span].mean() - mid_p[span].mean()), float(mid_p[span].mean())))
+        for hi, lo in BUCKETS:
+            bsel = (tte_p <= hi) & (tte_p > lo)
+            if bsel.sum() < 20:
+                continue
+            fc = np.clip(fair[bsel], 0.005, 0.995)
+            mc = np.clip(mid_p[bsel], 0.005, 0.995)
+            bf = float(-(outc * np.log(fc) + (1 - outc) * np.log(1 - fc)).mean())
+            bm = float(-(outc * np.log(mc) + (1 - outc) * np.log(1 - mc)).mean())
+            bce_rows.append({
+                "ticker": t, "date": utc_date(ts_p[bsel][0]), "bucket": f"{lo:.2f}-{hi:.2f}",
+                "bce_fair": bf, "bce_mkt": bm, "d": bf - bm,
+                "brier_fair": float(((fc - outc) ** 2).mean()),
+                "brier_mkt": float(((mc - outc) ** 2).mean()),
+                "mae": float(np.abs(fair[bsel] - mid_p[bsel]).mean()),
+            })
+        # raw-gap entries only (no demeaned variant: the adj head has no
+        # per-event calibration whose bias dm30 would strip)
+        trades += generate_trades(gap, m["label"], gap, fair, mid_p,
+                                  tte_p, ybid_p, yask_p, ts_p, outc, t, a,
+                                  fill_ybid, fill_yask, fx_fair=None, cb_age_p=None)
+    return trades, bce_rows
+
+
 def simulate(m, ev, meta, a):
     """-> (trades, bce_rows). One pass per event; all deltas scored together."""
+    if m["js"].get("kind") == "adj":
+        return simulate_adj(m, ev, meta, a)
     net_s, mode, clamp = sim.build_surface(m["js"])
     fwd = sim.make_fwd(net_s, mode, clamp)
     rho = torch.tensor(float(m["js"]["rho_bar"]))
@@ -692,7 +804,7 @@ def simulate(m, ev, meta, a):
         (ts_p, tte_p, ybid_p, yask_p, fair, gbar, fill_ybid, fill_yask,
          dbs_p, drs_p, spot_p, x_p, cb_p, cb_age_p, kr_p) = fair_series(
             d, m, strike, rho, b_scale, fwd, a.tte_max, a.fit_window, a.refit_step,
-            a.demean_window, a.latency_ms, live_cal=lc)
+            a.demean_window, a.latency_ms, live_cal=lc, fit_stride=a.fit_stride)
         if len(tte_p) < 50:
             continue
         mid_p = (ybid_p + yask_p) / 2.0
@@ -793,13 +905,26 @@ def simulate(m, ev, meta, a):
         # recomputed with the current params) when --demean-window > 0. Demeaned
         # trades are labeled `<model>.dm<W>` so ONE run reports raw vs demeaned
         # side by side in every section.
-        strats = [("", gap)]
+        strats = [("", gap, gap, fair, fx_fair)]
         if a.demean_window > 0:
-            strats.append((f".dm{int(a.demean_window)}", gap - gbar))
-        for suffix, sig in strats:
-            trades += generate_trades(sig, m["label"] + suffix, gap, fair, mid_p,
+            strats.append((f".dm{int(a.demean_window)}", gap - gbar, gap, fair, fx_fair))
+        # '+adj' twin: fair shifted by the adj head's predicted forward mid
+        # move (logit space). Same rows, same fills, same gate machinery — the
+        # ride gate's push now includes the fast forecast. dm variant reuses
+        # the BASE gbar (adj mean-reverts in ~10s; its 30s trailing mean is
+        # ~0, so gap2 − gbar ≈ demeaned base gap + adj innovation).
+        if "ADJ" in d:
+            adjv = d["ADJ"][np.searchsorted(d["ts"], ts_p)]
+            fc = np.clip(fair, 0.005, 0.995)
+            fair2 = 1.0 / (1.0 + np.exp(-(np.log(fc / (1.0 - fc)) + adjv)))
+            gap2 = fair2 - mid_p
+            strats.append(("+adj", gap2, gap2, fair2, None))
+            if a.demean_window > 0:
+                strats.append((f"+adj.dm{int(a.demean_window)}", gap2 - gbar, gap2, fair2, None))
+        for suffix, sig, g_, f_, fx_ in strats:
+            trades += generate_trades(sig, m["label"] + suffix, g_, f_, mid_p,
                                       tte_p, ybid_p, yask_p, ts_p, outc, t, a,
-                                      fill_ybid, fill_yask, fx_fair=fx_fair,
+                                      fill_ybid, fill_yask, fx_fair=fx_,
                                       # live parity: the stale veto only guards
                                       # 2-price surfaces (rule.rs two_price())
                                       cb_age_p=cb_age_p if cbm is not None else None)
@@ -834,6 +959,7 @@ def report(trades, bce_rows, a, models):
     for m in models:
         labels.append(m["label"])
         labels += sorted(l for l in seen if l.startswith(m["label"] + ".dm"))
+        labels += sorted(l for l in seen if l.startswith(m["label"] + "+adj"))
 
     lat = a.latency_ms > 0
     for tag, T in panels(trades, a.fresh_from):
@@ -1145,8 +1271,14 @@ def main():
                    help="entry window in seconds to expiry")
     p.add_argument("--fit-window", type=float, default=120.0,
                    help="rolling (db,dr) fit window in s (0 = expanding)")
-    p.add_argument("--refit-step", type=float, default=60.0,
-                   help="refit frequency in s (live default 60; smaller = fresher params)")
+    p.add_argument("--fit-sample-ms", type=float, default=1000.0,
+                   help="calibration fit sample resolution (ms); live=1000. "
+                        "converted to a scan-grid stride internally (50ms grid)")
+    p.add_argument("--refit-step", type=float, default=15.0,
+                   help="refit frequency in s (default 15 = the LIVE calibrator's "
+                        "cadence, 2026-08-10; was 60 — 4x fewer fits, faster runs, "
+                        "but a different (db,dr) path that misses live's marginal "
+                        "crossings; see the Aug-8/9 loss debug)")
     p.add_argument("--demean-window", type=float, default=0.0,
                    help="if >0, entry fires on gap MINUS its trailing mean over "
                         "this window (s), the mean recomputed with the current "
@@ -1157,6 +1289,9 @@ def main():
                         "overreact = fade a market overshoot (gap flipped past fair, "
                         "mid moved >> fair, same direction)")
     p.add_argument("--ride-share", type=float, default=0.75)
+    p.add_argument("--lookback-s", type=float, default=1.0,
+                   help="ride-gate lookback (s): reference = youngest sample at "
+                        "least this old (live lookback_min_ms/1000; default 1.0)")
     p.add_argument("--ride-open", type=float, default=None,
                    help="ride-gate open_min; DEFAULT = the gap threshold (delta), "
                         "per the 2026-08-03 convention (live open_min: 0.02 = delta)")
@@ -1219,11 +1354,19 @@ def main():
                    help="split every table in-sample vs fresh at this UTC date")
     p.add_argument("--meta-cache", default="",
                    help="Kalshi meta cache json (default: beside the samples)")
+    p.add_argument("--adj-overlay", default="", metavar="PATH",
+                   help="adj-head JSON (kind=adj): every surface model also "
+                        "runs a '+adj' twin with fair2 = sigmoid(logit(fair) + "
+                        "w.z + b) — the fast mid-forecast stacked on the "
+                        "calibrated fair; same rows, fills and gate machinery")
     p.add_argument("--out-dir", default="", help="write trades/bce/summary CSVs here")
     p.add_argument("--dump-fair", default="", metavar="PATH",
                    help="also write the causal fair series (ticker,ts_ms,tte_s,"
                         "fair,mid) here — for replay-parity checks")
     a = p.parse_args()
+
+    # fit sample resolution -> scan-grid stride (grid = 50ms * SCAN_STRIDE)
+    a.fit_stride = max(1, round(a.fit_sample_ms / (50.0 * SCAN_STRIDE)))
 
     a.live_calib = None
     if a.calib_from_live:
@@ -1243,6 +1386,14 @@ def main():
         BUCKETS[:0] = [b for b in BUCKETS_EARLY if b[1] < a.tte_max]
     paths = a.samples.split(",")
     models = [parse_model(s) for s in a.model]
+    if a.adj_overlay:
+        adj_js = json.load(open(a.adj_overlay))
+        assert adj_js.get("kind") == "adj", "--adj-overlay expects an adj-head JSON"
+        for m in models:
+            if m["js"].get("kind") != "adj":       # surfaces only
+                m["adj_js"] = adj_js
+        print(f"adj overlay: {a.adj_overlay} (h={adj_js.get('h')}) -> "
+              f"'+adj' twin for every surface model")
 
     print(f"loading {len(paths)} sample file(s)...")
     ev = {}
