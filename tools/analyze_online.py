@@ -779,6 +779,27 @@ def simulate_adj(m, ev, meta, a):
     return trades, bce_rows
 
 
+_WORKER_CACHE = {}
+
+
+def _fs_worker(payload):
+    """Worker-process entry: fair_series for ONE event. The per-event (db, dr)
+    fits are independent, so events parallelize perfectly; the torch surface is
+    rebuilt once per (worker, model) and cached by the model's path."""
+    key, js, cb_mult, kr_mult, t, d, strike, lc, fsargs, fit_stride = payload
+    torch.set_num_threads(1)  # tiny per-fit tensors; intra-op threads only add overhead
+    ent = _WORKER_CACHE.get(key)
+    if ent is None:
+        net_s, mode, clamp = sim.build_surface(js)
+        ent = (sim.make_fwd(net_s, mode, clamp),
+               torch.tensor(float(js["rho_bar"])), float(js.get("b_scale", 50.0)))
+        _WORKER_CACHE[key] = ent
+    fwd, rho, b_scale = ent
+    mm = {"js": js, "cb_mult": cb_mult, "kr_mult": kr_mult}
+    return t, fair_series(d, mm, strike, rho, b_scale, fwd, *fsargs,
+                          live_cal=lc, fit_stride=fit_stride)
+
+
 def simulate(m, ev, meta, a):
     """-> (trades, bce_rows). One pass per event; all deltas scored together."""
     if m["js"].get("kind") == "adj":
@@ -789,6 +810,8 @@ def simulate(m, ev, meta, a):
     b_scale = float(m["js"].get("b_scale", 50.0))
     trades, bce_rows = [], []
 
+    # eligibility pass (meta + coverage + live-calib), preserving event order
+    elig = []
     for t in sorted(ev, key=lambda x: ev[x]["ts"][0]):
         d = ev[t]
         mm = meta.get(t, {})
@@ -801,10 +824,31 @@ def simulate(m, ev, meta, a):
         lc = a.live_calib.get(t) if getattr(a, "live_calib", None) else None
         if getattr(a, "live_calib", None) and lc is None:
             continue  # consistency mode: live never calibrated this event
+        elig.append((t, strike, outc, lc))
+
+    # fair_series precompute — the fit-dominated part — across a process pool.
+    # Results are bit-identical to the serial path (same inputs, same init,
+    # single-threaded torch either way); only wall-clock changes.
+    fsargs = (a.tte_max, a.fit_window, a.refit_step, a.demean_window, a.latency_ms)
+    payloads = [(m["path"], m["js"], m["cb_mult"], m.get("kr_mult"),
+                 t, ev[t], strike, lc, fsargs, a.fit_stride)
+                for t, strike, outc, lc in elig]
+    series = {}
+    jobs = getattr(a, "jobs", 1)
+    if jobs > 1 and len(payloads) > 1:
+        import concurrent.futures as _cf
+        with _cf.ProcessPoolExecutor(max_workers=min(jobs, len(payloads))) as ex:
+            for t, res in ex.map(_fs_worker, payloads, chunksize=1):
+                series[t] = res
+    else:
+        for p in payloads:
+            t, res = _fs_worker(p)
+            series[t] = res
+
+    for t, strike, outc, lc in elig:
+        d = ev[t]
         (ts_p, tte_p, ybid_p, yask_p, fair, gbar, fill_ybid, fill_yask,
-         dbs_p, drs_p, spot_p, x_p, cb_p, cb_age_p, kr_p) = fair_series(
-            d, m, strike, rho, b_scale, fwd, a.tte_max, a.fit_window, a.refit_step,
-            a.demean_window, a.latency_ms, live_cal=lc, fit_stride=a.fit_stride)
+         dbs_p, drs_p, spot_p, x_p, cb_p, cb_age_p, kr_p) = series[t]
         if len(tte_p) < 50:
             continue
         mid_p = (ybid_p + yask_p) / 2.0
@@ -1354,6 +1398,10 @@ def main():
                    help="split every table in-sample vs fresh at this UTC date")
     p.add_argument("--meta-cache", default="",
                    help="Kalshi meta cache json (default: beside the samples)")
+    p.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 4) - 2),
+                   help="worker processes for the per-event calibration fits "
+                        "(default: cores-2; 1 = serial). Results are identical "
+                        "either way — fits are per-event independent.")
     p.add_argument("--adj-overlay", default="", metavar="PATH",
                    help="adj-head JSON (kind=adj): every surface model also "
                         "runs a '+adj' twin with fair2 = sigmoid(logit(fair) + "
