@@ -417,6 +417,18 @@ async fn lifecycle_task(
                 _ => {}
             }
         }
+
+        // Race-proof Meta delivery: the FIRST discovery cycle can run before
+        // downstream modules (calibrator/processor) have subscribed, losing the
+        // current market's Meta forever (metas were only re-published on
+        // lifecycle transitions — found arming the ETH trader, whose restarts
+        // land mid-window). Republishing every cycle is idempotent for all
+        // consumers (or_insert / overwrite) and costs ≤ n_windows metas / 30s.
+        for m in markets.values() {
+            if m.phase != Phase::Expired {
+                publish_catalog(&*bus, m, &cfg.kind, &mut seq);
+            }
+        }
         markets.retain(|_, m| !(m.phase == Phase::Expired && now >= m.close_ns + grace_ns));
 
         let desired = build_desired(&markets);
