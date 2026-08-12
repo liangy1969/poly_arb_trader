@@ -33,6 +33,8 @@ pub struct RunCfg {
     /// (e.g. ["band5", "vsurge120_1200"]); names as understood by
     /// `FeatureState::feats`. Empty = no extra columns.
     pub feature_extras: Vec<String>,
+    /// OB flow_vol probe columns (18 ob_* sampler columns; needs .volb feed).
+    pub ob_features: bool,
     /// Deep-book bus instrument for band{k} features (the `binance_depth`
     /// collector's instrument). Empty = no depth routing.
     pub depth_instrument: String,
@@ -47,6 +49,7 @@ impl Default for RunCfg {
             perp_instrument: "binance.usdt_perp.BTCUSDT".into(),
             cb_product: "BTC-USD".into(),
             feature_extras: Vec::new(),
+            ob_features: false,
             depth_instrument: String::new(),
         }
     }

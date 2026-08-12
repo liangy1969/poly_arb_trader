@@ -250,6 +250,7 @@ async fn main() -> anyhow::Result<()> {
         let spot_inst = cfg.binance_spot.as_ref().map(|c| c.instrument.clone()).unwrap_or_default();
         // extra feature columns (band5/vsurge/...) — sampler-owned config
         let feat_extras = cfg.run.feature_extras.clone();
+        let ob_on = cfg.run.ob_features;
         let depth_ref = cfg.run.depth_instrument.clone();
         let vol_inst = format!("{}.vol", cfg.run.perp_instrument);
         let mut sub = bus.subscribe("market.#", 8192, Policy::Conflate(key_by_instrument));
@@ -281,6 +282,8 @@ async fn main() -> anyhow::Result<()> {
             // probe features (band5/vsurge/...) reconstructed in-sampler so
             // every 50ms row carries them (empty extras = no extra columns).
             let mut feats = arb_processor::FeatureState::new(feat_extras.clone());
+            let mut obf = ob_on.then(arb_processor::ObFeats::new);
+            let volb_inst = format!("{vol_inst}b");
             let mut last_cb_push: i64 = 0;
             let mut books: HashMap<String, KTop> = HashMap::new();
             let mut expiry: HashMap<String, i64> = HashMap::new();
@@ -300,13 +303,34 @@ async fn main() -> anyhow::Result<()> {
                                     if !feat_extras.is_empty() && pb > 0.0 && pa > 0.0 {
                                         feats.on_perp(b.recv_ts_ns, 0.5 * (pb + pa), pbs, pas);
                                     }
+                                    if let Some(o) = obf.as_mut() {
+                                        o.on_tob(b.recv_ts_ns, pb, pa, pbs, pas);
+                                    }
                                 }
                             }
-                            Payload::Book(b) if !feat_extras.is_empty() && !depth_ref.is_empty() && b.instrument == depth_ref => {
-                                feats.on_depth(b.recv_ts_ns, &b.bids, &b.asks);
+                            Payload::Book(b) if (!feat_extras.is_empty() || ob_on) && !depth_ref.is_empty() && b.instrument == depth_ref => {
+                                if !feat_extras.is_empty() {
+                                    feats.on_depth(b.recv_ts_ns, &b.bids, &b.asks);
+                                }
+                                if let Some(o) = obf.as_mut() {
+                                    let b5: f64 = b.bids.iter().take(5).map(|&(_, q)| q).sum();
+                                    let a5: f64 = b.asks.iter().take(5).map(|&(_, q)| q).sum();
+                                    o.on_depth5(b.recv_ts_ns, b5, a5);
+                                }
                             }
-                            Payload::Trade(t) if !feat_extras.is_empty() && t.instrument == vol_inst => {
-                                feats.on_perp_trade(t.recv_ts_ns, t.qty); // cumulative volume
+                            Payload::Trade(t) if (!feat_extras.is_empty() || ob_on) && t.instrument == vol_inst => {
+                                if !feat_extras.is_empty() {
+                                    feats.on_perp_trade(t.recv_ts_ns, t.qty); // cumulative volume
+                                }
+                                if let Some(o) = obf.as_mut() {
+                                    o.on_vol(t.recv_ts_ns, t.qty);
+                                }
+                            }
+                            Payload::Trade(t) if ob_on && t.instrument == volb_inst => {
+                                if let Some(o) = obf.as_mut() {
+                                    // qty = cumulative BUY volume, price = cumulative count
+                                    o.on_volb(t.recv_ts_ns, t.qty, t.price);
+                                }
                             }
                             Payload::Book(b) if !spot_inst.is_empty() && b.instrument == spot_inst => {
                                 if let (Some(&(sb, sbs)), Some(&(sa, sas))) = (b.bids.first(), b.asks.first()) {
@@ -378,6 +402,12 @@ async fn main() -> anyhow::Result<()> {
                                             hdr.push(',');
                                             hdr.push_str(n);
                                         }
+                                        if ob_on {
+                                            for n in arb_processor::OB_FEATS.iter() {
+                                                hdr.push(',');
+                                                hdr.push_str(n);
+                                            }
+                                        }
                                         let _ = writeln!(w, "{hdr}");
                                     }
                                     out = Some((day, w));
@@ -420,6 +450,21 @@ async fn main() -> anyhow::Result<()> {
                             }
                             s
                         };
+                        let ob_cols = if let Some(o) = obf.as_mut() {
+                            o.roll(now);
+                            let mut s = String::new();
+                            for v in o.latest().iter() {
+                                s.push(',');
+                                if v.is_finite() {
+                                    s.push_str(&format!("{v:.6}"));
+                                } else {
+                                    s.push_str("nan");
+                                }
+                            }
+                            s
+                        } else {
+                            String::new()
+                        };
                         for (mid, k) in &books {
                             if k.expiry_ns == 0 || (k.yask <= 0.0 && k.ybid <= 0.0) {
                                 continue;
@@ -430,13 +475,13 @@ async fn main() -> anyhow::Result<()> {
                             }
                             let _ = writeln!(
                                 w,
-                                "{},{},{},{:.2},{:.2},{:.3},{:.3},{:.1},{:.1},{:.2},{:.2},{},{:.3},{:.3},{:.4},{:.4},{},{},{:.2},{:.2},{:.4},{:.4},{},{:.2},{:.2},{:.4},{:.4},{},{:.2},{:.2},{:.4},{:.4},{},{:.2},{:.2},{:.4},{:.4},{}{}",
+                                "{},{},{},{:.2},{:.2},{:.3},{:.3},{:.1},{:.1},{:.2},{:.2},{},{:.3},{:.3},{:.4},{:.4},{},{},{:.2},{:.2},{:.4},{:.4},{},{:.2},{:.2},{:.4},{:.4},{},{:.2},{:.2},{:.4},{:.4},{},{:.2},{:.2},{:.4},{:.4},{}{}{}",
                                 now / 1_000_000, mid, tte_ms, pb, pa, k.ybid, k.yask, k.ybsz, k.yasz,
                                 cb_b, cb_a, cb_age_ms, pbs, pas, cb_bs, cb_as, perp_age_ms, cb_srv_age_ms,
                                 sp_b, sp_a, sp_bs, sp_as, spot_age_ms,
                                 kr_b, kr_a, kr_bs, kr_as, kr_age_ms,
                                 bs_b, bs_a, bs_bs, bs_as, bs_age_ms,
-                                gm_b, gm_a, gm_bs, gm_as, gm_age_ms, feat_cols
+                                gm_b, gm_a, gm_bs, gm_as, gm_age_ms, feat_cols, ob_cols
                             );
                         }
                         n_since_flush += 1;

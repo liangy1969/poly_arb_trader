@@ -4,6 +4,7 @@
 pub mod calib;
 pub mod fair;
 pub mod module;
+pub mod ob_feats;
 
 pub mod rule;
 pub mod state;
@@ -11,6 +12,7 @@ pub mod window;
 
 pub use calib::{CalibCfg, CalibCore, Calibrator};
 pub use fair::{FairSurface, FeatureState, FitRow, MAX_EXTRA};
+pub use ob_feats::{ObFeats, OB_FEATS};
 
 pub use module::{ProcCfg, Processor};
 pub use rule::{FairRideCfg, FairRideRule, PerpMoveRule, Rule, RuleEngine};

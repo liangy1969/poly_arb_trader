@@ -290,11 +290,14 @@ async fn run_loop(cfg: BinanceCfg, http: reqwest::Client, bus: Arc<dyn Bus>) {
     }
 }
 
-/// Parse a combined-stream aggTrade frame → traded qty (base units).
-fn parse_agg_trade_qty(txt: &str) -> Option<f64> {
+/// Parse a combined-stream aggTrade frame → (qty, is_buy_aggressor).
+/// `m` = buyer-is-maker ⇒ the AGGRESSOR was a seller.
+fn parse_agg_trade(txt: &str) -> Option<(f64, bool)> {
     let v: Value = serde_json::from_str(txt).ok()?;
     let d = v.get("data").unwrap_or(&v); // combined stream wraps in {stream,data}
-    d.get("q")?.as_str()?.parse().ok()
+    let q: f64 = d.get("q")?.as_str()?.parse().ok()?;
+    let is_buy = !d.get("m")?.as_bool()?;
+    Some((q, is_buy))
 }
 
 /// aggTrade session: accumulate perp taker volume into a MONOTONE cumulative
@@ -305,6 +308,8 @@ async fn session_aggtrade(
     bus: &Arc<dyn Bus>,
     seq: &mut u64,
     cum_vol: &mut f64,
+    cum_buy: &mut f64,
+    cum_cnt: &mut f64,
 ) -> anyhow::Result<()> {
     let stream = format!("{}@aggTrade", cfg.symbol.to_lowercase());
     // Binance USDT-M futures splits its WS endpoints: `/public` carries only the
@@ -326,6 +331,11 @@ async fn session_aggtrade(
     tracing::info!("ws connected (aggTrade): {}", stream);
     let vol_inst = format!("{}.vol", cfg.instrument);
     let topic = format!("market.binance.usdt_perp.{}.vol", cfg.symbol);
+    // signed-flow sibling: qty = CUMULATIVE BUY volume, price = CUMULATIVE
+    // trade count (cumulative encoding ⇒ conflation-safe; sell = vol − buy).
+    let volb_inst = format!("{}.volb", cfg.instrument);
+    let topic_b = format!("market.binance.usdt_perp.{}.volb", cfg.symbol);
+    let mut last_pub_b = 0i64;
     let stale = Duration::from_secs(cfg.stale_timeout_s.max(30)); // trades can be sparse
     let mut last_pub = 0i64;
     loop {
@@ -334,9 +344,30 @@ async fn session_aggtrade(
             .map_err(|_| anyhow::anyhow!("stale aggTrade stream"))?;
         match msg {
             Some(Ok(Message::Text(t))) => {
-                if let Some(q) = parse_agg_trade_qty(t.as_str()) {
+                if let Some((q, is_buy)) = parse_agg_trade(t.as_str()) {
                     *cum_vol += q;
+                    if is_buy {
+                        *cum_buy += q;
+                    }
+                    *cum_cnt += 1.0;
                     let now = now_ns();
+                    if now - last_pub_b >= 100_000_000 {
+                        bus.publish(Event::new(
+                            topic_b.clone(),
+                            "collector-binance",
+                            now,
+                            nxt(seq),
+                            Payload::Trade(TradeTick {
+                                instrument: volb_inst.clone(),
+                                price: *cum_cnt,   // cumulative TRADE COUNT
+                                qty: *cum_buy,     // cumulative BUY volume
+                                side: Side::Buy,
+                                exch_ts_ns: now,
+                                recv_ts_ns: now,
+                            }),
+                        ));
+                        last_pub_b = now;
+                    }
                     if now - last_pub >= 200_000_000 {
                         // throttle to ~200ms; cumulative ⇒ no volume lost
                         bus.publish(Event::new(
@@ -371,8 +402,10 @@ async fn run_agg_loop(cfg: BinanceCfg, bus: Arc<dyn Bus>) {
     let mut backoff = cfg.reconnect_base_ms;
     let mut seq = 0u64;
     let mut cum_vol = 0.0f64; // persists across reconnects → stays monotone
+    let mut cum_buy = 0.0f64;
+    let mut cum_cnt = 0.0f64;
     loop {
-        match session_aggtrade(&cfg, &bus, &mut seq, &mut cum_vol).await {
+        match session_aggtrade(&cfg, &bus, &mut seq, &mut cum_vol, &mut cum_buy, &mut cum_cnt).await {
             Ok(()) => backoff = cfg.reconnect_base_ms,
             Err(e) => {
                 tracing::warn!("aggTrade session ended ({e}) -> reconnect in {backoff}ms");
