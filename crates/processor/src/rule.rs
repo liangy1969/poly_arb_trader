@@ -304,6 +304,17 @@ pub struct FairRideCfg {
     /// just repriced (sweep 2026-08-01: interior optimum ~100ms; vetoed
     /// entries = perp-led, fade-prone).
     pub stale_veto_ms: f64,
+    /// Entry gate: "ride" (default, unchanged) = model share of the 1s
+    /// gap-opening; "stable" = MARKET-STALE gate (the sim's `--gate stable`):
+    /// the Kalshi mid must have been quiet (range ≤ `stab_max_c`) over the past
+    /// `stab_window_s` while the FAIR moved ≥ `open_min` toward the trade side.
+    /// Any other value is treated as "ride".
+    pub gate: String,
+    /// Stable gate: past window (s) for BOTH the mid-range test and the fair
+    /// move. Requires `lookback_max_ms` ≥ this (the raw ring is the source).
+    pub stab_window_s: f64,
+    /// Stable gate: max mid RANGE (max − min) over the window, in dollars.
+    pub stab_max_c: f64,
 }
 
 impl Default for FairRideCfg {
@@ -330,6 +341,9 @@ impl Default for FairRideCfg {
             ttl_ms: 500,
             demean_window_s: 0.0,
             stale_veto_ms: 0.0,
+            gate: "ride".into(),
+            stab_window_s: 0.5,
+            stab_max_c: 0.03,
         }
     }
 }
@@ -660,7 +674,66 @@ impl FairRideRule {
         // signal but still disarms — now fully visible instead of inferred, and
         // reconcilable line-for-line with the offline replay's gate.
         let back_ms = (now - ts_then) as f64 / 1e6;
-        if !(tot > cfg.open_min && share > cfg.share_min) {
+
+        // ── STABLE gate (cfg.gate == "stable") — MARKET-STALE selection ──
+        // The mid must have been quiet (range ≤ stab_max_c) over the past
+        // stab_window_s while the FAIR moved ≥ open_min toward the trade side.
+        // `fair_then_w` is recomputed from the window-anchor sample's RAW
+        // inputs under the CURRENT (Δb, Δρ) — same convention as the ride
+        // gate's fair_then, so a refit jump cannot masquerade as a fair move.
+        // Offline twin: analyze_online `--gate stable --stab-window --stab-max-c`.
+        if cfg.gate == "stable" {
+            let w_ns = (cfg.stab_window_s * 1e9) as i64;
+            let w_lo = now - w_ns;
+            let mut mid_min = mid;
+            let mut mid_max = mid;
+            let mut anchor: Option<(i64, f64, f64, f64, [f64; MAX_EXTRA])> = None;
+            for s in st.ring.iter().rev() {
+                if s.0 < w_lo {
+                    break;
+                }
+                mid_min = mid_min.min(s.3);
+                mid_max = mid_max.max(s.3);
+                anchor = Some(*s); // oldest sample still inside the window
+            }
+            let n_win = st.ring.iter().rev().take_while(|s| s.0 >= w_lo).count();
+            let range = mid_max - mid_min;
+            // COVERAGE guard (live/sim parity): the mid-RANGE test shrinks if the
+            // ring sampled the window sparsely, so a thin ring would pass the
+            // quiet test too easily and fire more often than the 50ms-grid sim.
+            // Require the anchor to actually span ≥80% of the window and a
+            // minimum sample count; otherwise fail closed.
+            let min_span_ns = (cfg.stab_window_s * 0.8 * 1e9) as i64;
+            let (ok, dfair, anchor_ms) = match anchor {
+                Some((a_ts, a_px, a_px2, _a_mid, a_feats))
+                    if n_win >= 4 && (now - a_ts) >= min_span_ns =>
+                {
+                    let a_tte = (expiry - a_ts) as f64 / 1e9;
+                    let f_then = self
+                        .surface
+                        .fair(a_px, a_px2, a_tte, strike, d_b, d_rho, &a_feats);
+                    let df = side * (fair - f_then);
+                    (range <= cfg.stab_max_c && df >= cfg.open_min, df,
+                     (now - a_ts) as f64 / 1e6)
+                }
+                _ => (false, f64::NAN, f64::NAN),
+            };
+            if !ok {
+                tracing::info!(
+                    target: "episode",
+                    "{} DISARM tte={:.1} fair={:.4} mid={:.4} gap={:+.4} entry#{} gate=REJECT-STABLE mid_range={:.4} dfair={:+.4} win_n={} win_ms={:.0} (max_range={:.3} open_min={:.3} w={:.2}s)",
+                    inst, tte_s, fair, mid, sig, entry_no, range, dfair, n_win, anchor_ms,
+                    cfg.stab_max_c, cfg.open_min, cfg.stab_window_s
+                );
+                st.ring.push_back(push);
+                return None;
+            }
+            tracing::info!(
+                target: "episode",
+                "{} DISARM tte={:.1} fair={:.4} mid={:.4} gap={:+.4} entry#{} gate=PASS-STABLE mid_range={:.4} dfair={:+.4} win_n={} win_ms={:.0}",
+                inst, tte_s, fair, mid, sig, entry_no, range, dfair, n_win, anchor_ms
+            );
+        } else if !(tot > cfg.open_min && share > cfg.share_min) {
             tracing::info!(
                 target: "episode",
                 "{} DISARM tte={:.1} fair={:.4} mid={:.4} gap={:+.4} entry#{} gate=REJECT fair_then={:.4} mid_then={:.4} back_ms={:.0} push={:+.4} pull={:+.4} tot={:+.4} share={:.2} (open_min={:.3} share_min={:.2})",
@@ -684,11 +757,13 @@ impl FairRideRule {
                 return None;
             }
         }
-        tracing::info!(
-            target: "episode",
-            "{} DISARM tte={:.1} fair={:.4} mid={:.4} gap={:+.4} entry#{} gate=PASS fair_then={:.4} mid_then={:.4} back_ms={:.0} push={:+.4} pull={:+.4} tot={:+.4} share={:.2}",
-            inst, tte_s, fair, mid, sig, entry_no, fair_then, mid_then, back_ms, mp, xp, tot, share
-        );
+        if cfg.gate != "stable" {
+            tracing::info!(
+                target: "episode",
+                "{} DISARM tte={:.1} fair={:.4} mid={:.4} gap={:+.4} entry#{} gate=PASS fair_then={:.4} mid_then={:.4} back_ms={:.0} push={:+.4} pull={:+.4} tot={:+.4} share={:.2}",
+                inst, tte_s, fair, mid, sig, entry_no, fair_then, mid_then, back_ms, mp, xp, tot, share
+            );
+        }
 
         // ── SIGNAL ──
         st.ring.push_back(push);

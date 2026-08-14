@@ -112,7 +112,10 @@ def parse_model(spec):
     rho_kr = js.get("rho_kr")
     kr_mult = math.exp(rho_kr - js["rho_bar"]) if rho_kr is not None else None
     return {"label": label, "path": path, "js": js, "px": px,
-            "extras": js.get("extras", []), "cb_mult": cb_mult, "kr_mult": kr_mult}
+            "extras": js.get("extras", []), "cb_mult": cb_mult, "kr_mult": kr_mult,
+            # calib="dbp": per-event db shifts ONLY the perp leg; the cb leg is
+            # anchored at the raw strike (fit + inference must both honor it)
+            "calib": js.get("calib")}
 
 
 def prepare(ev, m):
@@ -277,6 +280,9 @@ def fair_series(d, m, strike, rho, b_scale, fwd, tte_max, fit_window, refit_step
     # "capitulation" overstates the model's retreat).
     dbs = np.full(len(tte_p), np.nan)
     drs = np.full(len(tte_p), np.nan)
+    # cb-leg anchor per row: NaN = shared b (default / dbp uses the raw strike)
+    dbcs = np.full(len(tte_p), np.nan)
+    calib = m.get("calib")
     init = None
     for B in range(int(tte_max), 0, -int(refit_step)):
         if live_cal is not None:
@@ -290,7 +296,8 @@ def fair_series(d, m, strike, rho, b_scale, fwd, tte_max, fit_window, refit_step
                 init = (nearest[1], nearest[2])
             if init is None:
                 continue
-            db, dr = init
+            db, dr = init[0], init[1]
+            b2_cur = strike if calib == "dbp" else None
         else:
             fitm = d["tte"] > B
             if fit_window > 0:
@@ -298,14 +305,23 @@ def fair_series(d, m, strike, rho, b_scale, fwd, tte_max, fit_window, refit_step
             if fitm[fit_sl].sum() < (30 if fit_window > 0 else 60):
                 continue
             mid_f = ((d["ybid"] + d["yask"]) / 2.0)[fitm][fit_sl]
-            db, dr = sim.fit_event(
+            fit_out = sim.fit_event(
                 fwd, d["spot"][fitm][fit_sl], d["tte"][fitm][fit_sl], mid_f, strike,
                 rho, b_scale, steps=sim.FIT_STEPS if init is None else 60, init=init,
                 extra=d["X"][fitm][fit_sl],
                 cb=d["cbmid"][fitm][fit_sl] if cbm is not None else None, cb_mult=cbm,
                 kr=d["krmid"][fitm][fit_sl] if krm is not None else None, kr_mult=krm,
+                cb_anchor=strike if calib == "dbp" else None,
+                fit_cb=(calib == "2db"),
             )
-            init = (float(db), float(dr))
+            if calib == "2db":
+                db, dr, dbc = fit_out
+                init = (float(db), float(dr), float(dbc))
+                b2_cur = strike + b_scale * float(dbc)
+            else:
+                db, dr = fit_out
+                init = (float(db), float(dr))
+                b2_cur = strike if calib == "dbp" else None
         seg = (tte_p <= B) & (tte_p > B - int(refit_step))
         if seg.any():
             with torch.no_grad():
@@ -319,10 +335,13 @@ def fair_series(d, m, strike, rho, b_scale, fwd, tte_max, fit_window, refit_step
                     cbm,
                     torch.tensor(kr_p[seg], dtype=torch.float32) if krm is not None else None,
                     krm,
+                    b2=b2_cur,
                 )
                 fair[seg] = torch.sigmoid(lo).numpy()
                 dbs[seg] = float(db)
                 drs[seg] = float(dr)
+                if calib == "2db":
+                    dbcs[seg] = float(dbc)
             if demean_window > 0:
                 # baseline gap: recompute (fair-mid) on a low-freq (1s) grid over
                 # the past-window + segment tte range using the CURRENT (db,dr),
@@ -341,7 +360,7 @@ def fair_series(d, m, strike, rho, b_scale, fwd, tte_max, fit_window, refit_step
                             torch.tensor(d["cbmid"][gi], dtype=torch.float32) if cbm is not None else None,
                             cbm,
                             torch.tensor(d["krmid"][gi], dtype=torch.float32) if krm is not None else None,
-                            krm)
+                            krm, b2=b2_cur)
                         g_fair = torch.sigmoid(glo).numpy()
                     g_gap = g_fair - (d["ybid"][gi] + d["yask"][gi]) / 2.0
                     order = np.argsort(g_tte)  # ascending tte = back in time
@@ -369,7 +388,7 @@ def fair_series(d, m, strike, rho, b_scale, fwd, tte_max, fit_window, refit_step
         fill_ybid, fill_yask = ybid_p, yask_p
     ok = ~np.isnan(fair)
     return (ts_p[ok], tte_p[ok], ybid_p[ok], yask_p[ok], fair[ok], gbar[ok],
-            fill_ybid[ok], fill_yask[ok], dbs[ok], drs[ok],
+            fill_ybid[ok], fill_yask[ok], dbs[ok], drs[ok], dbcs[ok],
             spot_p[ok], x_p[ok], cb_p[ok] if cbm is not None else None,
             age_p[ok] if age_p is not None else None,
             kr_p[ok] if krm is not None else None)
@@ -588,6 +607,31 @@ def generate_trades(sig, m_label, gap, fair, mid_p, tte_p, ybid_p, yask_p, ts_p,
                     if not ok:
                         k += 1
                         continue
+                if a.gate == "stable":
+                    # market-STABILITY gate: the mid must have been quiet (range
+                    # <= stab_max_c) over the past stab_window seconds while the
+                    # FAIR created the gap (moved >= open_min toward the trade
+                    # side; refit-jump-immune fair_then like the ride gate).
+                    # Directly encodes "model info not yet priced in" — the 1s
+                    # share gate cannot tell fair-led from mid-moved-and-bounced
+                    # (the 1215-15 entry-#33 pathology: share 2.19 on a dip the
+                    # market had already faded).
+                    jw = k - 1
+                    while jw > 0 and (tte_p[jw] - tte_p[k]) < a.stab_window and (k - jw) < 800:
+                        jw -= 1
+                    ok = False
+                    if (jw >= 0 and a.stab_window <= (tte_p[jw] - tte_p[k]) <= a.stab_window + 9.0
+                            and (k - jw) >= 10):
+                        mid_seg = mid_p[jw:k + 1]
+                        mrange = float(np.max(mid_seg) - np.min(mid_seg))
+                        fair_then_w = fx_fair(jw, k) if fx_fair is not None else float("nan")
+                        if math.isnan(fair_then_w):
+                            fair_then_w = fair[jw]
+                        ok = (mrange <= a.stab_max_c
+                              and s * (fair[k] - fair_then_w) >= open_eff)
+                    if not ok:
+                        k += 1
+                        continue
 
                 # trade-only vetoes: the crossing above already consumed the
                 # armed state (and stamped last_cross_ms), so unlike row-level
@@ -615,7 +659,11 @@ def generate_trades(sig, m_label, gap, fair, mid_p, tte_p, ybid_p, yask_p, ts_p,
             sig_ask = yask_p[k] if side_yes else 1.0 - ybid_p[k]
             if a.latency_ms > 0:
                 post_ask = fill_yask[k] if side_yes else 1.0 - fill_ybid[k]
-                if post_ask > sig_ask + a.chase_c + 1e-9:
+                # edge-scaled chase: allow chasing up to chase_frac x |signal|
+                # (never below the flat chase_c) — a big model-market gap
+                # justifies paying up; a marginal one does not.
+                chase_lim = max(a.chase_c, a.chase_frac * abs(sig[k])) if a.chase_frac > 0 else a.chase_c
+                if post_ask > sig_ask + chase_lim + 1e-9:
                     a.misses.append({
                         "model": m_label, "delta": dl,
                         "pbucket": price_bucket_of(float(mid_p[k])),
@@ -678,7 +726,32 @@ def generate_trades(sig, m_label, gap, fair, mid_p, tte_p, ybid_p, yask_p, ts_p,
                         if not math.isnan(f_fx):
                             cap_df_fx = float(f_fx - fair[k])
 
+            # per-crossing market-stability stats (--stab-stats): mid RANGE and
+            # refit-immune fair move over several past windows, so any
+            # (window, range) stable-gate grid re-scores from trades.csv
+            # without re-running the harness (crossings are gate-independent).
+            stab = {}
+            if a.stab_stats:
+                for wlab, ws in (("05", 0.5), ("07", 0.75), ("10", 1.0),
+                                 ("15", 1.5), ("20", 2.0), ("30", 3.0), ("50", 5.0)):
+                    need = max(4, min(10, int(ws * 16)))  # ~80% of 50ms rows for sub-1s windows
+                    jw = k - 1
+                    while jw > 0 and (tte_p[jw] - tte_p[k]) < ws and (k - jw) < 800:
+                        jw -= 1
+                    if (jw >= 0 and ws <= (tte_p[jw] - tte_p[k]) <= ws + 9.0
+                            and (k - jw) >= need):
+                        seg_m = mid_p[jw:k + 1]
+                        f_then = fx_fair(jw, k) if fx_fair is not None else float("nan")
+                        if math.isnan(f_then):
+                            f_then = fair[jw]
+                        stab["mr" + wlab] = float(np.max(seg_m) - np.min(seg_m))
+                        stab["df" + wlab] = float(fair[k] - f_then)
+                    else:
+                        stab["mr" + wlab] = float("nan")
+                        stab["df" + wlab] = float("nan")
+
             out.append({
+                **stab,
                 "model": m_label, "delta": dl, "ticker": t,
                 "date": utc_date(ts_p[k]), "ts_ms": int(ts_p[k]),
                 "tte": float(tte_p[k]), "bucket": bucket_of(tte_p[k]),
@@ -795,7 +868,7 @@ def _fs_worker(payload):
                torch.tensor(float(js["rho_bar"])), float(js.get("b_scale", 50.0)))
         _WORKER_CACHE[key] = ent
     fwd, rho, b_scale = ent
-    mm = {"js": js, "cb_mult": cb_mult, "kr_mult": kr_mult}
+    mm = {"js": js, "cb_mult": cb_mult, "kr_mult": kr_mult, "calib": js.get("calib")}
     return t, fair_series(d, mm, strike, rho, b_scale, fwd, *fsargs,
                           live_cal=lc, fit_stride=fit_stride)
 
@@ -848,7 +921,7 @@ def simulate(m, ev, meta, a):
     for t, strike, outc, lc in elig:
         d = ev[t]
         (ts_p, tte_p, ybid_p, yask_p, fair, gbar, fill_ybid, fill_yask,
-         dbs_p, drs_p, spot_p, x_p, cb_p, cb_age_p, kr_p) = series[t]
+         dbs_p, drs_p, dbcs_p, spot_p, x_p, cb_p, cb_age_p, kr_p) = series[t]
         if len(tte_p) < 50:
             continue
         mid_p = (ybid_p + yask_p) / 2.0
@@ -857,11 +930,19 @@ def simulate(m, ev, meta, a):
         krm = m.get("kr_mult")
         rho_f = float(rho)
 
+        calib_m = m.get("calib")
+
         def fx_fair(jj, kk):
-            """fair at row jj recomputed under row kk's (db, dr) — the
+            """fair at row jj recomputed under row kk's (db, dr[, db_cb]) — the
             frozen-calibration fair used to strip refit jumps from closure."""
             if math.isnan(dbs_p[kk]):
                 return float("nan")
+            if calib_m == "2db":
+                b2_cur = strike + b_scale * float(dbcs_p[kk])
+            elif calib_m == "dbp":
+                b2_cur = strike
+            else:
+                b2_cur = None
             with torch.no_grad():
                 lo = sim.logit_of(
                     fwd,
@@ -874,6 +955,7 @@ def simulate(m, ev, meta, a):
                     cbm,
                     torch.tensor(kr_p[jj:jj + 1], dtype=torch.float32) if kr_p is not None else None,
                     krm,
+                    b2=b2_cur,
                 )
                 return float(torch.sigmoid(lo)[0])
 
@@ -1328,7 +1410,7 @@ def main():
                         "this window (s), the mean recomputed with the current "
                         "params at 1s resolution (fire on deviations from the "
                         "standing bias, not the bias itself; 0 = off/raw gap)")
-    p.add_argument("--gate", choices=("ride", "fade", "none", "overreact"), default="ride",
+    p.add_argument("--gate", choices=("ride", "fade", "none", "overreact", "stable"), default="ride",
                    help="ride = only gaps opened by the model (share>ride-share); "
                         "overreact = fade a market overshoot (gap flipped past fair, "
                         "mid moved >> fair, same direction)")
@@ -1339,6 +1421,14 @@ def main():
     p.add_argument("--ride-open", type=float, default=None,
                    help="ride-gate open_min; DEFAULT = the gap threshold (delta), "
                         "per the 2026-08-03 convention (live open_min: 0.02 = delta)")
+    p.add_argument("--stab-stats", action="store_true",
+                   help="record per-trade mid-range + fair-move over windows "
+                        "{1.5,2,3,5}s into trades.csv (offline stable-gate sweeps)")
+    p.add_argument("--stab-window", type=float, default=3.0,
+                   help="stable gate: past window (s) over which the mid must be quiet")
+    p.add_argument("--stab-max-c", type=float, default=0.01,
+                   help="stable gate: max mid RANGE (max-min) over the window; "
+                        "fair must also have moved >= open_min toward the trade side")
     p.add_argument("--overreact-k", type=float, default=2.0,
                    help="overreact gate: mid must have moved >= this x |fair move|")
     p.add_argument("--overreact-flip", type=float, default=0.01,
@@ -1382,6 +1472,9 @@ def main():
                         "book this many ms AFTER the signal row (market drifts "
                         "meanwhile). 0 = instant fill at the signal instant "
                         "(legacy). Live executor is ~100.")
+    p.add_argument("--chase-frac", type=float, default=0.0,
+                   help="edge-scaled chase: fill limit = max(chase_c, frac*|sig|). "
+                        "0 = flat chase_c only (live parity).")
     p.add_argument("--chase-c", type=float, default=0.01,
                    help="max chase (dollars): with --latency-ms>0, MISS the fill "
                         "if the post-latency traded-side ask has run more than "

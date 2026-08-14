@@ -266,16 +266,19 @@ def make_fwd(net, mode, clamp):
     return fwd
 
 
-def logit_of(fwd, spot, tte, b, s, extra=None, cb=None, cb_mult=None, kr=None, kr_mult=None):
+def logit_of(fwd, spot, tte, b, s, extra=None, cb=None, cb_mult=None, kr=None, kr_mult=None, b2=None):
     """Single-price: (spot, b, s). Two-price (cb + cb_mult given): the second
     channel is z'_cb = ((cb - b)/(s*cb_mult))/sqrt(tau) — cb_mult =
     exp(rho_cb - rho_bar), so shared (b, dr) exactly as in training. Third
-    channel (kr + kr_mult = exp(rho_kr - rho_bar)) analogous."""
+    channel (kr + kr_mult = exp(rho_kr - rho_bar)) analogous.
+    `b2`: optional cb-leg anchor override (the `calib: dbp` convention —
+    cb anchored at the raw strike while db shifts only the perp leg);
+    None = shared b (all pre-existing models)."""
     tau = (tte / 900.0).clamp(1e-4, 1.0)
     zp = ((spot - b) / s) / tau.sqrt()
     zp2 = None
     if cb is not None:
-        zp2 = ((cb - b) / (s * cb_mult)) / tau.sqrt()
+        zp2 = ((cb - (b if b2 is None else b2)) / (s * cb_mult)) / tau.sqrt()
     zp3 = None
     if kr is not None:
         zp3 = ((kr - b) / (s * kr_mult)) / tau.sqrt()
@@ -308,10 +311,15 @@ def fee(p):
     return FEE_RATE * p * (1.0 - p)
 
 
-def fit_event(fwd, spot, tte, target, strike, rho_bar, b_scale, steps=FIT_STEPS, init=None, extra=None, cb=None, cb_mult=None, kr=None, kr_mult=None):
+def fit_event(fwd, spot, tte, target, strike, rho_bar, b_scale, steps=FIT_STEPS, init=None, extra=None, cb=None, cb_mult=None, kr=None, kr_mult=None, cb_anchor=None, fit_cb=False):
+    """`cb_anchor`: fixed cb-leg anchor (the `calib: dbp` convention — pass the
+    raw strike so db shifts only the perp leg); None = shared b (default).
+    `fit_cb` (the `calib: 2db` convention): fit an INDEPENDENT cb-leg db as a
+    third parameter; returns (db, dr, db_cb) instead of (db, dr)."""
     db = torch.tensor([init[0]] if init else [0.0], requires_grad=True)
     dr = torch.tensor([init[1]] if init else [0.0], requires_grad=True)
-    opt = torch.optim.Adam([db, dr], lr=FIT_LR)
+    dbc = torch.tensor([init[2] if (init and len(init) > 2) else 0.0], requires_grad=True)
+    opt = torch.optim.Adam([db, dr] + ([dbc] if fit_cb else []), lr=FIT_LR)
     ts = torch.tensor(spot, dtype=torch.float32)
     tt = torch.tensor(tte, dtype=torch.float32)
     xx = torch.tensor(extra, dtype=torch.float32) if extra is not None else None
@@ -320,9 +328,12 @@ def fit_event(fwd, spot, tte, target, strike, rho_bar, b_scale, steps=FIT_STEPS,
     y = torch.tensor(np.clip(target, P_CLIP, 1 - P_CLIP), dtype=torch.float32)
     for _ in range(steps):
         opt.zero_grad()
-        lo = logit_of(fwd, ts, tt, strike + b_scale * db, torch.exp(rho_bar + dr), xx, cc, cb_mult, kk, kr_mult)
+        b2 = (strike + b_scale * dbc) if fit_cb else cb_anchor
+        lo = logit_of(fwd, ts, tt, strike + b_scale * db, torch.exp(rho_bar + dr), xx, cc, cb_mult, kk, kr_mult, b2=b2)
         nn.functional.binary_cross_entropy_with_logits(lo, y).backward()
         opt.step()
+    if fit_cb:
+        return db.detach(), dr.detach(), dbc.detach()
     return db.detach(), dr.detach()
 
 

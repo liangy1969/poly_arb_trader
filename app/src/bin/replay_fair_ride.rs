@@ -72,15 +72,29 @@ fn main() -> anyhow::Result<()> {
         ..Default::default()
     };
     let mut core = CalibCore::new(calib_cfg, surface.clone(), hash);
+    // env overrides so the same binary can replay either gate (Level-2 parity
+    // for the stable gate: REPLAY_GATE=stable REPLAY_OM=0.005 REPLAY_STAB_W=0.5
+    // REPLAY_STAB_C=0.03 — mirrors analyze_online --gate stable).
+    let envf = |k: &str, d: f64| -> f64 {
+        std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+    };
     let ride_cfg = FairRideCfg {
         reference: reference.into(),
         basis_reference: CB.into(),
-        delta: 0.03,
+        delta: envf("REPLAY_DELTA", 0.03),
         entry_min_tte_s: 60.0,
         entry_max_tte_s: 300.0,
         max_entries_per_event: 255,
+        gate: std::env::var("REPLAY_GATE").unwrap_or_else(|_| "ride".into()),
+        open_min: envf("REPLAY_OM", 0.005),
+        stab_window_s: envf("REPLAY_STAB_W", 0.5),
+        stab_max_c: envf("REPLAY_STAB_C", 0.03),
         ..Default::default()
     };
+    eprintln!(
+        "gate={} delta={} open_min={} stab_w={}s stab_c={}",
+        ride_cfg.gate, ride_cfg.delta, ride_cfg.open_min, ride_cfg.stab_window_s, ride_cfg.stab_max_c
+    );
     let mut rule = FairRideRule::new(ride_cfg.clone(), surface.clone(), hash);
     let mut state = MarketState::new(reference.into(), "15m_updown".into(), 256, 10_000);
     // Local mirror of the pipeline's feature reconstruction, only for the fair
@@ -112,6 +126,7 @@ fn main() -> anyhow::Result<()> {
     let mut seq = 0u64;
     let mut known: HashMap<String, (f64, i64)> = HashMap::new(); // ticker -> (strike, expiry_ns)
     let mut calibs: HashMap<String, arb_core::model::CalibUpdate> = HashMap::new();
+    let mut n_calib: u64 = 0;
     let mut last_cb_recv_ns: i64 = i64::MIN;
     let mut last_perp_feed_ms: i64 = i64::MIN;
     let mut last_perp: (f64, f64) = (0.0, 0.0);
@@ -128,6 +143,7 @@ fn main() -> anyhow::Result<()> {
             let e = $e;
             state.on_event(&e);
             for u in core.on_event(&e) {
+                n_calib += 1;
                 push_calib(&mut state, &mut rule, &mut calibs, u, &mut seq, e.ts_ns);
             }
             for s in rule.on_event(&e, &state) {
@@ -260,7 +276,8 @@ fn main() -> anyhow::Result<()> {
     }
     eprintln!("replay done: rows={n_rows} signals={n_sigs} events={}", known.len());
     if debug {
-        eprintln!("cb feeds={n_cb_feeds}, last cb feed at ts_ms={last_cb_feed_ts}");
+        eprintln!("calib updates={n_calib}");
+    eprintln!("cb feeds={n_cb_feeds}, last cb feed at ts_ms={last_cb_feed_ts}");
     }
     Ok(())
 }
