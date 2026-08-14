@@ -680,8 +680,16 @@ impl Engine {
         // config fallback when a market's catalog didn't carry them.
         let params = self.market_params(&instrument);
 
-        // Sizing (§3.2): fixed target capped by displayed top-of-book depth.
-        let size = self.cfg.sizing.size_shares.min(self.cfg.sizing.depth_frac * book.ask_sz);
+        // Sizing (§3.2): FIXED size — always `size_shares` (user 2026-08-14).
+        // The old `min(size_shares, depth_frac * ask_sz)` depth cap silently
+        // REJECTED entries whenever the traded side's top-of-book was thinner
+        // than one contract (observed live: a NO signal 2s after a YES fill,
+        // rejected as "size 0.01 < min" because the NO ask had been swept to a
+        // 0.01 remnant). At size_shares=1 the cap could only ever block, never
+        // resize, so the guard cost signals with no risk benefit. If the book
+        // cannot fill the order it now simply misses at the venue, which is a
+        // fill outcome we already measure — not an invisible pre-trade drop.
+        let size = self.cfg.sizing.size_shares;
         if size < params.min_order_size {
             self.report(&trade_id, &instrument, "Rejected", &format!("size {size:.2} < min"));
             return;

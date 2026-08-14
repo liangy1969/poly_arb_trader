@@ -95,6 +95,9 @@ pub struct VenueCfg {
 #[serde(default)]
 pub struct SizingCfg {
     pub size_shares: f64,
+    /// DEPRECATED (2026-08-14, unused): was a top-of-book depth cap
+    /// `size = min(size_shares, depth_frac * ask_sz)`. Kept only so existing
+    /// configs still parse; sizing is now always `size_shares`.
     pub depth_frac: f64,
 }
 
