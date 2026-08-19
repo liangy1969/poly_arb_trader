@@ -316,6 +316,10 @@ async fn main() -> anyhow::Result<()> {
                                     let b5: f64 = b.bids.iter().take(5).map(|&(_, q)| q).sum();
                                     let a5: f64 = b.asks.iter().take(5).map(|&(_, q)| q).sum();
                                     o.on_depth5(b.recv_ts_ns, b5, a5);
+                                    // delta_min d_ofi: CKS from the depth book's best quotes
+                                    if let (Some(&(dbb, dbq)), Some(&(dba, daq))) = (b.bids.first(), b.asks.first()) {
+                                        o.on_depth_best(b.recv_ts_ns, dbb, dbq, dba, daq);
+                                    }
                                 }
                             }
                             Payload::Trade(t) if (!feat_extras.is_empty() || ob_on) && t.instrument == vol_inst => {

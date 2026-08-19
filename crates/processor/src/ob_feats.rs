@@ -7,6 +7,15 @@
 //! 18 of the 19 mirror features — `big_tr` (max trade in bar) is dropped:
 //! it cannot be cumulative-encoded through a conflating bus.
 //!
+//! delta_min extension (2026-08-19, collector doc §9): `ob_dofi` (+EWMAs) is
+//! the CKS best-quote OFI computed from the DEPTH-DIFF book state (the same
+//! Binance @depth@100ms source the remediated lake `d_ofi` is built from,
+//! same increment formula as `ob_delta_feats.py`), and `ob_bigtr` is a
+//! best-effort max-trade proxy: the largest per-publish cumulative-volume
+//! delta in the bar (= the true max when one trade dominates a 100ms window;
+//! an overestimate when several conflate). Appended AFTER the original 18 so
+//! existing consumers/parity joins are unaffected.
+//!
 //! Parity caveats vs the mirror-built dataset (documented, deliberate):
 //! - `upd` counts bookTicker EVENTS (mirror: ~7Hz l2 snapshots) → different
 //!   scale; any consumer must be (re)normalized on THESE columns.
@@ -21,11 +30,13 @@ const BAR_NS: i64 = 100_000_000; // 100ms
 const STALE_BARS: i64 = 20; // ff at most 2s, as the mirror builder
 const HL_BARS: [f64; 3] = [20.0, 100.0, 600.0]; // EWMA half-lives 2s/10s/60s
 
-pub const OB_FEATS: [&str; 18] = [
+pub const OB_FEATS: [&str; 23] = [
     "ob_ofi", "ob_ofi_e2", "ob_ofi_e10", "ob_ofi_e60", "ob_ofl5",
     "ob_tfi", "ob_tfi_e2", "ob_tfi_e10", "ob_tfi_e60", "ob_tv_e10",
     "ob_nt", "ob_upd", "ob_ret1", "ob_ret10", "ob_ret100", "ob_ret600",
     "ob_rv100", "ob_tslc",
+    // delta_min extension: event-cadence OFI from the depth-diff book + big_tr proxy
+    "ob_dofi", "ob_dofi_e2", "ob_dofi_e10", "ob_dofi_e60", "ob_bigtr",
 ];
 
 pub struct ObFeats {
@@ -39,6 +50,12 @@ pub struct ObFeats {
     b5: f64,
     a5: f64,
     have_d5: bool,
+    // previous DEPTH-book best quotes (for d_ofi — the delta_min OFI)
+    dbb: f64,
+    dba: f64,
+    dbq: f64,
+    daq: f64,
+    have_dbest: bool,
     // latest cumulative trade counters (.vol total, .volb buy/count)
     cum_vol: f64,
     cum_buy: f64,
@@ -53,10 +70,15 @@ pub struct ObFeats {
     ofi_acc: f64,
     ofl5_acc: f64,
     upd_acc: f64,
+    dofi_acc: f64,
+    // big_tr proxy: max per-publish cum-volume delta this bar
+    last_vol_evt: f64,
+    bigtr_acc: f64,
     stale_bars: i64,
     // EWMA state
     ofi_e: [f64; 3],
     tfi_e: [f64; 3],
+    dofi_e: [f64; 3],
     tv_e10: f64,
     // bar-close log-mid ring (601 = enough for ret_600) and rv ring (100 r1²)
     lm_ring: VecDeque<f64>,
@@ -64,7 +86,7 @@ pub struct ObFeats {
     r2_sum: f64,
     tslc: f64,
     last_mid: f64,
-    out: [f64; 18],
+    out: [f64; 23],
     ready: bool,
 }
 
@@ -85,6 +107,11 @@ impl ObFeats {
             b5: f64::NAN,
             a5: f64::NAN,
             have_d5: false,
+            dbb: f64::NAN,
+            dba: f64::NAN,
+            dbq: 0.0,
+            daq: 0.0,
+            have_dbest: false,
             cum_vol: f64::NAN,
             cum_buy: f64::NAN,
             cum_cnt: f64::NAN,
@@ -96,16 +123,20 @@ impl ObFeats {
             ofi_acc: 0.0,
             ofl5_acc: 0.0,
             upd_acc: 0.0,
+            dofi_acc: 0.0,
+            last_vol_evt: f64::NAN,
+            bigtr_acc: 0.0,
             stale_bars: 0,
             ofi_e: [0.0; 3],
             tfi_e: [0.0; 3],
+            dofi_e: [0.0; 3],
             tv_e10: 0.0,
             lm_ring: VecDeque::with_capacity(602),
             r2_ring: VecDeque::with_capacity(101),
             r2_sum: 0.0,
             tslc: 0.0,
             last_mid: f64::NAN,
-            out: [f64::NAN; 18],
+            out: [f64::NAN; 23],
             ready: false,
         }
     }
@@ -153,9 +184,48 @@ impl ObFeats {
         self.have_d5 = true;
     }
 
+    /// depth-diff book best quotes → the delta_min CKS OFI (`d_ofi`).
+    /// Same increment as `ob_delta_feats.py` (state-transition based, so a
+    /// conflated A→C transition is still well-defined), same source stream.
+    pub fn on_depth_best(&mut self, ts_ns: i64, bb: f64, bq: f64, ba: f64, aq: f64) {
+        if !(bb > 0.0 && ba > 0.0 && bb < ba) {
+            return;
+        }
+        self.roll(ts_ns);
+        if self.have_dbest {
+            let e_bid = if bb > self.dbb {
+                bq
+            } else if bb < self.dbb {
+                -self.dbq
+            } else {
+                bq - self.dbq
+            };
+            let e_ask = if ba < self.dba {
+                aq
+            } else if ba > self.dba {
+                -self.daq
+            } else {
+                aq - self.daq
+            };
+            self.dofi_acc += e_bid - e_ask;
+        }
+        self.dbb = bb;
+        self.dba = ba;
+        self.dbq = bq;
+        self.daq = aq;
+        self.have_dbest = true;
+    }
+
     /// `.vol` feed (cumulative TOTAL taker volume).
     pub fn on_vol(&mut self, ts_ns: i64, cum_vol: f64) {
         self.roll(ts_ns);
+        if self.last_vol_evt.is_finite() && cum_vol > self.last_vol_evt {
+            let d = cum_vol - self.last_vol_evt;
+            if d > self.bigtr_acc {
+                self.bigtr_acc = d;
+            }
+        }
+        self.last_vol_evt = cum_vol;
         self.cum_vol = cum_vol;
     }
 
@@ -214,6 +284,7 @@ impl ObFeats {
             if tfi_b.is_finite() {
                 self.tfi_e[k] = (1.0 - a) * self.tfi_e[k] + a * tfi_b;
             }
+            self.dofi_e[k] = (1.0 - a) * self.dofi_e[k] + a * self.dofi_acc;
         }
         let a10 = 1.0 - (-std::f64::consts::LN_2 / 100.0).exp();
         if tv_b.is_finite() {
@@ -273,19 +344,26 @@ impl ObFeats {
                 ret(600),
                 rv,
                 self.tslc,
+                if self.have_dbest { self.dofi_acc } else { nanv },
+                if self.have_dbest { self.dofi_e[0] } else { nanv },
+                if self.have_dbest { self.dofi_e[1] } else { nanv },
+                if self.have_dbest { self.dofi_e[2] } else { nanv },
+                if self.have_tr { self.bigtr_acc } else { nanv },
             ]
         } else {
-            [nanv; 18]
+            [nanv; 23]
         };
         self.ready = self.ready || valid;
 
         self.ofi_acc = 0.0;
         self.ofl5_acc = 0.0;
         self.upd_acc = 0.0;
+        self.dofi_acc = 0.0;
+        self.bigtr_acc = 0.0;
     }
 
     /// Latest CLOSED bar's features (call `roll(now)` first).
-    pub fn latest(&self) -> &[f64; 18] {
+    pub fn latest(&self) -> &[f64; 23] {
         &self.out
     }
 
