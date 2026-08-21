@@ -35,6 +35,12 @@ pub struct RunCfg {
     pub feature_extras: Vec<String>,
     /// OB flow_vol probe columns (18 ob_* sampler columns; needs .volb feed).
     pub ob_features: bool,
+    /// Optional OB distribution model (delta_min -> K logits). When set AND
+    /// `ob_features` is on, the sampler module evaluates it once per closed
+    /// 1s bar and PUBLISHES the logits (sampler columns `oblg0..` + a
+    /// throttled log line). Nothing consumes them yet — this is the
+    /// verification stage before a trade model reads them.
+    pub ob_model_path: String,
     /// Deep-book bus instrument for band{k} features (the `binance_depth`
     /// collector's instrument). Empty = no depth routing.
     pub depth_instrument: String,
@@ -50,6 +56,7 @@ impl Default for RunCfg {
             cb_product: "BTC-USD".into(),
             feature_extras: Vec::new(),
             ob_features: false,
+            ob_model_path: String::new(),
             depth_instrument: String::new(),
         }
     }

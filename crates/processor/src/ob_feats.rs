@@ -30,6 +30,128 @@ const BAR_NS: i64 = 100_000_000; // 100ms
 const STALE_BARS: i64 = 20; // ff at most 2s, as the mirror builder
 const HL_BARS: [f64; 3] = [20.0, 100.0, 600.0]; // EWMA half-lives 2s/10s/60s
 
+/// Number of logit bins the OB distribution model emits.
+pub const OB_NLOGIT: usize = 11;
+
+/// Column names for the published OB logits (sampler header + downstream).
+pub const OB_LOGIT_COLS: [&str; OB_NLOGIT] = [
+    "oblg0", "oblg1", "oblg2", "oblg3", "oblg4", "oblg5",
+    "oblg6", "oblg7", "oblg8", "oblg9", "oblg10",
+];
+
+#[derive(serde::Deserialize)]
+struct ObLayerJson {
+    w: Vec<Vec<f64>>,
+    b: Vec<f64>,
+    act: String,
+}
+
+#[derive(serde::Deserialize)]
+struct ObNetJson {
+    /// LIVE column names, in the order the net consumes them. Each must be a
+    /// member of `OB_FEATS`; the loader resolves them to indices once.
+    live_cols: Vec<String>,
+    #[serde(rename = "K")]
+    k: usize,
+    #[serde(rename = "T")]
+    t: f64,
+    lo: Vec<f64>,
+    hi: Vec<f64>,
+    mu: Vec<f64>,
+    sd: Vec<f64>,
+    layers: Vec<ObLayerJson>,
+}
+
+/// The frozen order-book distribution model: 17 delta_min features -> K
+/// temperature-scaled logits. Mirrors `scripts/ob_gen_logits.py::fwd`:
+/// `z = (clip(x, lo, hi) - mu) / sd`, two ReLU layers, a linear head, then
+/// divide by T (so `softmax(stored)` is the calibrated distribution).
+pub struct ObNet {
+    idx: Vec<usize>, // OB_FEATS index per net input
+    lo: Vec<f64>,
+    hi: Vec<f64>,
+    mu: Vec<f64>,
+    sd: Vec<f64>,
+    w: Vec<Vec<f64>>, // row-major per layer
+    b: Vec<Vec<f64>>,
+    dims: Vec<(usize, usize)>,
+    relu: Vec<bool>,
+    t: f64,
+    pub k: usize,
+}
+
+impl ObNet {
+    pub fn from_json(text: &str) -> anyhow::Result<Self> {
+        let js: ObNetJson = serde_json::from_str(text)?;
+        anyhow::ensure!(js.k == OB_NLOGIT, "net K={} but OB_NLOGIT={}", js.k, OB_NLOGIT);
+        let n_in = js.live_cols.len();
+        anyhow::ensure!(
+            js.lo.len() == n_in && js.hi.len() == n_in && js.mu.len() == n_in && js.sd.len() == n_in,
+            "lo/hi/mu/sd must all be {n_in} long"
+        );
+        let mut idx = Vec::with_capacity(n_in);
+        for c in &js.live_cols {
+            let i = OB_FEATS
+                .iter()
+                .position(|f| f == c)
+                .ok_or_else(|| anyhow::anyhow!("net input {c:?} is not an OB_FEATS column"))?;
+            idx.push(i);
+        }
+        let (mut w, mut b, mut dims, mut relu) = (vec![], vec![], vec![], vec![]);
+        for l in &js.layers {
+            let out_dim = l.w.len();
+            let in_dim = l.w[0].len();
+            anyhow::ensure!(l.b.len() == out_dim, "bias dim mismatch");
+            let mut flat = Vec::with_capacity(out_dim * in_dim);
+            for row in &l.w {
+                anyhow::ensure!(row.len() == in_dim, "ragged weight row");
+                flat.extend_from_slice(row);
+            }
+            w.push(flat);
+            b.push(l.b.clone());
+            dims.push((in_dim, out_dim));
+            relu.push(l.act == "relu");
+        }
+        anyhow::ensure!(dims[0].0 == n_in, "layer0 in_dim != {n_in}");
+        anyhow::ensure!(dims[dims.len() - 1].1 == js.k, "head out_dim != K");
+        Ok(ObNet { idx, lo: js.lo, hi: js.hi, mu: js.mu, sd: js.sd, w, b, dims, relu, t: js.t, k: js.k })
+    }
+
+    pub fn load(path: &str) -> anyhow::Result<Self> {
+        Self::from_json(&std::fs::read_to_string(path)?)
+    }
+
+    /// Logits for one CLOSED bar's feature vector. `None` if any input the net
+    /// needs is NaN (warmup / missing feed) — never publish a partial vector.
+    pub fn logits(&self, feats: &[f64; OB_FEATS.len()]) -> Option<Vec<f64>> {
+        let mut x = Vec::with_capacity(self.idx.len());
+        for (j, &i) in self.idx.iter().enumerate() {
+            let v = feats[i];
+            if !v.is_finite() {
+                return None;
+            }
+            let c = v.clamp(self.lo[j], self.hi[j]);
+            x.push((c - self.mu[j]) / self.sd[j]);
+        }
+        for (l, (in_dim, out_dim)) in self.dims.iter().enumerate() {
+            let mut y = vec![0.0f64; *out_dim];
+            for o in 0..*out_dim {
+                let mut acc = self.b[l][o];
+                let row = &self.w[l][o * in_dim..(o + 1) * in_dim];
+                for i in 0..*in_dim {
+                    acc += row[i] * x[i];
+                }
+                y[o] = if self.relu[l] { acc.max(0.0) } else { acc };
+            }
+            x = y;
+        }
+        for v in x.iter_mut() {
+            *v /= self.t;
+        }
+        Some(x)
+    }
+}
+
 pub const OB_FEATS: [&str; 23] = [
     "ob_ofi", "ob_ofi_e2", "ob_ofi_e10", "ob_ofi_e60", "ob_ofl5",
     "ob_tfi", "ob_tfi_e2", "ob_tfi_e10", "ob_tfi_e60", "ob_tv_e10",
@@ -88,6 +210,14 @@ pub struct ObFeats {
     last_mid: f64,
     out: [f64; 23],
     ready: bool,
+    /// Optional OB distribution model. When present, `roll()` evaluates it on
+    /// every CLOSED bar and republishes `logits`.
+    net: Option<ObNet>,
+    /// Latest published logits (None until a bar closes with all net inputs
+    /// finite). Consumers read `latest_logits()`.
+    logits: Option<Vec<f64>>,
+    /// Bar index the published logits belong to (for staleness checks/logs).
+    logits_bar: i64,
 }
 
 impl Default for ObFeats {
@@ -138,6 +268,9 @@ impl ObFeats {
             last_mid: f64::NAN,
             out: [f64::NAN; 23],
             ready: false,
+            net: None,
+            logits: None,
+            logits_bar: i64::MIN,
         }
     }
 
@@ -355,6 +488,18 @@ impl ObFeats {
         };
         self.ready = self.ready || valid;
 
+        // OB model: one forward per CLOSED bar (a "feature update"), so the
+        // published logits always describe the bar that just ended. A NaN in
+        // any net input (warmup, dead feed) republishes None rather than a
+        // partial vector.
+        if let Some(net) = self.net.as_ref() {
+            let lg = if valid { net.logits(&self.out) } else { None };
+            if lg.is_some() {
+                self.logits_bar = self.cur_bar;
+            }
+            self.logits = lg;
+        }
+
         self.ofi_acc = 0.0;
         self.ofl5_acc = 0.0;
         self.upd_acc = 0.0;
@@ -367,7 +512,104 @@ impl ObFeats {
         &self.out
     }
 
+    /// Attach the OB distribution model. Once set, `roll()` republishes
+    /// logits on every closed bar.
+    pub fn set_net(&mut self, net: ObNet) {
+        self.net = Some(net);
+    }
+
+    pub fn has_net(&self) -> bool {
+        self.net.is_some()
+    }
+
+    /// Latest published OB logits (temperature-applied; softmax => calibrated
+    /// distribution). `None` during warmup or on a bar with missing inputs.
+    pub fn latest_logits(&self) -> Option<&[f64]> {
+        self.logits.as_deref()
+    }
+
+    /// Bar index the published logits belong to.
+    pub fn logits_bar(&self) -> i64 {
+        self.logits_bar
+    }
+
     pub fn ready(&self) -> bool {
         self.ready
+    }
+}
+
+#[cfg(test)]
+mod obnet_tests {
+    //! Parity for the live OB model forward vs `scripts/ob_gen_logits.py`.
+    //! Vectors are the Python reference's own output on drawn feature rows.
+    use super::*;
+    use serde::Deserialize;
+
+    #[derive(Deserialize)]
+    struct Case {
+        feats: Vec<f64>,
+        logits: Vec<f64>,
+    }
+    #[derive(Deserialize)]
+    struct Cases {
+        cases: Vec<Case>,
+    }
+
+    fn net() -> ObNet {
+        ObNet::load(&format!("{}/../../models/ob-h100-delta-min.json", env!("CARGO_MANIFEST_DIR")))
+            .unwrap()
+    }
+
+    /// Build a full OB_FEATS row that carries the net's 17 inputs in the right
+    /// slots (everything else NaN — the net must ignore unused columns).
+    fn row(net: &ObNet, feats: &[f64]) -> [f64; OB_FEATS.len()] {
+        let mut r = [f64::NAN; OB_FEATS.len()];
+        for (j, &i) in net.idx.iter().enumerate() {
+            r[i] = feats[j];
+        }
+        r
+    }
+
+    #[test]
+    fn ob_net_parity_vs_python() {
+        let n = net();
+        let c: Cases = serde_json::from_str(
+            &std::fs::read_to_string(format!("{}/testdata/ob_net_case.json",
+                                             env!("CARGO_MANIFEST_DIR"))).unwrap()).unwrap();
+        let mut worst: f64 = 0.0;
+        for case in &c.cases {
+            let got = n.logits(&row(&n, &case.feats)).expect("finite inputs must produce logits");
+            assert_eq!(got.len(), case.logits.len());
+            for (g, e) in got.iter().zip(case.logits.iter()) {
+                worst = worst.max((g - e).abs());
+            }
+        }
+        // python reference runs the forward in f32; rust is f64 throughout
+        assert!(worst < 1e-4, "max |dlogit| = {worst}");
+    }
+
+    #[test]
+    fn nan_input_publishes_nothing() {
+        let n = net();
+        let c: Cases = serde_json::from_str(
+            &std::fs::read_to_string(format!("{}/testdata/ob_net_case.json",
+                                             env!("CARGO_MANIFEST_DIR"))).unwrap()).unwrap();
+        let mut r = row(&n, &c.cases[0].feats);
+        r[n.idx[3]] = f64::NAN; // one required input missing (e.g. feed warmup)
+        assert!(n.logits(&r).is_none(), "a NaN input must suppress publication");
+    }
+
+    #[test]
+    fn feature_mapping_is_exact() {
+        // every net input must resolve to a real OB_FEATS column, and the
+        // delta_min ordering must match the trained net's feature order.
+        let n = net();
+        assert_eq!(n.idx.len(), 17);
+        let names: Vec<&str> = n.idx.iter().map(|&i| OB_FEATS[i]).collect();
+        assert_eq!(names, vec![
+            "ob_tfi", "ob_tfi_e2", "ob_tfi_e10", "ob_tfi_e60", "ob_tv_e10",
+            "ob_nt", "ob_bigtr", "ob_tslc", "ob_ret1", "ob_ret10", "ob_ret100",
+            "ob_ret600", "ob_rv100", "ob_dofi", "ob_dofi_e2", "ob_dofi_e10", "ob_dofi_e60",
+        ]);
     }
 }

@@ -12,7 +12,7 @@ pub mod window;
 
 pub use calib::{CalibCfg, CalibCore, Calibrator};
 pub use fair::{FairSurface, FeatureState, FitRow, MAX_EXTRA};
-pub use ob_feats::{ObFeats, OB_FEATS};
+pub use ob_feats::{ObFeats, ObNet, OB_FEATS, OB_LOGIT_COLS, OB_NLOGIT};
 
 pub use module::{ProcCfg, Processor};
 pub use rule::{FairRideCfg, FairRideRule, PerpMoveRule, Rule, RuleEngine};

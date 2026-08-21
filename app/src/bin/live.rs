@@ -283,6 +283,21 @@ async fn main() -> anyhow::Result<()> {
             // every 50ms row carries them (empty extras = no extra columns).
             let mut feats = arb_processor::FeatureState::new(feat_extras.clone());
             let mut obf = ob_on.then(arb_processor::ObFeats::new);
+            // Attach the OB distribution model (publish-only for now).
+            if let (Some(o), false) = (obf.as_mut(), cfg.run.ob_model_path.is_empty()) {
+                match arb_processor::ObNet::load(&cfg.run.ob_model_path) {
+                    Ok(net) => {
+                        tracing::info!(target: "ob", "OB model loaded: {} (K={})",
+                                       cfg.run.ob_model_path, net.k);
+                        o.set_net(net);
+                    }
+                    // publish-only path: a bad model must NOT take the trader
+                    // down, since nothing trades on it yet.
+                    Err(e) => tracing::warn!(target: "ob", "OB model load failed ({}): {e}",
+                                             cfg.run.ob_model_path),
+                }
+            }
+            let mut ob_log_ns: i64 = 0;
             let volb_inst = format!("{vol_inst}b");
             let mut last_cb_push: i64 = 0;
             let mut books: HashMap<String, KTop> = HashMap::new();
@@ -411,6 +426,12 @@ async fn main() -> anyhow::Result<()> {
                                                 hdr.push(',');
                                                 hdr.push_str(n);
                                             }
+                                            if !cfg.run.ob_model_path.is_empty() {
+                                                for n in arb_processor::OB_LOGIT_COLS.iter() {
+                                                    hdr.push(',');
+                                                    hdr.push_str(n);
+                                                }
+                                            }
                                         }
                                         let _ = writeln!(w, "{hdr}");
                                     }
@@ -455,7 +476,7 @@ async fn main() -> anyhow::Result<()> {
                             s
                         };
                         let ob_cols = if let Some(o) = obf.as_mut() {
-                            o.roll(now);
+                            o.roll(now);          // closes the bar AND republishes logits
                             let mut s = String::new();
                             for v in o.latest().iter() {
                                 s.push(',');
@@ -463,6 +484,39 @@ async fn main() -> anyhow::Result<()> {
                                     s.push_str(&format!("{v:.6}"));
                                 } else {
                                     s.push_str("nan");
+                                }
+                            }
+                            if o.has_net() {
+                                match o.latest_logits() {
+                                    Some(lg) => {
+                                        for v in lg.iter() {
+                                            s.push(',');
+                                            s.push_str(&format!("{v:.6}"));
+                                        }
+                                        // verification log (1/min): the published
+                                        // vector + its bar, so live logits can be
+                                        // diffed against the lake archive offline.
+                                        if now - ob_log_ns >= 60_000_000_000 {
+                                            ob_log_ns = now;
+                                            let js: Vec<String> =
+                                                lg.iter().map(|v| format!("{v:.4}")).collect();
+                                            tracing::info!(
+                                                target: "ob",
+                                                "logits bar={} [{}]",
+                                                o.logits_bar(), js.join(",")
+                                            );
+                                        }
+                                    }
+                                    None => {
+                                        for _ in 0..arb_processor::OB_NLOGIT {
+                                            s.push_str(",nan");
+                                        }
+                                        if now - ob_log_ns >= 60_000_000_000 {
+                                            ob_log_ns = now;
+                                            tracing::info!(target: "ob",
+                                                "logits UNPUBLISHED (warmup or missing input)");
+                                        }
+                                    }
                                 }
                             }
                             s

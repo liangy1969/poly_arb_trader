@@ -605,6 +605,17 @@ def generate_trades(sig, m_label, gap, fair, mid_p, tte_p, ybid_p, yask_p, ts_p,
                 n_ent += 1
                 if a.trigger != "row":
                     run, armed = 0, False
+                # episode_arm: remember the pre-crossing state so a GATE REJECT
+                # can hand the arm back (live rule.rs `ungate!`). Entry counting
+                # is likewise rolled back, so a rejected crossing is invisible.
+                _ep_restore = bool(a.episode_arm)
+
+                def _ungate():
+                    """episode_arm: hand the arm back on a gate/veto reject."""
+                    nonlocal armed, n_ent, run
+                    if _ep_restore:
+                        armed, run = True, 0
+                        n_ent -= 1
                 side_yes = sig[k] > 0
                 dis_dir = 1.0 if side_yes else -1.0
                 s = 1.0 if side_yes else -1.0
@@ -635,10 +646,10 @@ def generate_trades(sig, m_label, gap, fair, mid_p, tte_p, ybid_p, yask_p, ts_p,
                 open_eff = a.ride_open if a.ride_open is not None else dl
                 is_ride = bool(tot > open_eff and share > a.ride_share)
                 if a.gate == "ride" and not is_ride:
-                    k += 1
+                    _ungate(); k += 1
                     continue
                 if a.gate == "fade" and is_ride:
-                    k += 1
+                    _ungate(); k += 1
                     continue
                 if a.gate == "overreact":
                     gap_then = gap[k] - dfair1 + dmid1  # = fair[j] - mid[j]
@@ -647,7 +658,7 @@ def generate_trades(sig, m_label, gap, fair, mid_p, tte_p, ybid_p, yask_p, ts_p,
                           and abs(dmid1) >= a.overreact_k * abs(dfair1)
                           and s * gap_then <= -a.overreact_flip)
                     if not ok:
-                        k += 1
+                        _ungate(); k += 1
                         continue
                 if a.gate == "stable":
                     # market-STABILITY gate: the mid must have been quiet (range
@@ -672,7 +683,7 @@ def generate_trades(sig, m_label, gap, fair, mid_p, tte_p, ybid_p, yask_p, ts_p,
                         ok = (mrange <= a.stab_max_c
                               and s * (fair[k] - fair_then_w) >= open_eff)
                     if not ok:
-                        k += 1
+                        _ungate(); k += 1
                         continue
 
                 # trade-only vetoes: the crossing above already consumed the
@@ -684,7 +695,7 @@ def generate_trades(sig, m_label, gap, fair, mid_p, tte_p, ybid_p, yask_p, ts_p,
                         not math.isnan(cb_age_p[k]) and cb_age_p[k] > a.stale_veto_ms:
                     a.vetoes.append({"model": m_label, "delta": dl, "why": "stale",
                                      "date": utc_date(ts_p[k]), "ticker": t})
-                    k += 1
+                    _ungate(); k += 1
                     continue
                 # (b) disarm cooldown: no trade within N s of the PREVIOUS
                 #     delta-crossing (any direction, traded or not) -> whipsaw
@@ -1635,6 +1646,12 @@ def main():
                    help="overreact gate: the gap must have been >= this on the OTHER side 1s ago")
     p.add_argument("--rearm-eps", type=float, default=0.02,
                    help="gap must fall below this to re-arm (one trade/episode)")
+    p.add_argument("--episode-arm", action="store_true",
+                   help="LIVE semantics since 2026-08-21 (rule.rs episode_arm): a "
+                        "gate REJECT does NOT consume the armed state, so the arm is "
+                        "spent only by an actual entry (one trade per contiguous "
+                        "|gap|>=delta episode). Without this the sim under-counts "
+                        "entries vs the deployed trader.")
     p.add_argument("--batch-calib", action="store_true",
                    help="shared2p models: batch the (db,dr) fits across ALL "
                         "events (one joint Adam per boundary) instead of the "
