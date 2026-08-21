@@ -95,6 +95,13 @@ pub struct VenueCfg {
 #[serde(default)]
 pub struct SizingCfg {
     pub size_shares: f64,
+    /// Per-EVENT directional position cap, in units of `size_shares`.
+    /// Exposure for a market = qty(YES) - qty(NO) measured in units; a BUY is
+    /// rejected when it would push |exposure| beyond this cap. An
+    /// opposite-direction buy always REDUCES |exposure| and is therefore never
+    /// blocked — that is how a Kalshi position is closed (buy the complement).
+    /// 0 = uncapped (legacy behaviour).
+    pub max_open_units: f64,
     /// DEPRECATED (2026-08-14, unused): was a top-of-book depth cap
     /// `size = min(size_shares, depth_frac * ask_sz)`. Kept only so existing
     /// configs still parse; sizing is now always `size_shares`.
@@ -221,7 +228,7 @@ impl Default for VenueCfg {
 
 impl Default for SizingCfg {
     fn default() -> Self {
-        SizingCfg { size_shares: 20.0, depth_frac: 0.5 }
+        SizingCfg { size_shares: 20.0, depth_frac: 0.5, max_open_units: 0.0 }
     }
 }
 

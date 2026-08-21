@@ -311,11 +311,18 @@ def fee(p):
     return FEE_RATE * p * (1.0 - p)
 
 
-def fit_event(fwd, spot, tte, target, strike, rho_bar, b_scale, steps=FIT_STEPS, init=None, extra=None, cb=None, cb_mult=None, kr=None, kr_mult=None, cb_anchor=None, fit_cb=False):
+def fit_event(fwd, spot, tte, target, strike, rho_bar, b_scale, steps=FIT_STEPS, init=None, extra=None, cb=None, cb_mult=None, kr=None, kr_mult=None, cb_anchor=None, fit_cb=False, prior=None):
     """`cb_anchor`: fixed cb-leg anchor (the `calib: dbp` convention — pass the
     raw strike so db shifts only the perp leg); None = shared b (default).
     `fit_cb` (the `calib: 2db` convention): fit an INDEPENDENT cb-leg db as a
-    third parameter; returns (db, dr, db_cb) instead of (db, dr)."""
+    third parameter; returns (db, dr, db_cb) instead of (db, dr).
+    `prior` (the `calib: shared2p` convention): (c_db, c_dr, psd_db, lam) —
+    Gaussian prior on db ONLY, centred at the training population mean and
+    scaled by its sd: loss = mean-BCE + lam*((db-c_db)/psd_db)^2. d_r stays
+    free but the cold-start init becomes (c_db, c_dr) — the width starts at
+    the offline population mean instead of the model default."""
+    if init is None and prior is not None:
+        init = (prior[0], prior[1])
     db = torch.tensor([init[0]] if init else [0.0], requires_grad=True)
     dr = torch.tensor([init[1]] if init else [0.0], requires_grad=True)
     dbc = torch.tensor([init[2] if (init and len(init) > 2) else 0.0], requires_grad=True)
@@ -330,7 +337,10 @@ def fit_event(fwd, spot, tte, target, strike, rho_bar, b_scale, steps=FIT_STEPS,
         opt.zero_grad()
         b2 = (strike + b_scale * dbc) if fit_cb else cb_anchor
         lo = logit_of(fwd, ts, tt, strike + b_scale * db, torch.exp(rho_bar + dr), xx, cc, cb_mult, kk, kr_mult, b2=b2)
-        nn.functional.binary_cross_entropy_with_logits(lo, y).backward()
+        loss = nn.functional.binary_cross_entropy_with_logits(lo, y)
+        if prior is not None:
+            loss = loss + prior[3] * (((db - prior[0]) / prior[2]) ** 2).sum()
+        loss.backward()
         opt.step()
     if fit_cb:
         return db.detach(), dr.detach(), dbc.detach()

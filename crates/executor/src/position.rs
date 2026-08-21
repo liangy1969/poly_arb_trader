@@ -315,3 +315,56 @@ mod tests {
         assert!((pm.cash() - (1000.0 - 8.0 + 20.0)).abs() < 1e-9); // got 20*1.0
     }
 }
+
+#[cfg(test)]
+mod cap_tests {
+    //! Per-event position-cap arithmetic (the executor applies this in
+    //! `module.rs` before the risk gate). Exposure for a market is
+    //! qty(traded side) - qty(complement); a buy passes iff
+    //! exposure + size <= max_open_units * size_shares.
+    fn allowed(held_same: f64, held_opp: f64, size: f64, cap: f64) -> bool {
+        (held_same - held_opp) + size <= cap + 1e-9
+    }
+
+    #[test]
+    fn flat_entry_allowed() {
+        assert!(allowed(0.0, 0.0, 1.0, 1.0));
+    }
+
+    #[test]
+    fn second_same_side_blocked() {
+        // already long 1 unit of the side we want to buy again
+        assert!(!allowed(1.0, 0.0, 1.0, 1.0));
+    }
+
+    #[test]
+    fn opposite_side_always_allowed_to_close() {
+        // long 1 YES (held_opp from the NO token's perspective) -> buying NO
+        // has exposure -1, so it passes and flattens the event.
+        assert!(allowed(0.0, 1.0, 1.0, 1.0));
+    }
+
+    #[test]
+    fn closing_then_reversing_is_bounded() {
+        // long 1 YES, buy NO -> flat (exposure -1 + 1 = 0): allowed
+        assert!(allowed(0.0, 1.0, 1.0, 1.0));
+        // flat (1 YES + 1 NO), buy another NO -> 1 unit short: still within cap
+        assert!(allowed(1.0, 1.0, 1.0, 1.0));
+        // 1 unit short (1 YES, 2 NO), buy a THIRD NO -> 2 units short: blocked
+        assert!(!allowed(2.0, 1.0, 1.0, 1.0));
+    }
+
+    #[test]
+    fn reducing_exposure_is_always_allowed() {
+        // even from a state that already violates the cap (e.g. after a
+        // partial fill race), a buy that moves toward flat must pass.
+        assert!(allowed(1.0, 3.0, 1.0, 1.0));   // exposure -2 -> -1
+        assert!(allowed(0.0, 5.0, 1.0, 1.0));   // exposure -5 -> -4
+    }
+
+    #[test]
+    fn cap_scales_with_units() {
+        assert!(allowed(1.0, 0.0, 1.0, 2.0));   // 2-unit cap permits stacking to 2
+        assert!(!allowed(2.0, 0.0, 1.0, 2.0));  // but not to 3
+    }
+}

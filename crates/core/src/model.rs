@@ -82,6 +82,12 @@ pub struct CalibUpdate {
     pub rows: u32,
     pub d_b: f64,
     pub d_rho: f64,
+    /// shared2p causal venue offset in effect at this fit: the perp price
+    /// used for BOTH fitting and inference is `perp − off`. 0.0 on legacy
+    /// models. Carried on the update so the rule's inference cannot drift
+    /// from the calibrator's fit basis.
+    #[serde(default)]
+    pub off: f64,
     pub bce: f64,
     /// FNV-1a hash of the model file — the rule refuses mismatched pairs.
     pub model_hash: u64,

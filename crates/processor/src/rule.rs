@@ -274,6 +274,14 @@ pub struct FairRideCfg {
     pub open_min: f64,
     /// Re-arm hysteresis (spec: 0.02).
     pub rearm_eps: f64,
+    /// EPISODE arm semantics (user 2026-08-20, matches the offline ROW
+    /// universe): the armed state is consumed ONLY by an actual fire. A gate
+    /// rejection leaves the rule ARMED, so the next tick can still trade if
+    /// the full condition set becomes true. After a fire the rule re-arms the
+    /// normal way (|sig| back within rearm_eps), giving exactly ONE trade per
+    /// contiguous |gap|>=delta episode. false = legacy (a δ-crossing consumes
+    /// the arm whether or not the gate passed).
+    pub episode_arm: bool,
     pub entry_min_tte_s: f64,
     pub entry_max_tte_s: f64,
     pub max_entries_per_event: u8,
@@ -327,6 +335,7 @@ impl Default for FairRideCfg {
             share_min: 0.75,
             open_min: 0.005,
             rearm_eps: 0.02,
+            episode_arm: false,
             entry_min_tte_s: 60.0,
             entry_max_tte_s: 300.0,
             max_entries_per_event: 3,
@@ -554,6 +563,11 @@ impl FairRideRule {
             return None;
         }
         let (d_b, d_rho) = (c.d_b, c.d_rho);
+        // shared2p: the calibrator fitted on the OFFSET-ADJUSTED perp, so
+        // inference must use the same basis or fair drifts from the fit.
+        // `off` is 0.0 on legacy models, making this a no-op there.
+        let off = c.off;
+        let ref_mid = ref_mid - off;
 
         let fair = self.surface.fair(ref_mid, px2_now, tte_s, strike, d_b, d_rho, &feats_now);
         let gap = fair - mid;
@@ -643,6 +657,17 @@ impl FairRideRule {
         st.armed = false;
         st.disarm_dir = if sig > 0.0 { 1.0 } else { -1.0 };
         let entry_no = st.entries;
+        // episode_arm: a gate REJECT must not burn the episode — every early
+        // return below restores the armed state and un-counts the entry, so
+        // the arm is consumed only when a trade actually fires.
+        macro_rules! ungate {
+            ($st:expr) => {
+                if cfg.episode_arm {
+                    $st.armed = true;
+                    $st.entries = entry_no - 1;
+                }
+            };
+        }
 
         // ride gate: youngest ring sample >= lookback_min old
         let lo = now - cfg.lookback_max_ms * 1_000_000;
@@ -656,12 +681,13 @@ impl FairRideRule {
                     "{} DISARM tte={:.1} fair={:.4} mid={:.4} gap={:+.4} entry#{} gate=NO-LOOKBACK",
                     inst, tte_s, fair, mid, sig, entry_no
                 );
+                ungate!(st);
                 st.ring.push_back(push);
                 return None;
             }
         };
         let tte_then = (expiry - ts_then) as f64 / 1e9;
-        let fair_then = self.surface.fair(px_then, px2_then, tte_then, strike, d_b, d_rho, &feats_then);
+        let fair_then = self.surface.fair(px_then - off, px2_then, tte_then, strike, d_b, d_rho, &feats_then);
         let side = if sig > 0.0 { 1.0 } else { -1.0 };
         let mp = side * (fair - fair_then);
         let xp = -side * (mid - mid_then);
@@ -711,7 +737,7 @@ impl FairRideRule {
                     let a_tte = (expiry - a_ts) as f64 / 1e9;
                     let f_then = self
                         .surface
-                        .fair(a_px, a_px2, a_tte, strike, d_b, d_rho, &a_feats);
+                        .fair(a_px - off, a_px2, a_tte, strike, d_b, d_rho, &a_feats);
                     let df = side * (fair - f_then);
                     (range <= cfg.stab_max_c && df >= cfg.open_min, df,
                      (now - a_ts) as f64 / 1e6)
@@ -725,6 +751,7 @@ impl FairRideRule {
                     inst, tte_s, fair, mid, sig, entry_no, range, dfair, n_win, anchor_ms,
                     cfg.stab_max_c, cfg.open_min, cfg.stab_window_s
                 );
+                ungate!(st);
                 st.ring.push_back(push);
                 return None;
             }
@@ -739,6 +766,7 @@ impl FairRideRule {
                 "{} DISARM tte={:.1} fair={:.4} mid={:.4} gap={:+.4} entry#{} gate=REJECT fair_then={:.4} mid_then={:.4} back_ms={:.0} push={:+.4} pull={:+.4} tot={:+.4} share={:.2} (open_min={:.3} share_min={:.2})",
                 inst, tte_s, fair, mid, sig, entry_no, fair_then, mid_then, back_ms, mp, xp, tot, share, cfg.open_min, cfg.share_min
             );
+            ungate!(st);
             st.ring.push_back(push);
             return None;
         }
@@ -753,6 +781,7 @@ impl FairRideRule {
                     "{} DISARM tte={:.1} fair={:.4} mid={:.4} gap={:+.4} entry#{} gate=PASS veto=STALE cb_age_ms={}",
                     inst, tte_s, fair, mid, sig, entry_no, cb_age
                 );
+                ungate!(st);
                 st.ring.push_back(push);
                 return None;
             }
@@ -818,7 +847,7 @@ impl Rule for FairRideRule {
                                 if tte <= 0.0 {
                                     continue;
                                 }
-                                let f = self.surface.fair(px, px2, tte, strike, c.d_b, c.d_rho, &feats);
+                                let f = self.surface.fair(px - c.off, px2, tte, strike, c.d_b, c.d_rho, &feats);
                                 st.base_hist.push_back((ts, f - mid));
                                 st.base_sum += f - mid;
                                 st.base_last_ns = ts;

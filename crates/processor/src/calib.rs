@@ -91,6 +91,12 @@ struct EvState {
     d_b: f64,
     d_rho: f64,
     fitted: bool,
+    /// Causal venue offset (shared2p models): running sum/count of
+    /// (perp − cb) from EVENT START, so `off = off_sum / off_n` is an
+    /// expanding mean that uses only past data. The perp fed to the surface
+    /// becomes `perp − off`; cb is the anchor and is never shifted.
+    off_sum: f64,
+    off_n: u64,
     /// Next tte boundary (seconds) at which to (re)fit; decreases by
     /// refit_every_s down to last_tte_s.
     next_boundary_s: f64,
@@ -176,6 +182,8 @@ impl CalibCore {
                                 d_b: 0.0,
                                 d_rho: 0.0,
                                 fitted: false,
+                        off_sum: 0.0,
+                        off_n: 0,
                                 next_boundary_s: self.cfg.first_tte_s,
                                 seq: 0,
                             });
@@ -235,7 +243,18 @@ impl CalibCore {
                         Some(f64::NAN)
                     };
                     if let (Some(feats), Some(px2)) = (feats, px2) {
-                        st.rows.push(FitRow { tte_s, px: self.ref_px, px2, mid: 0.5 * (st.ybid + st.yask), feats });
+                        // shared2p: advance the causal venue offset on this
+                        // sample, then feed the OFFSET-ADJUSTED perp. Offset
+                        // advances only on rows that carry a fresh cb quote,
+                        // matching the offline builder's row set exactly.
+                        let px_used = if self.surface.causal_offset && px2.is_finite() {
+                            st.off_sum += self.ref_px - px2;
+                            st.off_n += 1;
+                            self.ref_px - st.off_sum / st.off_n as f64
+                        } else {
+                            self.ref_px
+                        };
+                        st.rows.push(FitRow { tte_s, px: px_used, px2, mid: 0.5 * (st.ybid + st.yask), feats });
                     } else if now - self.last_drop_log_ns > 60_000_000_000 {
                         // throttled diagnostic: WHY are fit rows being dropped
                         // (feature warmup vs missing/stale cb price channel)
@@ -269,7 +288,9 @@ impl CalibCore {
                 let (steps, init) = if st.fitted {
                     (cfg.steps_refit, (st.d_b, st.d_rho))
                 } else {
-                    (cfg.steps_first, (0.0, 0.0))
+                    // cold start at the model's prior centre (population mean)
+                    // when configured; legacy models keep (0, 0).
+                    (cfg.steps_first, self.surface.init_params())
                 };
                 let (db, dr) = self.surface.fit(&fit_rows, st.strike, init, steps, cfg.lr);
                 let bce = self.surface.fit_loss(&fit_rows, st.strike, db, dr);
@@ -287,6 +308,11 @@ impl CalibCore {
                     rows: fit_rows.len() as u32,
                     d_b: db,
                     d_rho: dr,
+                    off: if self.surface.causal_offset && st.off_n > 0 {
+                        st.off_sum / st.off_n as f64
+                    } else {
+                        0.0
+                    },
                     bce,
                     model_hash: self.model_hash,
                 });

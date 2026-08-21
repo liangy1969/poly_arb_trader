@@ -45,6 +45,7 @@ import json
 import math
 import os
 import sys
+import time
 from collections import defaultdict, Counter
 from datetime import datetime, timezone
 
@@ -111,11 +112,20 @@ def parse_model(spec):
     # three-price surface: kraken BBO mid as the THIRD channel
     rho_kr = js.get("rho_kr")
     kr_mult = math.exp(rho_kr - js["rho_bar"]) if rho_kr is not None else None
+    # calib="shared2p" (shared-db + deterministic venue offset design):
+    # perp is shifted by a CAUSAL expanding mean of (perp - cb) from event
+    # start, then ONE shared money line b serves both legs; the online fit is
+    # 2 params (db, dr) with a Gaussian db-prior centred on the training
+    # population and d_r cold-started at its training mean.
+    pr = js.get("prior")
+    prior = ((float(pr["center"][0]), float(pr["center"][1]),
+              float(pr["psd"][0]), float(pr["lam"])) if pr else None)
     return {"label": label, "path": path, "js": js, "px": px,
             "extras": js.get("extras", []), "cb_mult": cb_mult, "kr_mult": kr_mult,
             # calib="dbp": per-event db shifts ONLY the perp leg; the cb leg is
             # anchored at the raw strike (fit + inference must both honor it)
-            "calib": js.get("calib")}
+            "calib": js.get("calib"), "prior": prior,
+            "causal_off": js.get("offset") == "causal"}
 
 
 def prepare(ev, m):
@@ -225,6 +235,17 @@ def prepare(ev, m):
             d[k] = d[k][ok]
         dropped += int((~ok).sum())
         kept += int(ok.sum())
+        if m.get("causal_off") and ok.sum() > 0:
+            # shared2p venue offset: causal expanding mean of (perp - cb) from
+            # the event's first usable row, BAKED into the price channel so
+            # every downstream consumer (fit, inference, closure) sees the
+            # offset-adjusted perp. Features above were built on the RAW perp
+            # (matching training). Offset only advances on fresh-cb rows —
+            # identical to the offline builder's row set.
+            g = d["spot"] - d["cbmid"]
+            voff = np.cumsum(g) / np.arange(1, len(g) + 1)
+            d["voff"] = voff
+            d["spot"] = d["spot"] - voff
         if ok.sum() > 0:            # skip events with 0 usable rows — old-schema
             out[t] = d              # days (pre-Jul-8) lack cb/sizes -> features NaN
     print(f"  [{m['label']}] px={m['px']} extras={extras or '-'}: "
@@ -253,7 +274,7 @@ def load_live_calib(path):
     return out
 
 
-def fair_series(d, m, strike, rho, b_scale, fwd, tte_max, fit_window, refit_step=60, demean_window=0.0, latency_ms=0.0, live_cal=None, fit_stride=None):
+def fair_series(d, m, strike, rho, b_scale, fwd, tte_max, fit_window, refit_step=60, demean_window=0.0, latency_ms=0.0, live_cal=None, fit_stride=None, precomputed=None):
     """Windowed refit at each `refit_step`-second boundary; returns the causal
     fair series on the scan grid (the live Calibrator's semantics). If
     `demean_window>0`, also returns `gbar` = the trailing mean of (fair-mid) over
@@ -283,8 +304,17 @@ def fair_series(d, m, strike, rho, b_scale, fwd, tte_max, fit_window, refit_step
     # cb-leg anchor per row: NaN = shared b (default / dbp uses the raw strike)
     dbcs = np.full(len(tte_p), np.nan)
     calib = m.get("calib")
+    if precomputed is not None:
+        # --batch-calib path: (fair, dbs, drs) already computed by the batched
+        # fitter on this exact scan[::SCAN_STRIDE] grid; skip the fitting loop
+        # (gbar/demean and live-cal modes are excluded upstream).
+        pf, pdb, pdr = precomputed
+        fair[:] = pf; dbs[:] = pdb; drs[:] = pdr
+        boundaries = ()
+    else:
+        boundaries = range(int(tte_max), 0, -int(refit_step))
     init = None
-    for B in range(int(tte_max), 0, -int(refit_step)):
+    for B in boundaries:
         if live_cal is not None:
             # consistency mode: take the LIVE calibrator's logged fit at this
             # boundary (nearest within half a step); no fit here -> live had
@@ -313,6 +343,7 @@ def fair_series(d, m, strike, rho, b_scale, fwd, tte_max, fit_window, refit_step
                 kr=d["krmid"][fitm][fit_sl] if krm is not None else None, kr_mult=krm,
                 cb_anchor=strike if calib == "dbp" else None,
                 fit_cb=(calib == "2db"),
+                prior=m.get("prior"),
             )
             if calib == "2db":
                 db, dr, dbc = fit_out
@@ -546,23 +577,34 @@ def generate_trades(sig, m_label, gap, fair, mid_p, tte_p, ybid_p, yask_p, ts_p,
                 is_ride = True
             else:
                 ag = abs(sig[k])
-                if not armed:
-                    # DIRECTIONAL re-arm (live semantics): same-direction re-fires
-                    # revert to within rearm_eps; a sign flip re-arms immediately.
-                    if sig[k] * dis_dir <= a.rearm_eps:
-                        armed, run = True, 0
-                    k += 1
-                    continue
-                run = run + 1 if ag >= dl else 0
-                if run < 1:
-                    k += 1
-                    continue
+                if a.trigger == "row":
+                    # trigger=row: NO arm/disarm state — every row_stride-th
+                    # scan row is evaluated INDEPENDENTLY against the full
+                    # entry condition set. The trade universe becomes
+                    # time-in-state (episodes weighted by their qualifying
+                    # duration), not crossing episodes.
+                    if (k % a.row_stride) != 0 or math.isnan(sig[k]) or ag < dl:
+                        k += 1
+                        continue
+                else:
+                    if not armed:
+                        # DIRECTIONAL re-arm (live semantics): same-direction re-fires
+                        # revert to within rearm_eps; a sign flip re-arms immediately.
+                        if sig[k] * dis_dir <= a.rearm_eps:
+                            armed, run = True, 0
+                        k += 1
+                        continue
+                    run = run + 1 if ag >= dl else 0
+                    if run < 1:
+                        k += 1
+                        continue
                 if tte_p[k] <= a.tte_min:
                     break            # entry window closed
                 if a.cap and n_ent >= a.cap:
                     break            # per-event exposure cap
                 n_ent += 1
-                run, armed = 0, False
+                if a.trigger != "row":
+                    run, armed = 0, False
                 side_yes = sig[k] > 0
                 dis_dir = 1.0 if side_yes else -1.0
                 s = 1.0 if side_yes else -1.0
@@ -732,6 +774,18 @@ def generate_trades(sig, m_label, gap, fair, mid_p, tte_p, ybid_p, yask_p, ts_p,
             # without re-running the harness (crossings are gate-independent).
             stab = {}
             if a.stab_stats:
+                # delayed-entry book snapshots: the traded-side quotes at fixed
+                # offsets AFTER the crossing, for offline entry-delay decay
+                # curves (NaN when the tape gaps past offset+500ms)
+                for lab, off in (("025", 250.0), ("05", 500.0), ("10", 1000.0),
+                                 ("20", 2000.0), ("30", 3000.0), ("50", 5000.0)):
+                    j = int(np.searchsorted(ts_p, ts_p[k] + off, side="left"))
+                    if j >= len(ts_p) or (ts_p[j] - ts_p[k]) > off + 500.0:
+                        stab["ask_d" + lab] = float("nan")
+                        stab["bid_d" + lab] = float("nan")
+                    else:
+                        stab["ask_d" + lab] = float(yask_p[j])
+                        stab["bid_d" + lab] = float(ybid_p[j])
                 for wlab, ws in (("05", 0.5), ("07", 0.75), ("10", 1.0),
                                  ("15", 1.5), ("20", 2.0), ("30", 3.0), ("50", 5.0)):
                     need = max(4, min(10, int(ws * 16)))  # ~80% of 50ms rows for sub-1s windows
@@ -855,6 +909,131 @@ def simulate_adj(m, ev, meta, a):
 _WORKER_CACHE = {}
 
 
+def batch_calib_shared2p(m, ev, elig, a, fwd, rho, b_scale):
+    """--batch-calib: (db, dr) calibration BATCHED across all events for
+    shared2p 2-price models — one (n_ev, 2) Adam per refit boundary.
+    Elementwise Adam on per-event-independent gradients is numerically
+    identical to the solo fits (pure vectorization, not an approximation).
+    Sequential-path semantics replicated exactly: window rows
+    [fitm][::fit_stride], eligibility fitm[::fit_stride].sum() >= 30
+    (60 when expanding), per-event FIRST successful fit runs FIT_STEPS on an
+    uninterrupted Adam trajectory (warm events snapshotted at step 60 and
+    restored — exact because grads are per-event independent), init + prior
+    from the model, ineligible boundaries carry params and leave the segment's
+    fair NaN. Returns {ticker: (fair, dbs, drs)} on the scan[::SCAN_STRIDE]
+    grid. Validated vs the sequential engine (net bit-parity on day joins)."""
+    S0 = math.exp(float(rho))
+    cbm = m["cb_mult"]
+    c_db, c_dr, psd_db, lam = m["prior"]
+    fs = a.fit_stride
+    W = a.fit_window
+    n_ev = len(elig)
+    EV = []
+    for (t, strike, _outc, _lc) in elig:
+        d = ev[t]
+        gidx = np.where(d["tte"] <= a.tte_max)[0][::SCAN_STRIDE]
+        EV.append({"t": t, "K": strike, "d": d, "g": gidx,
+                   "fair": np.full(len(gidx), np.nan),
+                   "dbs": np.full(len(gidx), np.nan),
+                   "drs": np.full(len(gidx), np.nan)})
+    th = torch.tensor(np.tile([c_db, c_dr], (n_ev, 1)).astype(np.float32),
+                      requires_grad=True)
+    has_fit = np.zeros(n_ev, bool)
+    Kt = torch.tensor(np.array([e["K"] for e in EV], np.float32))
+    bce_f = torch.nn.functional.binary_cross_entropy_with_logits
+    for B in range(int(a.tte_max), 0, -int(a.refit_step)):
+        sp_l, cb_l, tt_l, X_l, y_l, ei_l = [], [], [], [], [], []
+        el = np.zeros(n_ev, bool)
+        cnt = np.zeros(n_ev, int)
+        for i, e in enumerate(EV):
+            d = e["d"]
+            fitm = d["tte"] > B
+            if W > 0:
+                fitm &= d["tte"] <= B + W
+            if fitm[::fs].sum() < (30 if W > 0 else 60):
+                continue
+            el[i] = True
+            idx = np.where(fitm)[0][::fs]
+            sp_l.append(d["spot"][idx]); cb_l.append(d["cbmid"][idx])
+            tt_l.append(d["tte"][idx]); X_l.append(d["X"][idx])
+            y_l.append(np.clip((d["ybid"][idx] + d["yask"][idx]) / 2.0,
+                               sim.P_CLIP, 1 - sim.P_CLIP))
+            ei_l.append(np.full(len(idx), i)); cnt[i] = len(idx)
+        if not el.any():
+            continue
+        sp = torch.tensor(np.concatenate(sp_l), dtype=torch.float32)
+        cbt = torch.tensor(np.concatenate(cb_l), dtype=torch.float32)
+        tt = torch.tensor(np.concatenate(tt_l), dtype=torch.float32)
+        X = torch.tensor(np.concatenate(X_l).astype(np.float32))
+        yy = torch.tensor(np.concatenate(y_l), dtype=torch.float32)
+        eii = np.concatenate(ei_l)
+        ei = torch.tensor(eii, dtype=torch.long)
+        wrow = torch.tensor((1.0 / cnt[eii]).astype(np.float32))
+        tau = (tt / 900.0).clamp(1e-4, 1.0)
+        ltau, stau = tau.log(), tau.sqrt()
+        newf = el & ~has_fit
+        warm = el & has_fit
+        prev = th.detach().clone()
+        n_steps = sim.FIT_STEPS if newf.any() else 60
+        act_el = torch.tensor(el); act_new = torch.tensor(newf)
+        o3 = torch.optim.Adam([th], lr=sim.FIT_LR)
+        snap = None
+        for it in range(n_steps):
+            act = act_el if it < 60 else act_new
+            o3.zero_grad()
+            b = Kt[ei] + b_scale * th[ei, 0]
+            s = S0 * torch.exp(th[ei, 1])
+            lo = fwd((sp - b) / s / stau, ltau, X, (cbt - b) / (s * cbm) / stau)
+            L = (bce_f(lo, yy, reduction="none") * wrow * act[ei]).sum()
+            L = L + lam * ((((th[:, 0] - c_db) / psd_db) ** 2) * act).sum()
+            L.backward(); o3.step()
+            if it == 59 and n_steps > 60:
+                snap = th.detach().clone()
+        with torch.no_grad():
+            if snap is not None:
+                wm = torch.tensor(warm)
+                th.data[wm] = snap[wm]
+            th.data[torch.tensor(~el)] = prev[~el]
+        has_fit |= el
+        thn = th.detach().numpy()
+        # segment inference — batched through the SAME fwd as the serial path
+        seg_sp, seg_cb, seg_tt, seg_X, seg_b, seg_s, seg_ptr = [], [], [], [], [], [], []
+        for i, e in enumerate(EV):
+            if not el[i]:
+                continue
+            d = e["d"]; g = e["g"]
+            tg = d["tte"][g]
+            sl = (tg <= B) & (tg > B - a.refit_step)
+            if not sl.any():
+                continue
+            gi = g[sl]
+            seg_sp.append(d["spot"][gi]); seg_cb.append(d["cbmid"][gi])
+            seg_tt.append(d["tte"][gi]); seg_X.append(d["X"][gi])
+            seg_b.append(np.full(int(sl.sum()), e["K"] + b_scale * thn[i, 0]))
+            seg_s.append(np.full(int(sl.sum()), S0 * math.exp(thn[i, 1])))
+            seg_ptr.append((i, np.where(sl)[0]))
+        if seg_sp:
+            ssp = torch.tensor(np.concatenate(seg_sp), dtype=torch.float32)
+            scb = torch.tensor(np.concatenate(seg_cb), dtype=torch.float32)
+            stt = torch.tensor(np.concatenate(seg_tt), dtype=torch.float32)
+            sX = torch.tensor(np.concatenate(seg_X).astype(np.float32))
+            sb = torch.tensor(np.concatenate(seg_b), dtype=torch.float32)
+            ssc = torch.tensor(np.concatenate(seg_s), dtype=torch.float32)
+            tau2 = (stt / 900.0).clamp(1e-4, 1.0)
+            with torch.no_grad():
+                lo2 = fwd((ssp - sb) / ssc / tau2.sqrt(), tau2.log(), sX,
+                          (scb - sb) / (ssc * cbm) / tau2.sqrt())
+                fseg = torch.sigmoid(lo2).numpy()
+            off = 0
+            for (i, sl_idx) in seg_ptr:
+                nrows = len(sl_idx)
+                EV[i]["fair"][sl_idx] = fseg[off:off + nrows]
+                EV[i]["dbs"][sl_idx] = thn[i, 0]
+                EV[i]["drs"][sl_idx] = thn[i, 1]
+                off += nrows
+    return {e["t"]: (e["fair"], e["dbs"], e["drs"]) for e in EV}
+
+
 def _fs_worker(payload):
     """Worker-process entry: fair_series for ONE event. The per-event (db, dr)
     fits are independent, so events parallelize perfectly; the torch surface is
@@ -868,7 +1047,14 @@ def _fs_worker(payload):
                torch.tensor(float(js["rho_bar"])), float(js.get("b_scale", 50.0)))
         _WORKER_CACHE[key] = ent
     fwd, rho, b_scale = ent
-    mm = {"js": js, "cb_mult": cb_mult, "kr_mult": kr_mult, "calib": js.get("calib")}
+    # NB: rebuild the FULL model view. Omitting "prior" here silently ran every
+    # pooled shared2p fit with lam=0 and (0,0) cold-init instead of the
+    # population prior + center-init (caught 2026-08-19; the serial path was
+    # always correct — worker parity must mirror parse_model exactly).
+    pr = js.get("prior")
+    mm = {"js": js, "cb_mult": cb_mult, "kr_mult": kr_mult, "calib": js.get("calib"),
+          "prior": ((float(pr["center"][0]), float(pr["center"][1]),
+                     float(pr["psd"][0]), float(pr["lam"])) if pr else None)}
     return t, fair_series(d, mm, strike, rho, b_scale, fwd, *fsargs,
                           live_cal=lc, fit_stride=fit_stride)
 
@@ -907,6 +1093,20 @@ def simulate(m, ev, meta, a):
                  t, ev[t], strike, lc, fsargs, a.fit_stride)
                 for t, strike, outc, lc in elig]
     series = {}
+    if (getattr(a, "batch_calib", False) and m.get("calib") == "shared2p"
+            and m.get("prior") and not getattr(a, "live_calib", None)
+            and a.demean_window <= 0):
+        # batched fitter (one joint Adam per boundary), then the cheap
+        # per-event tail of fair_series (latency fills + filtering) inline
+        t_b = __import__("time").time()
+        pre = batch_calib_shared2p(m, ev, elig, a, fwd, rho, b_scale)
+        print(f"  [{m['label']}] batch-calib: {len(pre)} events "
+              f"({__import__('time').time() - t_b:.0f}s)")
+        for t, strike, outc, lc in elig:
+            series[t] = fair_series(ev[t], m, strike, rho, b_scale, fwd,
+                                    *fsargs, live_cal=None,
+                                    fit_stride=a.fit_stride, precomputed=pre[t])
+        payloads = []
     jobs = getattr(a, "jobs", 1)
     if jobs > 1 and len(payloads) > 1:
         import concurrent.futures as _cf
@@ -1435,7 +1635,16 @@ def main():
                    help="overreact gate: the gap must have been >= this on the OTHER side 1s ago")
     p.add_argument("--rearm-eps", type=float, default=0.02,
                    help="gap must fall below this to re-arm (one trade/episode)")
-    p.add_argument("--trigger", choices=("gap", "move"), default="gap",
+    p.add_argument("--batch-calib", action="store_true",
+                   help="shared2p models: batch the (db,dr) fits across ALL "
+                        "events (one joint Adam per boundary) instead of the "
+                        "per-event pool — ~50-100x faster, numerically "
+                        "equivalent (validated); auto-falls back to the pool "
+                        "for live-calib / demean / non-shared2p")
+    p.add_argument("--row-stride", type=int, default=20,
+                   help="trigger=row: evaluate every Nth scan row independently "
+                        "(20 = 1s on the 50ms grid)")
+    p.add_argument("--trigger", choices=("gap", "move", "row"), default="gap",
                    help="gap = level trigger |fair-mid| >= delta (default). "
                         "move = 1s-DYNAMICS trigger: fire when |dfair_1s| >= delta "
                         "AND |dfair_1s| >= move-k * |dmid_1s| (fair moved, market "
@@ -1500,6 +1709,12 @@ def main():
                         "runs a '+adj' twin with fair2 = sigmoid(logit(fair) + "
                         "w.z + b) — the fast mid-forecast stacked on the "
                         "calibrated fair; same rows, fills and gate machinery")
+    p.add_argument("--flow-vsurge", default="", metavar="FLOW_CSV",
+                   help="flow_feat csv(.gz): compute vsurge 120/1200 the TRAINING "
+                        "way (cumsum of buy+sell vol) and inject it as per-row "
+                        "column 'vsurge_flow' — the sampler's own vsurge column "
+                        "comes from a different (Rust) pipeline and was dead "
+                        "before the mid-Jul aggTrade fix")
     p.add_argument("--out-dir", default="", help="write trades/bce/summary CSVs here")
     p.add_argument("--dump-fair", default="", metavar="PATH",
                    help="also write the causal fair series (ticker,ts_ms,tte_s,"
@@ -1548,6 +1763,34 @@ def main():
         o = np.argsort(d["ts"])
         for k in d:
             d[k] = d[k][o]
+    if a.flow_vsurge:
+        # training-pipeline vsurge (identical to build_extended_eval.vs_at):
+        # share-of-1200s taker volume in the last 120s, on 1s cumsum grid
+        import gzip as _gz
+        _ft, _tot = [], []
+        _op = _gz.open if a.flow_vsurge.endswith(".gz") else open
+        with _op(a.flow_vsurge, "rt") as f:
+            for r in csv.DictReader(f):
+                _ft.append(int(float(r["t"])))
+                _tot.append(float(r["buy_vol"] or 0) + float(r["sell_vol"] or 0))
+        _ft = np.array(_ft); _o = np.argsort(_ft); _ft = _ft[_o]
+        _t0g, _t1g = int(_ft[0]), int(_ft[-1])
+        _arr = np.zeros(_t1g - _t0g + 1)
+        _arr[_ft - _t0g] = np.array(_tot)[_o]
+        _C = np.concatenate([[0.0], np.cumsum(_arr)])
+        S_, L_ = 120, 1200
+        for t, d in ev.items():
+            sec = (d["ts"] / 1000.0).astype(np.int64)
+            i = sec - _t0g + 1
+            vs = np.full(len(sec), np.nan)
+            mm = (sec - L_ >= _t0g) & (sec <= _t1g)
+            ii = i[mm]
+            den = _C[ii] - _C[ii - L_]
+            vs[mm] = np.where(den > 0, (_C[ii] - _C[ii - S_]) / np.where(den > 0, den, 1), np.nan)
+            d["vsurge_flow"] = vs
+        print(f"flow vsurge: {a.flow_vsurge} covers "
+              f"{time.strftime('%Y-%m-%d', time.gmtime(_t0g))} .. "
+              f"{time.strftime('%Y-%m-%d', time.gmtime(_t1g))}")
     cache = a.meta_cache or os.path.join(os.path.dirname(paths[0]), "meta_cache.json")
     meta = sim.fetch_meta(sorted(ev), cache)
     print(f"events: {len(ev)}  (meta cache: {cache})")

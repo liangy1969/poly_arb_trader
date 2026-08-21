@@ -695,6 +695,29 @@ impl Engine {
             return;
         }
 
+        // Per-EVENT position cap (§ user 2026-08-20). Directional exposure for
+        // this market = qty(traded side) - qty(complement), in shares. A buy
+        // that would push exposure beyond `max_open_units * size_shares` is
+        // rejected; a buy on the opposite side REDUCES exposure (it is how a
+        // Kalshi long is closed) and always passes. 0 = uncapped.
+        if self.cfg.sizing.max_open_units > 0.0 {
+            let cap = self.cfg.sizing.max_open_units * self.cfg.sizing.size_shares;
+            let held_same = self.pm.qty(&instrument);
+            let held_opp = self.pm.qty(&complement(&instrument));
+            let exposure = held_same - held_opp;
+            if exposure + size > cap + 1e-9 {
+                self.report(
+                    &trade_id,
+                    &instrument,
+                    "Rejected",
+                    &format!(
+                        "position cap: exposure {exposure:+.2} + {size:.2} > {cap:.2}                          (held same {held_same:.2}, opp {held_opp:.2})"
+                    ),
+                );
+                return;
+            }
+        }
+
         // Risk gate (§9 feasible subset).
         if let Err(reason) = self.risk.check(s, book, tte_ms, now, size, book.best_ask) {
             self.report(&trade_id, &instrument, "Rejected", &reason);

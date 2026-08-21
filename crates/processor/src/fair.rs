@@ -51,6 +51,42 @@ struct ModelJson {
     mu: Vec<f64>,
     #[serde(default)]
     sd: Vec<f64>,
+    /// `"shared2p"`: ONE money line b for both venues after the perp is
+    /// shifted by a deterministic venue offset (see `offset`), so the online
+    /// fit is (Δb, Δρ) against a cb-anchored price pair.
+    #[serde(default)]
+    calib: Option<String>,
+    /// `"causal"`: the perp price fed to the surface is `perp − off`, where
+    /// `off` is the expanding mean of (perp − cb) from event start.
+    #[serde(default)]
+    offset: Option<String>,
+    /// Gaussian prior on Δb only: loss += lam·((Δb − c_db)/psd_db)².
+    /// `center` also seeds the cold-start init (Δb, Δρ) so the width starts
+    /// at the offline population mean instead of the model default.
+    #[serde(default)]
+    prior: Option<PriorJson>,
+}
+
+#[derive(Deserialize, Clone, Copy)]
+pub struct PriorJsonInner {
+    pub lam: f64,
+}
+
+#[derive(Deserialize)]
+struct PriorJson {
+    center: Vec<f64>,
+    psd: Vec<f64>,
+    lam: f64,
+}
+
+/// Online-calibration prior: Gaussian on Δb, centred at the training
+/// population mean. `init` is the cold-start (Δb, Δρ).
+#[derive(Clone, Copy, Debug)]
+pub struct CalibPrior {
+    pub c_db: f64,
+    pub c_dr: f64,
+    pub psd_db: f64,
+    pub lam: f64,
 }
 
 /// The frozen fair-probability surface.
@@ -67,6 +103,14 @@ pub struct FairSurface {
     pub extras: Vec<String>,
     mu: Vec<f64>,
     sd: Vec<f64>,
+    /// shared2p: cb-anchored single money line + causal venue offset.
+    pub shared2p: bool,
+    /// Causal venue offset requested (perp shifted by expanding mean of
+    /// (perp − cb) from event start). The offset itself is tracked per event
+    /// by the caller (`calib.rs`), not here.
+    pub causal_offset: bool,
+    /// Online-calibration prior on Δb (+ cold-start init). None = legacy.
+    pub prior: Option<CalibPrior>,
 }
 
 /// One calibration sample: tte seconds, reference price, kalshi YES mid, and
@@ -131,6 +175,14 @@ impl FairSurface {
             rho_bar: js.rho_bar,
             rho_cb: js.rho_cb,
             b_scale: js.b_scale,
+            shared2p: js.calib.as_deref() == Some("shared2p"),
+            causal_offset: js.offset.as_deref() == Some("causal"),
+            prior: js.prior.as_ref().map(|p| CalibPrior {
+                c_db: p.center[0],
+                c_dr: *p.center.get(1).unwrap_or(&0.0),
+                psd_db: p.psd[0],
+                lam: p.lam,
+            }),
             extras: js.extras,
             mu: js.mu,
             sd: js.sd,
@@ -207,7 +259,23 @@ impl FairSurface {
             // stable BCE-with-logits: max(l,0) − l·y + ln(1 + e^{−|l|})
             acc += l.max(0.0) - l * y + (-l.abs()).exp().ln_1p();
         }
-        acc / rows.len() as f64
+        let mut loss = acc / rows.len() as f64;
+        // Gaussian prior on Δb ONLY (Δρ stays free) — mirrors the offline
+        // harness: loss = mean-BCE + lam·((Δb − c_db)/psd_db)².
+        if let Some(pr) = self.prior {
+            let z = (d_b - pr.c_db) / pr.psd_db;
+            loss += pr.lam * z * z;
+        }
+        loss
+    }
+
+    /// Cold-start (Δb, Δρ) for a fresh event: the prior centre when a prior
+    /// is configured, else the legacy (0, 0).
+    pub fn init_params(&self) -> (f64, f64) {
+        match self.prior {
+            Some(pr) => (pr.c_db, pr.c_dr),
+            None => (0.0, 0.0),
+        }
     }
 
     /// Full-batch Adam on (Δb, Δρ), central-FD gradients. Fresh moment state
@@ -780,5 +848,126 @@ mod tests {
         let (db2b, dr2b) = m.fit(&rows2, case.strike, (db1, dr1), case.stage2.steps, 0.05);
         let d2b = max_fair_diff(&m, &case, db2b, dr2b, &case.stage2.fair_core);
         assert!(d2b < 0.005, "own-chain max |Δfair| = {d2b}");
+    }
+}
+
+#[cfg(test)]
+mod shared2p_tests {
+    //! Parity for the shared2p path actually deployed: cb-anchored two-price
+    //! surface on the OFFSET-ADJUSTED perp, plus the online fit with the Δb
+    //! Gaussian prior and prior-centred cold start. Vectors are produced by
+    //! `scratchpad/gen_shared2p_vectors.py` from the same Python forward used
+    //! for every offline result.
+    use super::*;
+    use serde::Deserialize;
+
+    #[derive(Deserialize)]
+    struct S2Row {
+        tte_s: f64,
+        px: f64,
+        cb: f64,
+        mid: f64,
+        feats: Vec<f64>,
+    }
+    #[derive(Deserialize)]
+    struct S2Stage {
+        fit_tte_gt: f64,
+        steps: u32,
+        init: (f64, f64),
+        db: f64,
+        dr: f64,
+        fair_core: Vec<f64>,
+    }
+    #[derive(Deserialize)]
+    struct S2NoPrior {
+        db: f64,
+        dr: f64,
+    }
+    #[derive(Deserialize)]
+    struct S2Case {
+        strike: f64,
+        rows: Vec<S2Row>,
+        stage1: S2Stage,
+        stage2: S2Stage,
+        noprior: S2NoPrior,
+        core_idx: Vec<usize>,
+    }
+
+    fn s2model() -> FairSurface {
+        FairSurface::load(&format!("{}/../../models/fair-2p-shared-ex5.json",
+                                   env!("CARGO_MANIFEST_DIR"))).unwrap()
+    }
+
+    fn case() -> S2Case {
+        serde_json::from_str(&std::fs::read_to_string(
+            format!("{}/testdata/shared2p_case.json", env!("CARGO_MANIFEST_DIR"))).unwrap()).unwrap()
+    }
+
+    fn rows_gt(c: &S2Case, gt: f64) -> Vec<FitRow> {
+        c.rows.iter().filter(|r| r.tte_s > gt).map(|r| {
+            let mut f = [0.0; MAX_EXTRA];
+            f[..r.feats.len()].copy_from_slice(&r.feats);
+            FitRow { tte_s: r.tte_s, px: r.px, px2: r.cb, mid: r.mid, feats: f }
+        }).collect()
+    }
+
+    fn max_fair_diff(m: &FairSurface, c: &S2Case, db: f64, dr: f64, exp: &[f64]) -> f64 {
+        let mut worst: f64 = 0.0;
+        for (k, &i) in c.core_idx.iter().enumerate() {
+            let r = &c.rows[i];
+            let got = m.fair(r.px, r.cb, r.tte_s, c.strike, db, dr, &r.feats);
+            worst = worst.max((got - exp[k]).abs());
+        }
+        worst
+    }
+
+    #[test]
+    fn model_carries_shared2p_flags_and_prior() {
+        let m = s2model();
+        assert!(m.shared2p, "calib:shared2p not parsed");
+        assert!(m.causal_offset, "offset:causal not parsed");
+        let pr = m.prior.expect("prior not parsed");
+        assert!(pr.lam > 0.0 && pr.psd_db > 0.0);
+        // cold start must be the prior centre, not (0,0)
+        let (i0, i1) = m.init_params();
+        assert_eq!((i0, i1), (pr.c_db, pr.c_dr));
+    }
+
+    #[test]
+    fn shared2p_fit_parity_with_prior() {
+        let m = s2model();
+        let c = case();
+        // stage 1: cold fit STARTED AT THE PRIOR CENTRE
+        let r1 = rows_gt(&c, c.stage1.fit_tte_gt);
+        let (db1, dr1) = m.fit(&r1, c.strike, c.stage1.init, c.stage1.steps, 0.05);
+        let d1 = max_fair_diff(&m, &c, db1, dr1, &c.stage1.fair_core);
+        assert!(d1 < 0.005, "stage1 |Δfair| {d1} (db {db1} vs {}, dr {dr1} vs {})",
+                c.stage1.db, c.stage1.dr);
+        // stage 2: warm refit
+        let r2 = rows_gt(&c, c.stage2.fit_tte_gt);
+        let (db2, dr2) = m.fit(&r2, c.strike, c.stage2.init, c.stage2.steps, 0.05);
+        let d2 = max_fair_diff(&m, &c, db2, dr2, &c.stage2.fair_core);
+        assert!(d2 < 0.005, "stage2 |Δfair| {d2}");
+        // own chain (stage2 warm-started from OUR stage1) — how it runs live
+        let (db2b, dr2b) = m.fit(&r2, c.strike, (db1, dr1), c.stage2.steps, 0.05);
+        let d2b = max_fair_diff(&m, &c, db2b, dr2b, &c.stage2.fair_core);
+        assert!(d2b < 0.005, "own-chain |Δfair| {d2b}");
+    }
+
+    #[test]
+    fn prior_actually_binds() {
+        // Fitting the SAME rows without the prior must land measurably further
+        // from the prior centre — proves the penalty term is live, not inert.
+        let m = s2model();
+        let c = case();
+        let pr = m.prior.unwrap();
+        let r1 = rows_gt(&c, c.stage1.fit_tte_gt);
+        let (db_p, _) = m.fit(&r1, c.strike, c.stage1.init, c.stage1.steps, 0.05);
+        let d_with = (db_p - pr.c_db).abs();
+        let d_without = (c.noprior.db - pr.c_db).abs();
+        assert!(d_with < d_without,
+                "prior did not pull Δb toward centre: with {d_with} vs without {d_without}");
+        // and it should agree with the Python prior-on fit
+        assert!((db_p - c.stage1.db).abs() < 5e-3, "db {db_p} vs python {}", c.stage1.db);
     }
 }
