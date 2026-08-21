@@ -369,6 +369,10 @@ struct RideState {
     armed: bool,
     /// last `fairlog` sample time for this event (online-vs-offline check).
     fairlog_ns: i64,
+    /// throttle for gate-REJECT episode logs. Under `episode_arm` a reject no
+    /// longer consumes the arm, so an un-throttled reject re-logs on EVERY
+    /// tick while |gap|>=delta (~500/s/event => ~4GB/day, disk-fill risk).
+    gate_log_ns: i64,
     /// demeaned-trigger baseline: (ts_ns, gap) at ~1s grain under the CURRENT
     /// params (prefilled from `ring` on every calib update); `base_sum` keeps
     /// the running sum so the mean is O(1) per eval.
@@ -392,6 +396,7 @@ impl RideState {
             entries: 0,
             armed: true,
             fairlog_ns: 0,
+            gate_log_ns: 0,
             base_hist: VecDeque::new(),
             base_sum: 0.0,
             base_last_ns: 0,
@@ -745,12 +750,14 @@ impl FairRideRule {
                 _ => (false, f64::NAN, f64::NAN),
             };
             if !ok {
-                tracing::info!(
+                let log_ok = now - st.gate_log_ns >= 1_000_000_000;
+                if log_ok { st.gate_log_ns = now; }
+                if log_ok { tracing::info!(
                     target: "episode",
                     "{} DISARM tte={:.1} fair={:.4} mid={:.4} gap={:+.4} entry#{} gate=REJECT-STABLE mid_range={:.4} dfair={:+.4} win_n={} win_ms={:.0} (max_range={:.3} open_min={:.3} w={:.2}s)",
                     inst, tte_s, fair, mid, sig, entry_no, range, dfair, n_win, anchor_ms,
                     cfg.stab_max_c, cfg.open_min, cfg.stab_window_s
-                );
+                ); }
                 ungate!(st);
                 st.ring.push_back(push);
                 return None;
