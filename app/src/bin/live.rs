@@ -500,10 +500,24 @@ async fn main() -> anyhow::Result<()> {
                                             ob_log_ns = now;
                                             let js: Vec<String> =
                                                 lg.iter().map(|v| format!("{v:.4}")).collect();
+                                            // also dump the INPUT vector: the
+                                            // logits are only interpretable
+                                            // against the features that made
+                                            // them, and a live-vs-lake feature
+                                            // diff is the actual verification.
+                                            let fs = match o.window_feats() {
+                                                Some(w) => arb_processor::OB_W_FEATS
+                                                    .iter()
+                                                    .zip(w.iter())
+                                                    .map(|(n, v)| format!("{n}={v:.5}"))
+                                                    .collect::<Vec<_>>()
+                                                    .join(" "),
+                                                None => "-".to_string(),
+                                            };
                                             tracing::info!(
                                                 target: "ob",
-                                                "logits bar={} [{}]",
-                                                o.logits_bar(), js.join(",")
+                                                "logits bar={} [{}] feats {}",
+                                                o.logits_bar(), js.join(","), fs
                                             );
                                         }
                                     }
