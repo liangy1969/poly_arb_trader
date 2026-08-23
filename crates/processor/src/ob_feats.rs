@@ -437,8 +437,12 @@ impl ObFeats {
             let m = 0.5 * (bb + ba);
             if m > 0.0 {
                 let lm = m.ln();
-                let changed = bb != self.dbb || ba != self.dba
-                    || bq != self.dbq || aq != self.daq;
+                // PRICE-only, matching ob_wfeats.py:
+                //   quote_moved = (best_b != prev_bb_px) or (best_a != prev_ba_px)
+                // Counting SIZE changes here made i_qupd ~25x the lake's rate
+                // (live lqupd_1s 2.20 => 8 changes/s vs a training mean of
+                // 0.31/s), saturating every lqupd_W input at its clip ceiling.
+                let changed = bb != self.dbb || ba != self.dba;
                 if changed {
                     if self.w_last_lm.is_finite() {
                         let d = lm - self.w_last_lm;
