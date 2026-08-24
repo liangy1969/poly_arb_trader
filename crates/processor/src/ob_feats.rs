@@ -47,6 +47,23 @@ const C_BIG: usize = 7;
 
 /// Design-B (§11.6) feature names, in the trainer's exact emission order:
 /// for each window, then `spread_bps` last.
+/// §11.10 `spnorm` reference window, in BARS: 30 min. Must match
+/// `ob_dist_w.py::REF_SP`. This is the B4 warmup — 30 minutes after a
+/// restart before any logit publishes (design B needed only 60s).
+pub const REF_SP_BARS: usize = 18000;
+/// BTCUSDT tick size, for expressing the spread in ticks (scale-free).
+pub const TICK_BTC: f64 = 0.1;
+
+/// Design-B4 (§11.10b) feature names. Identical to `OB_W_FEATS` except the
+/// trailing point-in-time `spread_bps` is replaced by the normalised
+/// `spnorm` = log(spread_ticks / 30-min mean spread).
+pub const OB_W4_FEATS: [&str; 22] = [
+    "tfifrac_1s", "ofin_1s", "retstd_1s", "ltv_1s", "lnt_1s", "bigfrac_1s", "lqupd_1s",
+    "tfifrac_10s", "ofin_10s", "retstd_10s", "ltv_10s", "lnt_10s", "bigfrac_10s", "lqupd_10s",
+    "tfifrac_60s", "ofin_60s", "retstd_60s", "ltv_60s", "lnt_60s", "bigfrac_60s", "lqupd_60s",
+    "spnorm",
+];
+
 pub const OB_W_FEATS: [&str; 22] = [
     "tfifrac_1s", "ofin_1s", "retstd_1s", "ltv_1s", "lnt_1s", "bigfrac_1s", "lqupd_1s",
     "tfifrac_10s", "ofin_10s", "retstd_10s", "ltv_10s", "lnt_10s", "bigfrac_10s", "lqupd_10s",
@@ -95,6 +112,8 @@ struct ObNetJson {
 pub enum ObNetKind {
     /// legacy bar-bucketed `OB_FEATS` columns (pre-§11)
     Legacy,
+    /// §11.10b B4 window features, consumed in `OB_W4_FEATS` order
+    Window4,
     /// §11 window features, consumed in `OB_W_FEATS` order
     Window,
 }
@@ -124,9 +143,17 @@ impl ObNet {
             "lo/hi/mu/sd must all be {n_in} long"
         );
         // Window nets declare exactly the OB_W_FEATS names, in order.
-        let is_window = js.live_cols.len() == OB_W_FEATS.len()
-            && js.live_cols.iter().zip(OB_W_FEATS.iter()).all(|(a, b)| a == b);
-        let kind = if is_window { ObNetKind::Window } else { ObNetKind::Legacy };
+        let matches = |names: &[&str]| {
+            js.live_cols.len() == names.len()
+                && js.live_cols.iter().zip(names.iter()).all(|(a, b)| a == b)
+        };
+        let kind = if matches(&OB_W4_FEATS) {
+            ObNetKind::Window4
+        } else if matches(&OB_W_FEATS) {
+            ObNetKind::Window
+        } else {
+            ObNetKind::Legacy
+        };
         let mut idx = Vec::with_capacity(n_in);
         if kind == ObNetKind::Legacy {
             for c in &js.live_cols {
@@ -175,7 +202,7 @@ impl ObNet {
 
     /// §11 window path: the vector is already in the net's own order.
     pub fn logits_window(&self, x: &[f64]) -> Option<Vec<f64>> {
-        debug_assert_eq!(self.kind, ObNetKind::Window);
+        debug_assert!(matches!(self.kind, ObNetKind::Window | ObNetKind::Window4));
         self.forward(x)
     }
 
@@ -287,6 +314,21 @@ pub struct ObFeats {
     w_quote_age: f64,
     /// spread in bps at the bar edge
     w_spread_bps: f64,
+    // ---- §11.10 B4: time-weighted spread integral (ticks x seconds) ----
+    // Spread is a step function between quote changes, so sum(prev_spread x
+    // elapsed) is EXACT and the 30-min mean is a class-A cumulative
+    // difference — not a bar-based rolling mean, which would violate §10.7.
+    /// per-bar `i_spdt` increment
+    wi_spdt: f64,
+    /// 30-min ring of `i_spdt` increments, and its running sum
+    sp_ring: std::collections::VecDeque<f64>,
+    sp_sum: f64,
+    /// spread in TICKS as of the last depth event (bar-edge value)
+    w_sp_ticks: f64,
+    /// last depth-event timestamp, for the time weighting
+    w_prev_ts_ns: i64,
+    /// spread in ticks at `w_prev_ts_ns` (the step being integrated)
+    w_prev_sp_ticks: f64,
     /// bars observed since start (explicit warmup, mirrors WARMUP_BARS)
     w_bars: i64,
     /// Optional OB distribution model. When present, `roll()` evaluates it on
@@ -357,6 +399,12 @@ impl ObFeats {
             w_last_lm: f64::NAN,
             w_quote_age: 0.0,
             w_spread_bps: f64::NAN,
+            wi_spdt: 0.0,
+            sp_ring: std::collections::VecDeque::new(),
+            sp_sum: 0.0,
+            w_sp_ticks: f64::NAN,
+            w_prev_ts_ns: i64::MIN,
+            w_prev_sp_ticks: f64::NAN,
             w_bars: 0,
             net: None,
             logits: None,
@@ -434,6 +482,21 @@ impl ObFeats {
             // §11 counters accumulated AT THE EVENT SOURCE (class C -> A):
             // squared and absolute log-mid return BETWEEN CONSECUTIVE
             // best-quote changes, plus the change count.
+            // §11.10 i_spdt: integrate the PREVIOUS spread over the elapsed
+            // interval, then latch the new one. Accumulated on EVERY book
+            // event (not only quote moves), matching ob_wfeats.py — `roll`
+            // has already advanced the bar, so the interval is attributed to
+            // the bar containing `ts_ns`, exactly as the lake does.
+            if self.w_prev_ts_ns != i64::MIN && self.w_prev_sp_ticks.is_finite() {
+                let dt_s = (ts_ns - self.w_prev_ts_ns) as f64 / 1e9;
+                if dt_s > 0.0 {
+                    self.wi_spdt += self.w_prev_sp_ticks * dt_s;
+                }
+            }
+            self.w_prev_ts_ns = ts_ns;
+            self.w_sp_ticks = (ba - bb) / TICK_BTC;
+            self.w_prev_sp_ticks = self.w_sp_ticks;
+
             let m = 0.5 * (bb + ba);
             if m > 0.0 {
                 let lm = m.ln();
@@ -652,8 +715,16 @@ impl ObFeats {
         while self.w_logmid.len() > maxw + 1 {
             self.w_logmid.pop_front();
         }
+        // 30-min spdt ring for B4's `spnorm` reference
+        self.sp_ring.push_back(self.wi_spdt);
+        self.sp_sum += self.wi_spdt;
+        while self.sp_ring.len() > REF_SP_BARS {
+            self.sp_sum -= self.sp_ring.pop_front().unwrap_or(0.0);
+        }
+
         self.w_quote_age += 1.0;
         self.w_bars += 1;
+        self.wi_spdt = 0.0;
         self.wi_r2 = 0.0;
         self.wi_absm = 0.0;
         self.wi_qupd = 0.0;
@@ -665,6 +736,9 @@ impl ObFeats {
         // partial vector.
         if let Some(net) = self.net.as_ref() {
             let lg = match net.kind {
+                ObNetKind::Window4 => {
+                    self.window_feats_b4().and_then(|f| net.logits_window(&f))
+                }
                 ObNetKind::Window => self.window_feats().and_then(|f| net.logits_window(&f)),
                 ObNetKind::Legacy => {
                     if valid { net.logits(&self.out) } else { None }
@@ -719,6 +793,71 @@ impl ObFeats {
             out[k] = qupd.max(0.0).ln_1p(); k += 1;         // lqupd_W
         }
         out[k] = self.w_spread_bps;
+        if out.iter().any(|v| !v.is_finite()) {
+            return None;
+        }
+        Some(out)
+    }
+
+    /// Design-B4 (§11.10b) window features for the bar that just closed, in
+    /// the trainer's emission order (`OB_W4_FEATS`). Differs from
+    /// `window_feats` in exactly the three ways §11.9/§11.10 specify:
+    ///
+    /// 1. the volume denominator is FLOORED at 10% of the volume expected in
+    ///    this window from the trailing 60s rate — `ofin_1s` reached 1.3e11
+    ///    on the 15.0% of 1s windows that contain no trades at all;
+    /// 2. the rv denominator is floored the same way (scaled sqrt of the
+    ///    window ratio, since rv ~ sqrt(t));
+    /// 3. the trailing `spread_bps` — a function of PRICE LEVEL, since BTC's
+    ///    spread is pinned at one tick — becomes `spnorm`, the log of the
+    ///    spread over its own 30-minute mean.
+    ///
+    /// Returns `None` on a book-event gap (`spref <= 0`), where the lake
+    /// drops the bar rather than fabricate a reference.
+    pub fn window_feats_b4(&self) -> Option<[f64; OB_W4_FEATS.len()]> {
+        let maxw = W_WINDOWS[W_WINDOWS.len() - 1].0;
+        if self.w_ring.len() <= maxw || self.w_logmid.len() <= maxw {
+            return None; // 60s counter warmup
+        }
+        if self.sp_ring.len() < REF_SP_BARS {
+            return None; // 30-min spnorm reference warmup
+        }
+        const EPS: f64 = 1e-9;
+        let lm_now = *self.w_logmid.back()?;
+        // 60s reference rates that floor the ratio denominators
+        let s60 = &self.w_sum[W_WINDOWS.len() - 1];
+        let vol60 = s60[C_VOL];
+        let rv60 = s60[C_R2].max(0.0).sqrt() * 1e4;
+        let wmax = maxw as f64;
+
+        let mut out = [0.0f64; OB_W4_FEATS.len()];
+        let mut k = 0usize;
+        for (wi, (w, _)) in W_WINDOWS.iter().enumerate() {
+            let sm = &self.w_sum[wi];
+            let (ofi, r2, qupd) = (sm[C_OFI], sm[C_R2].max(0.0), sm[C_QUPD]);
+            let (vol, buy, cnt, big) = (sm[C_VOL], sm[C_BUY], sm[C_CNT], sm[C_BIG]);
+            let tfi = 2.0 * buy - vol;
+            let rv = r2.sqrt() * 1e4;
+            let frac = *w as f64 / wmax;
+            let den = vol.max(0.1 * vol60 * frac) + EPS;
+            let drv = rv.max(0.1 * rv60 * frac.sqrt()) + EPS;
+            let lm_then = self.w_logmid[self.w_logmid.len() - 1 - *w];
+            let ret_bp = (lm_now - lm_then) * 1e4;
+            out[k] = tfi / den; k += 1;                     // tfifrac_W
+            out[k] = ofi / den; k += 1;                     // ofin_W
+            out[k] = ret_bp / drv; k += 1;                  // retstd_W
+            out[k] = vol.max(0.0).ln_1p(); k += 1;          // ltv_W
+            out[k] = cnt.max(0.0).ln_1p(); k += 1;          // lnt_W
+            out[k] = big / den; k += 1;                     // bigfrac_W
+            out[k] = qupd.max(0.0).ln_1p(); k += 1;         // lqupd_W
+        }
+        // spnorm = log(spread_ticks / mean spread over REF_SP). The ring
+        // holds ticks x seconds, so the mean is sum / (REF_SP bars x 0.1 s).
+        let spref = self.sp_sum / (REF_SP_BARS as f64 * 0.1);
+        if !(spref > 0.0) {
+            return None; // book-event gap: no reference, drop the bar
+        }
+        out[k] = (self.w_sp_ticks.max(1e-9) / spref).ln();
         if out.iter().any(|v| !v.is_finite()) {
             return None;
         }
