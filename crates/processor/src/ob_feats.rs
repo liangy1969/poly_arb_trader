@@ -318,6 +318,8 @@ pub struct ObFeats {
     // Spread is a step function between quote changes, so sum(prev_spread x
     // elapsed) is EXACT and the 30-min mean is a class-A cumulative
     // difference — not a bar-based rolling mean, which would violate §10.7.
+    /// last cumulative large-print volume seen on `.vol` (price field)
+    last_big_evt: f64,
     /// per-bar `i_spdt` increment
     wi_spdt: f64,
     /// 30-min ring of `i_spdt` increments, and its running sum
@@ -406,6 +408,7 @@ impl ObFeats {
             w_last_lm: f64::NAN,
             w_quote_age: 0.0,
             w_spread_bps: f64::NAN,
+            last_big_evt: f64::NAN,
             wi_spdt: 0.0,
             sp_ring: std::collections::VecDeque::new(),
             sp_sum: 0.0,
@@ -542,17 +545,40 @@ impl ObFeats {
     }
 
     /// `.vol` feed (cumulative TOTAL taker volume).
-    pub fn on_vol(&mut self, ts_ns: i64, cum_vol: f64) {
+    /// `cum_vol` = cumulative taker volume; `cum_big` = cumulative volume of
+    /// individual prints >= `BIG_BTC`, both accumulated per-aggTrade by the
+    /// collector.
+    ///
+    /// `i_big` MUST come from `cum_big`, not from thresholding this feed's own
+    /// delta: `.vol` is published on a ~200 ms throttle, so `d` here is a
+    /// BUCKET TOTAL, and `bucket >= 1 BTC` is a different predicate from
+    /// `print >= 1 BTC` — a 1s window holds ~5 buckets, so bucket totals clear
+    /// the bar far more often than any single print does. Measured bar-exact
+    /// against the lake, the old form inflated `bigfrac_W` by ~45% (live 0.80
+    /// vs lake 0.55 at 60s) and carried ~15% of the live-vs-lake logit
+    /// divergence, with the tell-tale FLAT correlation across windows
+    /// (0.66/0.71/0.66) of a definition mismatch rather than noise
+    /// (OB_DIST_MODEL 11.13).
+    ///
+    /// `bigtr_acc` (the legacy `ob_bigtr` column) stays on the bucket delta:
+    /// it is a MAX print size, which a cumulative counter cannot express. It
+    /// is therefore still bucket-distorted, and is a known limitation of the
+    /// legacy feature space — design B4 does not use it.
+    pub fn on_vol(&mut self, ts_ns: i64, cum_vol: f64, cum_big: f64) {
         self.roll(ts_ns);
         if self.last_vol_evt.is_finite() && cum_vol > self.last_vol_evt {
             let d = cum_vol - self.last_vol_evt;
             if d > self.bigtr_acc {
                 self.bigtr_acc = d;
             }
-            // §11 `i_big`: VOLUME of large prints (additive), not a max.
-            if d >= BIG_BTC {
-                self.wi_big += d;
+        }
+        // §11 `i_big`: VOLUME of large prints (additive), differenced from the
+        // collector's exact per-print counter.
+        if cum_big.is_finite() {
+            if self.last_big_evt.is_finite() && cum_big > self.last_big_evt {
+                self.wi_big += cum_big - self.last_big_evt;
             }
+            self.last_big_evt = cum_big;
         }
         self.last_vol_evt = cum_vol;
         self.cum_vol = cum_vol;
@@ -1044,7 +1070,7 @@ mod obwnet_tests {
         let mut f = ObFeats::new();
         let mut t = 0i64;
         let mut px = 100_000.0f64;
-        f.on_vol(t, 0.0);
+        f.on_vol(t, 0.0, 0.0);
         f.on_volb(t, 0.0, 0.0);
         let mut cum = 0.0;
         let mut cum_buy = 0.0;
@@ -1054,7 +1080,7 @@ mod obwnet_tests {
             f.on_depth_best(t, px - 0.5, 3.0, px + 0.5, 4.0);
             cum += 0.4;
             cum_buy += 0.25;
-            f.on_vol(t, cum);
+            f.on_vol(t, cum, 0.0);
             f.on_volb(t, cum_buy, (i + 1) as f64);
             if i == 300 {
                 assert!(f.window_feats().is_none(), "must not publish before 600 bars");
@@ -1065,5 +1091,61 @@ mod obwnet_tests {
         assert!(w.iter().all(|v| v.is_finite()));
         // spread 1.0 on a ~100k mid ~= 0.1bp
         assert!((w[OB_W_FEATS.len() - 1] - 0.1).abs() < 0.05, "spread_bps {}", w[OB_W_FEATS.len() - 1]);
+    }
+
+    /// `i_big` must be the collector's exact per-print counter, NOT a
+    /// threshold applied to this feed's own delta.
+    ///
+    /// The tape below is the case that actually broke live: every print is
+    /// 0.2 BTC — so NO print is large and `i_big` must stay 0 — but `.vol` is
+    /// published on a ~200 ms throttle, so each delivered delta is a bucket
+    /// total of 1.0 BTC and the old `d >= BIG_BTC` form counted ALL of it as
+    /// large. That inflated `bigfrac_W` by ~45% against the lake
+    /// (OB_DIST_MODEL 11.13).
+    #[test]
+    fn i_big_counts_prints_not_throttled_buckets() {
+        let mut f = ObFeats::new();
+        let mut t = 0i64;
+        let px = 100_000.0f64;
+        f.on_vol(t, 0.0, 0.0);
+        f.on_volb(t, 0.0, 0.0);
+        let mut cum = 0.0f64;
+        // 5 prints of 0.2 BTC per bucket, delivered as ONE 1.0 BTC delta.
+        for i in 0..900 {
+            t += 100_000_000;
+            f.on_depth_best(t, px - 0.5, 3.0, px + 0.5, 4.0);
+            cum += 1.0;
+            f.on_vol(t, cum, 0.0); // collector says: no large prints
+            f.on_volb(t, 0.5 * cum, (5 * (i + 1)) as f64);
+        }
+        f.roll(t + 100_000_000);
+        let w = f.window_feats().expect("warm");
+        let bf = w[5]; // bigfrac_1s
+        assert!(bf.abs() < 1e-9, "bigfrac must be 0 when no PRINT is large, got {bf}");
+
+        // Same tape, but the collector reports half the volume as large prints.
+        let mut g = ObFeats::new();
+        let mut t = 0i64;
+        g.on_vol(t, 0.0, 0.0);
+        g.on_volb(t, 0.0, 0.0);
+        let (mut cum, mut big) = (0.0f64, 0.0f64);
+        for i in 0..900 {
+            t += 100_000_000;
+            g.on_depth_best(t, px - 0.5, 3.0, px + 0.5, 4.0);
+            cum += 1.0;
+            big += 0.5;
+            g.on_vol(t, cum, big);
+            g.on_volb(t, 0.5 * cum, (5 * (i + 1)) as f64);
+        }
+        g.roll(t + 100_000_000);
+        let bf2 = g.window_feats().expect("warm")[5];
+        assert!((bf2 - 0.5).abs() < 1e-6, "bigfrac should track the counter, got {bf2}");
+    }
+
+    /// The collector's threshold and the processor's must be the same number,
+    /// and must match `ob_wfeats.py::BIG_BTC`.
+    #[test]
+    fn big_threshold_matches_collector() {
+        assert_eq!(BIG_BTC, 1.0, "must equal collector BIG_TRADE_BTC and ob_wfeats.py BIG_BTC");
     }
 }

@@ -300,9 +300,25 @@ fn parse_agg_trade(txt: &str) -> Option<(f64, bool)> {
     Some((q, is_buy))
 }
 
+/// Large-print threshold for the cumulative big-volume counter, in BTC.
+///
+/// MUST equal `arb_processor::ob_feats::BIG_BTC` and `ob_wfeats.py::BIG_BTC`.
+/// Duplicated rather than imported because the collector must not depend on
+/// the processor; `ob_feats.rs` asserts the two agree.
+pub const BIG_TRADE_BTC: f64 = 1.0;
+
 /// aggTrade session: accumulate perp taker volume into a MONOTONE cumulative
 /// counter and publish it (throttled) on the `.vol` instrument. The processor
 /// derives 60s/600s windows from cum(now)−cum(now−W), which is conflation-safe.
+///
+/// `cum_big` is the same idea for LARGE PRINTS: the volume of individual
+/// trades >= BIG_TRADE_BTC. It has to be accumulated HERE, per aggTrade,
+/// because thresholding is not additive — a consumer differencing the plain
+/// `.vol` counter sees a ~200 ms BUCKET TOTAL, and `bucket >= 1 BTC` is a
+/// different predicate from `print >= 1 BTC`. Doing it downstream inflated
+/// `bigfrac_W` by ~45% against the lake and cost ~15% of the live-vs-lake
+/// logit divergence (OB_DIST_MODEL 11.13). This is the 10.7 class-C rule:
+/// a path-dependent quantity must be accumulated at the event source.
 async fn session_aggtrade(
     cfg: &BinanceCfg,
     bus: &Arc<dyn Bus>,
@@ -310,6 +326,7 @@ async fn session_aggtrade(
     cum_vol: &mut f64,
     cum_buy: &mut f64,
     cum_cnt: &mut f64,
+    cum_big: &mut f64,
 ) -> anyhow::Result<()> {
     let stream = format!("{}@aggTrade", cfg.symbol.to_lowercase());
     // Binance USDT-M futures splits its WS endpoints: `/public` carries only the
@@ -350,6 +367,9 @@ async fn session_aggtrade(
                         *cum_buy += q;
                     }
                     *cum_cnt += 1.0;
+                    if q >= BIG_TRADE_BTC {
+                        *cum_big += q;
+                    }
                     let now = now_ns();
                     if now - last_pub_b >= 100_000_000 {
                         bus.publish(Event::new(
@@ -377,7 +397,10 @@ async fn session_aggtrade(
                             nxt(seq),
                             Payload::Trade(TradeTick {
                                 instrument: vol_inst.clone(),
-                                price: 0.0,
+                                // `price` is free on `.vol` and carries the
+                                // cumulative LARGE-PRINT volume, mirroring the
+                                // established `.volb` overload (price = count).
+                                price: *cum_big,
                                 qty: *cum_vol, // cumulative volume, not per-trade
                                 side: Side::Buy,
                                 exch_ts_ns: now,
@@ -404,8 +427,13 @@ async fn run_agg_loop(cfg: BinanceCfg, bus: Arc<dyn Bus>) {
     let mut cum_vol = 0.0f64; // persists across reconnects → stays monotone
     let mut cum_buy = 0.0f64;
     let mut cum_cnt = 0.0f64;
+    let mut cum_big = 0.0f64;
     loop {
-        match session_aggtrade(&cfg, &bus, &mut seq, &mut cum_vol, &mut cum_buy, &mut cum_cnt).await {
+        match session_aggtrade(
+            &cfg, &bus, &mut seq, &mut cum_vol, &mut cum_buy, &mut cum_cnt, &mut cum_big,
+        )
+        .await
+        {
             Ok(()) => backoff = cfg.reconnect_base_ms,
             Err(e) => {
                 tracing::warn!("aggTrade session ended ({e}) -> reconnect in {backoff}ms");

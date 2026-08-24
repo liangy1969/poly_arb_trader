@@ -342,7 +342,7 @@ async fn main() -> anyhow::Result<()> {
                                     feats.on_perp_trade(t.recv_ts_ns, t.qty); // cumulative volume
                                 }
                                 if let Some(o) = obf.as_mut() {
-                                    o.on_vol(t.recv_ts_ns, t.qty);
+                                    o.on_vol(t.recv_ts_ns, t.qty, t.price); // price = cumulative LARGE-PRINT volume
                                 }
                             }
                             Payload::Trade(t) if ob_on && t.instrument == volb_inst => {
