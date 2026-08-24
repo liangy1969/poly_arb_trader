@@ -496,7 +496,7 @@ async fn main() -> anyhow::Result<()> {
                                         // verification log (1/min): the published
                                         // vector + its bar, so live logits can be
                                         // diffed against the lake archive offline.
-                                        if now - ob_log_ns >= 60_000_000_000 {
+                                        if now - ob_log_ns >= 10_000_000_000 {
                                             ob_log_ns = now;
                                             let js: Vec<String> =
                                                 lg.iter().map(|v| format!("{v:.4}")).collect();
@@ -505,8 +505,15 @@ async fn main() -> anyhow::Result<()> {
                                             // against the features that made
                                             // them, and a live-vs-lake feature
                                             // diff is the actual verification.
-                                            let fs = match o.window_feats() {
-                                                Some(w) => arb_processor::OB_W_FEATS
+                                            // Ask the module what it actually
+                                            // fed the net — never rebuild the
+                                            // vector here. Hard-coding design
+                                            // B's window_feats()/OB_W_FEATS
+                                            // meant a B4 net logged the WRONG
+                                            // 22 columns (`spread_bps` while
+                                            // the model consumed `spnorm`).
+                                            let fs = match o.logits_feats() {
+                                                Some((names, w)) => names
                                                     .iter()
                                                     .zip(w.iter())
                                                     .map(|(n, v)| format!("{n}={v:.5}"))
@@ -525,7 +532,7 @@ async fn main() -> anyhow::Result<()> {
                                         for _ in 0..arb_processor::OB_NLOGIT {
                                             s.push_str(",nan");
                                         }
-                                        if now - ob_log_ns >= 60_000_000_000 {
+                                        if now - ob_log_ns >= 10_000_000_000 {
                                             ob_log_ns = now;
                                             tracing::info!(target: "ob",
                                                 "logits UNPUBLISHED (warmup or missing input)");

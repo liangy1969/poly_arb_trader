@@ -339,6 +339,13 @@ pub struct ObFeats {
     logits: Option<Vec<f64>>,
     /// Bar index the published logits belong to (for staleness checks/logs).
     logits_bar: i64,
+    /// The feature vector actually fed to the net on the last published bar,
+    /// with its column names. Cached rather than recomputed by the logger:
+    /// the diagnostic log previously hard-coded `window_feats()` +
+    /// `OB_W_FEATS`, so when a B4 net was loaded it silently dumped design
+    /// B's vector — the log said `spread_bps` while the net consumed
+    /// `spnorm`, and the mismatch cost a full debug cycle.
+    logits_feats: Option<(&'static [&'static str], Vec<f64>)>,
 }
 
 impl Default for ObFeats {
@@ -409,6 +416,7 @@ impl ObFeats {
             net: None,
             logits: None,
             logits_bar: i64::MIN,
+            logits_feats: None,
         }
     }
 
@@ -735,19 +743,34 @@ impl ObFeats {
         // any net input (warmup, dead feed) republishes None rather than a
         // partial vector.
         if let Some(net) = self.net.as_ref() {
-            let lg = match net.kind {
-                ObNetKind::Window4 => {
-                    self.window_feats_b4().and_then(|f| net.logits_window(&f))
+            // Build the input ONCE, keep it, and derive both the logits and
+            // the diagnostic dump from it — so the log can never describe a
+            // different vector than the model consumed.
+            let inp: Option<(&'static [&'static str], Vec<f64>)> = match net.kind {
+                ObNetKind::Window4 => self
+                    .window_feats_b4()
+                    .map(|f| (&OB_W4_FEATS[..], f.to_vec())),
+                ObNetKind::Window => {
+                    self.window_feats().map(|f| (&OB_W_FEATS[..], f.to_vec()))
                 }
-                ObNetKind::Window => self.window_feats().and_then(|f| net.logits_window(&f)),
                 ObNetKind::Legacy => {
-                    if valid { net.logits(&self.out) } else { None }
+                    if valid { Some((&OB_FEATS[..], self.out.to_vec())) } else { None }
                 }
+            };
+            let lg = match (&inp, net.kind) {
+                (Some((_, f)), ObNetKind::Legacy) => {
+                    let mut a = [f64::NAN; OB_FEATS.len()];
+                    a.copy_from_slice(f);
+                    net.logits(&a)
+                }
+                (Some((_, f)), _) => net.logits_window(f),
+                (None, _) => None,
             };
             if lg.is_some() {
                 self.logits_bar = self.cur_bar;
             }
             self.logits = lg;
+            self.logits_feats = if self.logits.is_some() { inp } else { None };
         }
 
         self.ofi_acc = 0.0;
@@ -878,6 +901,12 @@ impl ObFeats {
     /// distribution). `None` during warmup or on a bar with missing inputs.
     pub fn latest_logits(&self) -> Option<&[f64]> {
         self.logits.as_deref()
+    }
+
+    /// The exact feature vector the net consumed for the published logits,
+    /// with its column names. `None` when nothing was published.
+    pub fn logits_feats(&self) -> Option<(&'static [&'static str], &[f64])> {
+        self.logits_feats.as_ref().map(|(n, v)| (*n, v.as_slice()))
     }
 
     /// Bar index the published logits belong to.
