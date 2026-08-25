@@ -96,22 +96,11 @@ impl Signer {
 /// than the first market of every 15-minute event. If Kalshi migrates again,
 /// a `market_not_found` invalidates both entries and the next order re-reads
 /// the truth from the venue.
-#[derive(Default)]
-struct ExchangeIdx {
-    by_ticker: std::collections::HashMap<String, i64>,
-    by_series: std::collections::HashMap<String, i64>,
-}
-
-fn series_of(ticker: &str) -> &str {
-    ticker.split('-').next().unwrap_or(ticker)
-}
-
 /// Live Kalshi order adapter.
 pub struct KalshiVenue {
     http: reqwest::Client,
     signer: Signer,
     base: String,
-    exch: std::sync::Mutex<ExchangeIdx>,
 }
 
 impl KalshiVenue {
@@ -136,7 +125,6 @@ impl KalshiVenue {
             http,
             signer: Signer::load(key_id, pem_path)?,
             base,
-            exch: std::sync::Mutex::new(ExchangeIdx::default()),
         })
     }
 }
@@ -228,55 +216,6 @@ fn extract_reduced_by(v: &serde_json::Value) -> Option<f64> {
     extract_num(v, &["reduced_by", "reduced_by_fp"])
 }
 
-impl KalshiVenue {
-    /// `exchange_index` for `ticker`: cache -> series fast path -> venue.
-    /// Returns `None` only if the venue lookup fails, in which case the order
-    /// is sent without the field (legacy behaviour, exchange 0).
-    async fn exchange_index(&self, ticker: &str) -> Option<i64> {
-        if let Ok(c) = self.exch.lock() {
-            if let Some(v) = c.by_ticker.get(ticker) {
-                return Some(*v);
-            }
-            if let Some(v) = c.by_series.get(series_of(ticker)) {
-                return Some(*v);
-            }
-        }
-        let path = format!("/trade-api/v2/markets/{ticker}");
-        let ts_ms = now_ns() / 1_000_000;
-        let (ts, sig) = self.signer.sign("GET", &path, ts_ms).ok()?;
-        let url = format!("{}/markets/{ticker}", self.base);
-        let resp = self
-            .http
-            .get(&url)
-            .header("KALSHI-ACCESS-KEY", self.signer.key_id.as_str())
-            .header("KALSHI-ACCESS-TIMESTAMP", ts)
-            .header("KALSHI-ACCESS-SIGNATURE", sig)
-            .send()
-            .await
-            .ok()?;
-        if !resp.status().is_success() {
-            return None;
-        }
-        let v: serde_json::Value = resp.json().await.ok()?;
-        let idx = v.get("market")?.get("exchange_index")?.as_i64()?;
-        if let Ok(mut c) = self.exch.lock() {
-            c.by_ticker.insert(ticker.to_string(), idx);
-            c.by_series.insert(series_of(ticker).to_string(), idx);
-        }
-        tracing::info!(target: "exec", "kalshi exchange_index {ticker} = {idx}");
-        Some(idx)
-    }
-
-    /// Drop cached indices for `ticker` so the next order re-reads them. Called
-    /// on `market_not_found`, which is exactly what a migration looks like.
-    fn forget_exchange_index(&self, ticker: &str) {
-        if let Ok(mut c) = self.exch.lock() {
-            c.by_ticker.remove(ticker);
-            c.by_series.remove(series_of(ticker));
-        }
-    }
-}
-
 #[async_trait]
 impl TradingVenue for KalshiVenue {
     async fn submit(&self, intent: &OrderIntent) -> VenueOutcome {
@@ -302,10 +241,15 @@ impl TradingVenue for KalshiVenue {
             "time_in_force": "immediate_or_cancel",
             "self_trade_prevention_type": "taker_at_cross",
         });
-        // Omitting this targets exchange 0; KXBTC15M moved to 2 on 2026-08-25.
-        if let Some(idx) = self.exchange_index(&ticker).await {
-            body["exchange_index"] = serde_json::json!(idx);
-        }
+        // Kalshi shards markets across "exchange_index" 0..N. Per the V2 docs:
+        // "If omitted, auto-routes when ticker is provided; otherwise defaults
+        // to 0. Use -1 to require auto-routing by ticker." Omitting it in
+        // practice routed to shard 0, so when Kalshi moved KXBTC15M/KXETH15M
+        // to shard 2 at 00:00 ET 2026-08-25 every order returned 404
+        // market_not_found and the trader silently stopped filling. -1 asks
+        // Kalshi to resolve the shard from the ticker, which is correct across
+        // any future migration without us tracking shard assignments.
+        body["exchange_index"] = serde_json::json!(-1);
 
         let ts_ms = now_ns() / 1_000_000;
         let (ts, sig) = match self.signer.sign("POST", ORDERS_PATH, ts_ms) {
@@ -329,10 +273,6 @@ impl TradingVenue for KalshiVenue {
         if !resp.status().is_success() {
             let code = resp.status();
             let txt = resp.text().await.unwrap_or_default();
-            if txt.contains("market_not_found") {
-                // Most likely an exchange migration: re-read on the next order.
-                self.forget_exchange_index(&ticker);
-            }
             return VenueOutcome::Rejected(format!("kalshi {code}: {txt}"));
         }
         let parsed: OrderRespV2 = match resp.json().await {
