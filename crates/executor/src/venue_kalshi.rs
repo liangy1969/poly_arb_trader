@@ -47,8 +47,22 @@ use crate::venue_spec::market_id_of;
 // in-region.) Demo is a SEPARATE account + key on external-api.demo.kalshi.co.
 const PROD_BASE: &str = "https://external-api.kalshi.com/trade-api/v2";
 const DEMO_BASE: &str = "https://external-api.demo.kalshi.co/trade-api/v2";
-/// Path component that is signed (must match the request path exactly).
-const ORDERS_PATH: &str = "/trade-api/v2/portfolio/events/orders";
+/// Orders resource: a suffix appended to `base` (which already ends in
+/// `/trade-api/v2`), and the absolute path that gets SIGNED. Kalshi signs
+/// (timestamp + method + path), so the two MUST stay in lockstep — pinned by
+/// a test below.
+///
+/// This was the `portfolio/events/orders` variant until 2026-08-25, when
+/// Kalshi stopped routing it: every POST began returning 404
+/// `{"code":"market_not_found"}` at 04:00 UTC (00:00 ET), and the trader
+/// silently stopped filling for hours while signals, calibration and the gate
+/// all kept working normally. That path had not failed once in the preceding
+/// 53 days. Kalshi now appears to route that prefix as
+/// `portfolio/events/{event_ticker}/orders`, so `orders` was being parsed as
+/// an event ticker — hence "market not found" on POST and a plain
+/// "404 page not found" on GET.
+const ORDERS_SUFFIX: &str = "/portfolio/orders";
+const ORDERS_PATH: &str = "/trade-api/v2/portfolio/orders";
 
 /// RSA-PSS request signer (DESIGN_KALSHI_VENUE §2). Minimal copy of
 /// `arb_collector_kalshi::auth::Signer`; TODO factor a shared `kalshi-auth` crate.
@@ -226,7 +240,7 @@ impl TradingVenue for KalshiVenue {
             Ok(v) => v,
             Err(e) => return VenueOutcome::Rejected(format!("sign: {e}")),
         };
-        let url = format!("{}/portfolio/events/orders", self.base);
+        let url = format!("{}{ORDERS_SUFFIX}", self.base);
         let resp = self
             .http
             .post(&url)
@@ -302,7 +316,7 @@ impl TradingVenue for KalshiVenue {
         });
         let ts_ms = now_ns() / 1_000_000;
         let (ts, sig) = self.signer.sign("POST", ORDERS_PATH, ts_ms).map_err(|e| format!("sign: {e}"))?;
-        let url = format!("{}/portfolio/events/orders", self.base);
+        let url = format!("{}{ORDERS_SUFFIX}", self.base);
         let resp = self
             .http
             .post(&url)
@@ -330,7 +344,7 @@ impl TradingVenue for KalshiVenue {
         let path = format!("{ORDERS_PATH}/{order_id}");
         let ts_ms = now_ns() / 1_000_000;
         let (ts, sig) = self.signer.sign("DELETE", &path, ts_ms).map_err(|e| format!("sign: {e}"))?;
-        let url = format!("{}/portfolio/events/orders/{order_id}", self.base);
+        let url = format!("{}{ORDERS_SUFFIX}/{order_id}", self.base);
         let resp = self
             .http
             .delete(&url)
@@ -361,10 +375,10 @@ impl TradingVenue for KalshiVenue {
     /// query replica hasn't caught up (fresh orders lag ~70-145ms) or the order
     /// id is unknown — not an error.
     async fn order_fill_count(&self, order_id: &str) -> Result<Option<f64>, String> {
-        let path = format!("/trade-api/v2/portfolio/orders/{order_id}");
+        let path = format!("{ORDERS_PATH}/{order_id}");
         let ts_ms = now_ns() / 1_000_000;
         let (ts, sig) = self.signer.sign("GET", &path, ts_ms).map_err(|e| format!("sign: {e}"))?;
-        let url = format!("{}/portfolio/orders/{order_id}", self.base);
+        let url = format!("{}{ORDERS_SUFFIX}/{order_id}", self.base);
         let resp = self
             .http
             .get(&url)
@@ -634,3 +648,29 @@ mod tests {
         assert_eq!(extract_num(&p2, &["position", "position_fp"]), Some(1.0));
     }
 }
+
+#[cfg(test)]
+mod orders_path_tests {
+    use super::*;
+
+    /// The SIGNED path and the REQUESTED url must denote the same path or
+    /// Kalshi rejects the signature. `base` ends in `/trade-api/v2`, so the
+    /// signed absolute path must be exactly that prefix plus our suffix.
+    #[test]
+    fn signed_path_matches_request_path() {
+        for base in [PROD_BASE, DEMO_BASE] {
+            let url = format!("{base}{ORDERS_SUFFIX}");
+            assert!(url.ends_with(ORDERS_PATH), "url {url} must end with signed path {ORDERS_PATH}");
+        }
+        assert!(ORDERS_PATH.ends_with(ORDERS_SUFFIX));
+    }
+
+    /// Guard against re-introducing the endpoint Kalshi stopped routing on
+    /// 2026-08-25 (see the ORDERS_PATH comment).
+    #[test]
+    fn not_the_dead_events_orders_endpoint() {
+        assert!(!ORDERS_PATH.contains("/events/"));
+        assert!(!ORDERS_SUFFIX.contains("/events/"));
+    }
+}
+
