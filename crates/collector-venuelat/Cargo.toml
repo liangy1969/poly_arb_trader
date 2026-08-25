@@ -1,0 +1,19 @@
+[package]
+name = "arb-collector-venuelat"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "arb_collector_venuelat"
+path = "src/lib.rs"
+
+[dependencies]
+arb-core = { path = "../core" }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+tokio-socks = "0.5"
+futures-util = "0.3"

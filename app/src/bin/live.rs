@@ -589,6 +589,12 @@ async fn main() -> anyhow::Result<()> {
     let mut calibrator = arb_processor::Calibrator::new(cfg.calibrator.clone());
     let mut executor = Executor::new(cfg.executor.clone());
 
+    // LOGGING-ONLY venue-latency probe. Takes its own OS thread with a private
+    // current-thread runtime and publishes NOTHING to the bus, so it can
+    // neither occupy a trading worker nor appear in any consumer's stream.
+    // Started before the trading modules only because it is fire-and-forget.
+    arb_collector_venuelat::spawn(cfg.venue_latency.clone());
+
     // Single active prediction venue (DESIGN_MULTI_VENUE): start only its
     // collector. The other is constructed but never connected.
     let active_venue = cfg.executor.venue.market.clone();

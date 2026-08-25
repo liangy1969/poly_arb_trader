@@ -6,6 +6,7 @@ use serde::Deserialize;
 
 use arb_collector_binance::BinanceCfg;
 use arb_collector_cryptospot::CryptoSpotCfg;
+use arb_collector_venuelat::VenueLatCfg;
 use arb_collector_databento::DatabentoCfg;
 use arb_collector_kalshi::KalshiCfg;
 use arb_collector_polymarket::PolyCfg;
@@ -80,6 +81,11 @@ pub struct AppConfig {
     pub processor: ProcCfg,
     pub calibrator: CalibCfg,
     pub recorder: RecorderCfg,
+    /// LOGGING-ONLY cross-venue top-of-book probe (bybit/okx/binance) used to
+    /// rank venue+ticker speed. Runs on its OWN OS thread and publishes
+    /// NOTHING to the bus, so it cannot affect trading latency. Disabled by
+    /// default; see `crates/collector-venuelat`.
+    pub venue_latency: VenueLatCfg,
     pub executor: ExecutorCfg,
     pub run: RunCfg,
 }

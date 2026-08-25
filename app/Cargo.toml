@@ -24,6 +24,7 @@ arb-collector-kalshi = { path = "../crates/collector-kalshi" }
 arb-collector-binance = { path = "../crates/collector-binance" }
 arb-collector-databento = { path = "../crates/collector-databento" }
 arb-collector-cryptospot = { path = "../crates/collector-cryptospot" }
+arb-collector-venuelat = { path = "../crates/collector-venuelat" }
 arb-recorder = { path = "../crates/recorder" }
 arb-executor = { path = "../crates/executor" }
 tokio = { workspace = true }
