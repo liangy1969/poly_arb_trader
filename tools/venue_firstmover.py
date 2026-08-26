@@ -1,0 +1,139 @@
+#!/usr/bin/env python3
+"""Per-EVENT first-mover census across venues (`data/venue_latency.csv`).
+
+Correlation answers "who leads ON AVERAGE". This answers the different
+question: on any GIVEN large move, which feed printed it first, and how often
+does each feed win? A venue with no average edge can still be first sometimes,
+and that is what a latency-sensitive consumer would exploit.
+
+Method
+------
+1. Common last-value grid over all series (step `--step-ms`), log-mid.
+2. Events: ticks where the cross-sectional MEDIAN |move| over `--horizon-ms`
+   exceeds its `--pct` percentile. Median (not any single venue) so the event
+   definition is symmetric — conditioning on one venue's own move would hand
+   that venue the win by construction. Events are de-overlapped: once one
+   fires, the next `--horizon-ms` is skipped.
+3. For each event, the consensus move is the median signed move across feeds.
+   For each feed, find the FIRST grid tick at which it has covered
+   `--cross-frac` of that consensus move, measured from the pre-event price.
+4. Rank feeds by that crossing time. Report win share, mean rank, and the
+   median lead of each feed over the field.
+
+Uses recv_ts by default: it is clock-free (our box stamps every series), so
+"who arrived first" is answered without trusting any venue's clock.
+"""
+from __future__ import annotations
+
+import argparse
+import collections
+import datetime as dt
+
+import numpy as np
+
+from venue_leadlag import grid_resample, load  # same parsing/resampling
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--csv", default="out/venue_latency.csv")
+    ap.add_argument("--clock", choices=["exch", "recv"], default="recv")
+    ap.add_argument("--step-ms", type=int, default=10)
+    ap.add_argument("--horizon-ms", type=int, default=200, help="move window defining an event")
+    ap.add_argument("--pct", type=float, default=99.0)
+    ap.add_argument("--cross-frac", type=float, default=0.5, help="fraction of the move to call it")
+    ap.add_argument("--symbol", default="BTC")
+    ap.add_argument("--min-rows", type=int, default=500)
+    a = ap.parse_args()
+
+    S, n, kept, bad = load(a.csv, a.clock, -(2**62), 2**62)
+    S = {k: v for k, v in S.items() if k[2].upper().startswith(a.symbol.upper())}
+    S = {k: v for k, v in S.items() if len(v[0]) >= a.min_rows}
+    names = sorted(S)
+    lo = max(v[0][0] for v in S.values())
+    hi = min(v[0][-1] for v in S.values())
+    step = a.step_ms * 10**6
+    grid = np.arange(lo, hi, step, dtype=np.int64)
+    G = np.vstack([grid_resample(*S[k], grid) for k in names])  # log-mid, (nfeed, ngrid)
+
+    h = max(1, a.horizon_ms // a.step_ms)
+    mv = np.full_like(G, np.nan)
+    mv[:, h:] = 1e4 * (G[:, h:] - G[:, :-h])  # signed move over the horizon, bps
+    with np.errstate(invalid="ignore"):
+        cons = np.nanmedian(mv, axis=0)  # consensus signed move
+    absc = np.abs(cons)
+    thr = np.nanpercentile(absc, a.pct)
+
+    f = lambda x: dt.datetime.utcfromtimestamp(x / 1e9).strftime("%H:%M:%S")
+    print("first-mover census | clock=%s step=%dms horizon=%dms cross=%.0f%% | %s..%s"
+          % (a.clock, a.step_ms, a.horizon_ms, 100 * a.cross_frac, f(lo), f(hi)))
+    print("feeds: %s" % ", ".join("%s.%s.%s" % k for k in names))
+    print("event threshold: |consensus move| >= p%.4g = %.3f bps\n" % (a.pct, thr))
+
+    cand = np.where(np.isfinite(absc) & (absc >= thr))[0]
+    events, last = [], -(10**9)
+    for t in cand:
+        if t - last >= h:  # de-overlap
+            events.append(t)
+            last = t
+    wins = collections.Counter()
+    ranks = collections.defaultdict(list)
+    cross_t = collections.defaultdict(list)
+    best_of_gain = collections.defaultdict(list)
+    used = 0
+    for t in events:
+        t0 = t - h
+        target = cons[t] * a.cross_frac
+        first = {}
+        for i, k in enumerate(names):
+            base = G[i, t0]
+            if not np.isfinite(base):
+                continue
+            seg = 1e4 * (G[i, t0 : t + h + 1] - base)
+            ok = seg >= target if cons[t] > 0 else seg <= target
+            w = np.flatnonzero(np.isfinite(seg) & ok)
+            if len(w):
+                first[k] = int(w[0]) * a.step_ms
+        if len(first) < len(names):
+            continue  # need every feed to have crossed, else ranking is biased
+        used += 1
+        order = sorted(first, key=lambda k: first[k])
+        wins[order[0]] += 1
+        for r, k in enumerate(order):
+            ranks[k].append(r + 1)
+        med = np.median(list(first.values()))
+        for k, v in first.items():
+            cross_t[k].append(v - med)
+            # how much earlier the field's first print is than THIS feed
+            best_of_gain[k].append(v - first[order[0]])
+
+    print("events: %s detected, %s with all feeds crossing (used)\n"
+          % (format(len(events), ","), format(used, ",")))
+    if not used:
+        return
+    print("%-24s %8s %8s %9s %11s %11s"
+          % ("feed", "wins", "win%", "mean rank", "med vs field", "p10 vs field"))
+    for k in sorted(names, key=lambda k: -wins[k]):
+        d = np.array(cross_t[k])
+        print("%-24s %8d %7.1f%% %9.2f %10.0fms %10.0fms"
+              % ("%s.%s.%s" % k, wins[k], 100 * wins[k] / used,
+                 float(np.mean(ranks[k])), float(np.median(d)), float(np.percentile(d, 10))))
+    print("\n'med vs field' = median (this feed's crossing time - median crossing time).")
+    print("Negative = habitually early. 'p10 vs field' = how early on its BEST")
+    print("decile, i.e. the occasions this feed is genuinely first.")
+
+    # ---- what does consuming ALL feeds buy over the single best one? ----
+    # This is the actionable number: a consumer that acts on whichever feed
+    # prints first is early by this much versus one wired to a single venue.
+    best_single = max(names, key=lambda k: wins[k])
+    gain = np.array(best_of_gain[best_single])
+    print("\nBEST-OF-ALL vs the single best feed (%s.%s.%s):" % best_single)
+    print("  it is NOT first on %.0f%% of events" % (100 * (1 - wins[best_single] / used)))
+    print("  taking whichever feed prints first is earlier by:")
+    print("     median %.0fms   mean %.1fms   p75 %.0fms   p90 %.0fms   max %.0fms"
+          % (np.median(gain), gain.mean(), np.percentile(gain, 75),
+             np.percentile(gain, 90), gain.max()))
+
+
+if __name__ == "__main__":
+    main()

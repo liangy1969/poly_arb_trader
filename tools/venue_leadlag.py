@@ -95,6 +95,14 @@ def main():
     ap.add_argument("--to", dest="t_to", default="", help="UTC HH:MM (exclusive)")
     ap.add_argument("--min-rows", type=int, default=500)
     ap.add_argument("--symbol", default="", help="restrict to one base, e.g. BTC")
+    ap.add_argument("--tail-pct", type=float, default=0.0,
+                    help="keep only ticks whose CONDITIONING |delta| is at or above this "
+                         "percentile (e.g. 99). 0 = use every tick.")
+    ap.add_argument("--tail-ref", choices=["median", "max", "pair"], default="median",
+                    help="what defines a big-move tick. 'median'/'max' = cross-sectional "
+                         "stat over ALL series at t (symmetric wrt any pair -- the default, "
+                         "because conditioning on one side's own |delta| manufactures a lead "
+                         "for that side). 'pair' = union of the two sides' own tails.")
     a = ap.parse_args()
 
     t0_ns, t1_ns = -(2**62), 2**62
@@ -142,21 +150,54 @@ def main():
         print("%-9s %-5s %-14s %9s %10.1f %9.3f"
               % (k + (format(len(ts), ","), len(ts) / ((hi - lo) / 1e9), np.nanstd(d))))
 
+    # ---- conditioning mask: restrict to the biggest cross-venue moves ----
+    # Selection is on a series that is NOT either side of the pair, so the
+    # filter cannot itself create a lead. Conditioning on |dA| would guarantee
+    # A looks like the leader (A is extreme at t by construction, B merely
+    # correlates), which is the trap this avoids.
+    keep = None
+    if a.tail_pct > 0:
+        M = np.vstack([np.abs(D[k]) for k in names])
+        with np.errstate(invalid="ignore"):
+            ref = np.nanmedian(M, axis=0) if a.tail_ref == "median" else np.nanmax(M, axis=0)
+        if a.tail_ref == "pair":
+            ref = None  # computed per pair below
+        else:
+            thr = np.nanpercentile(ref, a.tail_pct)
+            keep = np.isfinite(ref) & (ref >= thr)
+            print("\nTAIL FILTER: cross-sectional %s |delta| >= p%.4g  (= %.3f bps)"
+                  % (a.tail_ref, a.tail_pct, thr))
+            print("  %s of %s grid ticks kept (%.3f%%)"
+                  % (format(int(keep.sum()), ","), format(len(keep), ","),
+                     100 * keep.mean()))
+
     lags = np.arange(-a.max_lag_ms, a.max_lag_ms + 1, a.step_ms) // a.step_ms
     print("\nPAIRWISE  xcorr(L) = corr(dA[t], dB[t+L]);  L>0 => A LEADS B")
-    print("%-24s %-24s %9s %9s %9s" % ("A", "B", "peak L", "corr@peak", "corr@0"))
+    print("%-24s %-24s %9s %9s %9s %9s" % ("A", "B", "peak L", "corr@peak", "corr@0", "n@peak"))
     rows = []
     for i in range(len(names)):
         for j in range(i + 1, len(names)):
             x, y = D[names[i]], D[names[j]]
+            kp = keep
+            if a.tail_pct > 0 and a.tail_ref == "pair":
+                tx = np.nanpercentile(np.abs(x), a.tail_pct)
+                ty = np.nanpercentile(np.abs(y), a.tail_pct)
+                kp = (np.abs(x) >= tx) | (np.abs(y) >= ty)
             best = (None, -2.0)
             c0 = np.nan
+            npk = 0
             for L in lags:
                 if L >= 0:
                     xa, yb = x[: len(x) - L if L else None], y[L:]
+                    ka = kp[: len(x) - L if L else None] if kp is not None else None
                 else:
                     xa, yb = x[-L:], y[: len(y) + L]
+                    ka = kp[-L:] if kp is not None else None
                 m = np.isfinite(xa) & np.isfinite(yb)
+                if ka is not None:
+                    # mask anchored at the A-side index t, i.e. the tick where
+                    # the big move happened -- NOT re-selected per lag.
+                    m &= ka
                 if m.sum() < 100:
                     continue
                 sa, sb = xa[m].std(), yb[m].std()
@@ -167,11 +208,13 @@ def main():
                     c0 = c
                 if c > best[1]:
                     best = (int(L) * a.step_ms, c)
+                    npk = int(m.sum())
             lbl = lambda k: "%s.%s.%s" % k
             rows.append((lbl(names[i]), lbl(names[j]), best[0], best[1], c0))
-            print("%-24s %-24s %+9s %9.4f %9.4f"
+            print("%-24s %-24s %+9s %9.4f %9.4f %9s"
                   % (lbl(names[i]), lbl(names[j]),
-                     "n/a" if best[0] is None else "%dms" % best[0], best[1], c0))
+                     "n/a" if best[0] is None else "%dms" % best[0], best[1], c0,
+                     format(npk, ",")))
 
     eff = int(((hi - lo) / 1e9) / (a.delta_ms / 1000.0))
     print("\nCAVEATS")
