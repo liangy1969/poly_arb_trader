@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """Per-second OKX SPOT (BTC-USDT) prices from the local parquet lake.
 
-Emits the same `ticker,t,venue,px` schema as `backfill_venues.py` so the
-existing multi-venue training scripts consume it unchanged — but reads the
-lake instead of the venue REST API, which turns an hours-long paced crawl
-into a few minutes and cannot be rate-limited.
+Emits a CONTINUOUS per-second series `t,px` — deliberately NOT keyed by event
+ticker. An earlier version keyed rows to events from `events_meta.csv`, but
+that file stops at 2026-07-03, so the whole eval window (07-04 onward) came
+out empty. Consumers have timestamps and do not need tickers.
 
-`px` is the LAST trade price in each second (matching how kraken/coinbase are
-built there), keyed to the event whose [open, close] window contains it.
+Reads the local lake instead of the venue REST API, which turns an hours-long
+paced crawl into a few minutes and cannot be rate-limited. `px` is the LAST
+trade price in each second (matching how kraken/coinbase are built there).
 
 ⚠️ BTC-USDT, not BTC-USD. This series carries a USDT basis that the BRTI
 constituents (coinbase/kraken/bitstamp/gemini) do not, so it must not be
@@ -22,7 +23,6 @@ Usage:
 """
 from __future__ import annotations
 
-import calendar
 import csv
 import glob
 import gzip
@@ -58,20 +58,9 @@ def day_seconds(date: str):
 def main():
     if len(sys.argv) < 3:
         sys.exit(__doc__)
-    data_dir, out_dir = sys.argv[1], sys.argv[2]
+    _unused, out_dir = sys.argv[1], sys.argv[2]
     d_from = sys.argv[3] if len(sys.argv) > 3 else "2026-05-24"
     d_to = sys.argv[4] if len(sys.argv) > 4 else "2026-12-31"
-
-    meta = list(csv.DictReader(open(os.path.join(data_dir, "events_meta.csv"))))
-    evs = []
-    for r in meta:
-        try:
-            o, c = int(r["open_ts"]), int(r["close_ts"])
-        except (KeyError, ValueError):
-            continue
-        evs.append((r["ticker"], o, c))
-    evs.sort(key=lambda e: e[1])
-    print(f"events in meta: {len(evs):,}")
 
     dates = sorted(
         os.path.basename(d)[5:]
@@ -86,29 +75,17 @@ def main():
     t0 = time.time()
     with gzip.open(path, "wt", newline="") as fh:
         w = csv.writer(fh)
-        w.writerow(["ticker", "t", "venue", "px"])
+        w.writerow(["t", "px"])
         for di, date in enumerate(dates):
             sec = day_seconds(date)
             if not sec:
                 print(f"  {date}: NO DATA", flush=True)
                 continue
-            lo = calendar.timegm(time.strptime(date, "%Y-%m-%d"))
-            hi = lo + 86_400
-            # events overlapping this day
-            todays = [e for e in evs if e[2] >= lo and e[1] < hi]
-            wrote = 0
-            for ticker, o, c in todays:
-                for t in range(max(o, lo), min(c, hi)):
-                    p = sec.get(t)
-                    if p is not None:
-                        w.writerow([ticker, t, VENUE, f"{p:.2f}"])
-                        wrote += 1
-            n_rows += wrote
-            print(
-                f"  {date}: {len(sec):,} secs, {len(todays)} events, {wrote:,} rows "
-                f"({di + 1}/{len(dates)}, {time.time() - t0:.0f}s)",
-                flush=True,
-            )
+            for t in sorted(sec):
+                w.writerow([t, f"{sec[t]:.2f}"])
+            n_rows += len(sec)
+            print(f"  {date}: {len(sec):,} secs ({di + 1}/{len(dates)}, "
+                  f"{time.time() - t0:.0f}s)", flush=True)
     print(f"WROTE {path}: {n_rows:,} rows in {time.time() - t0:.0f}s")
 
 
