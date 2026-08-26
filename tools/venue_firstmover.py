@@ -44,6 +44,11 @@ def main():
     ap.add_argument("--cross-frac", type=float, default=0.5, help="fraction of the move to call it")
     ap.add_argument("--symbol", default="BTC")
     ap.add_argument("--min-rows", type=int, default=500)
+    ap.add_argument("--max-premove", type=float, default=0.10,
+                    help="skip an event unless EVERY feed moved less than this "
+                         "fraction of the consensus move in the horizon BEFORE the "
+                         "window opens. Guarantees the window contains the move; "
+                         "0 disables (and reintroduces the mis-centring bias).")
     a = ap.parse_args()
 
     S, n, kept, bad = load(a.csv, a.clock, -(2**62), 2**62)
@@ -76,14 +81,41 @@ def main():
         if t - last >= h:  # de-overlap
             events.append(t)
             last = t
-    wins = collections.Counter()
+    wins = collections.Counter()          # OUTRIGHT (sole earliest) only
+    shared = collections.defaultdict(float)  # ties split evenly
+    ties = collections.Counter()
     ranks = collections.defaultdict(list)
     cross_t = collections.defaultdict(list)
     best_of_gain = collections.defaultdict(list)
+    drop_by = collections.Counter()
+    dropped = premoved = 0
     used = 0
     for t in events:
         t0 = t - h
         target = cons[t] * a.cross_frac
+
+        # --- WINDOW-CENTRING GUARD ---------------------------------------
+        # `seg` is measured from each feed's OWN price at t0, so seg[0] == 0
+        # always and a feed can never "cross at 0ms". The real hazard is the
+        # opposite: a feed that moved BEFORE t0 has that move absorbed into
+        # its own baseline, so it looks SLOW or never crosses at all. Measured
+        # on BTC, the p90 pre-window move was 0.89 of the consensus for
+        # binance perp and 0.98-0.99 for okx perp/spot — i.e. on the worst
+        # decile the move had already happened. Require every feed to be quiet
+        # before t0 so the window provably contains the move being ranked.
+        if a.max_premove > 0:
+            if t0 - h < 0:
+                continue
+            pre = []
+            for i in range(len(names)):
+                if not (np.isfinite(G[i, t0]) and np.isfinite(G[i, t0 - h])):
+                    pre = None
+                    break
+                pre.append(abs(1e4 * (G[i, t0] - G[i, t0 - h]) / cons[t]))
+            if pre is None or max(pre) > a.max_premove:
+                premoved += 1
+                continue
+
         first = {}
         for i, k in enumerate(names):
             base = G[i, t0]
@@ -95,11 +127,36 @@ def main():
             if len(w):
                 first[k] = int(w[0]) * a.step_ms
         if len(first) < len(names):
-            continue  # need every feed to have crossed, else ranking is biased
+            # Dropping is necessary (a partial field cannot be ranked) but it
+            # is NOT random: on BTC, binance SPOT caused 156 of 249 drops
+            # because it need not cover half a perp-inclusive consensus move.
+            # Attribute every drop so the selection bias is visible, never
+            # silent.
+            dropped += 1
+            for k in names:
+                if k not in first:
+                    drop_by[k] += 1
+            continue
         used += 1
         order = sorted(first, key=lambda k: first[k])
-        wins[order[0]] += 1
-        for r, k in enumerate(order):
+        # TIES ARE COMMON (~35% of events at a 10ms grid) and must NOT go to
+        # whichever key sorts first -- Python's sort is stable, so `order[0]`
+        # silently handed every tie to the alphabetically-first feed and
+        # inflated its win rate by ~2x. Count outright wins separately from
+        # ties, and split tied credit evenly.
+        mn = min(first.values())
+        winners = [k for k, v in first.items() if v == mn]
+        if len(winners) == 1:
+            wins[winners[0]] += 1
+        else:
+            ties[len(winners)] += 1
+        for k in winners:
+            shared[k] += 1.0 / len(winners)
+        # competition ranking: tied feeds get the same rank
+        r = 0
+        for i, k in enumerate(order):
+            if i and first[k] > first[order[i - 1]]:
+                r = i
             ranks[k].append(r + 1)
         med = np.median(list(first.values()))
         for k, v in first.items():
@@ -107,16 +164,29 @@ def main():
             # how much earlier the field's first print is than THIS feed
             best_of_gain[k].append(v - first[order[0]])
 
-    print("events: %s detected, %s with all feeds crossing (used)\n"
-          % (format(len(events), ","), format(used, ",")))
+    print("events: %s detected | %s skipped as pre-moved (>%.0f%% of the move "
+          "already made before the window) | %s dropped (a feed never crossed) "
+          "| %s USED"
+          % (format(len(events), ","), format(premoved, ","), 100 * a.max_premove,
+             format(dropped, ","), format(used, ",")))
+    if dropped:
+        # Drops are NOT random -- surface who caused them so the selection
+        # bias is visible rather than silent.
+        print("  drops attributed to: %s"
+              % ", ".join("%s.%s.%s x%d" % (k + (v,)) for k, v in drop_by.most_common() if v))
+    print()
     if not used:
         return
-    print("%-24s %8s %8s %9s %11s %11s"
-          % ("feed", "wins", "win%", "mean rank", "med vs field", "p10 vs field"))
-    for k in sorted(names, key=lambda k: -wins[k]):
+    nt = sum(ties.values())
+    print("ties for earliest tick: %s of %s events (%.1f%%) -- split evenly, "
+          "NOT given to the first-sorted feed\n"
+          % (format(nt, ","), format(used, ","), 100 * nt / used))
+    print("%-24s %9s %9s %9s %11s %11s"
+          % ("feed", "outright%", "shared%", "mean rank", "med vs field", "p10 vs field"))
+    for k in sorted(names, key=lambda k: -shared[k]):
         d = np.array(cross_t[k])
-        print("%-24s %8d %7.1f%% %9.2f %10.0fms %10.0fms"
-              % ("%s.%s.%s" % k, wins[k], 100 * wins[k] / used,
+        print("%-24s %8.1f%% %8.1f%% %9.2f %10.0fms %10.0fms"
+              % ("%s.%s.%s" % k, 100 * wins[k] / used, 100 * shared[k] / used,
                  float(np.mean(ranks[k])), float(np.median(d)), float(np.percentile(d, 10))))
     print("\n'med vs field' = median (this feed's crossing time - median crossing time).")
     print("Negative = habitually early. 'p10 vs field' = how early on its BEST")
@@ -125,10 +195,10 @@ def main():
     # ---- what does consuming ALL feeds buy over the single best one? ----
     # This is the actionable number: a consumer that acts on whichever feed
     # prints first is early by this much versus one wired to a single venue.
-    best_single = max(names, key=lambda k: wins[k])
+    best_single = max(names, key=lambda k: shared[k])
     gain = np.array(best_of_gain[best_single])
     print("\nBEST-OF-ALL vs the single best feed (%s.%s.%s):" % best_single)
-    print("  it is NOT first on %.0f%% of events" % (100 * (1 - wins[best_single] / used)))
+    print("  it is NOT first on %.0f%% of events" % (100 * (1 - shared[best_single] / used)))
     print("  taking whichever feed prints first is earlier by:")
     print("     median %.0fms   mean %.1fms   p75 %.0fms   p90 %.0fms   max %.0fms"
           % (np.median(gain), gain.mean(), np.percentile(gain, 75),
