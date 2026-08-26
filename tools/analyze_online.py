@@ -125,7 +125,12 @@ def parse_model(spec):
             # calib="dbp": per-event db shifts ONLY the perp leg; the cb leg is
             # anchored at the raw strike (fit + inference must both honor it)
             "calib": js.get("calib"), "prior": prior,
-            "causal_off": js.get("offset") == "causal"}
+            "causal_off": js.get("offset") == "causal",
+            # venue3 selects the series behind the THIRD price channel. The
+            # channel itself is the existing kraken one; "okx" only repoints
+            # it at okmid and gives it its own causal offset, so the 3-price
+            # forward math stays a single implementation.
+            "venue3": js.get("venue3", "kr")}
 
 
 def prepare(ev, m):
@@ -228,7 +233,7 @@ def prepare(ev, m):
             # two-price surface: a fresh cb quote is a PRICE input on every row
             ok &= ~np.isnan(d["cbmid"])
         if m.get("kr_mult") is not None:
-            ok &= ~np.isnan(d["krmid"])
+            ok &= ~np.isnan(d["okmid"] if m.get("venue3") == "okx" else d["krmid"])
         if extras:
             ok &= ~np.isnan(d["X"]).any(axis=1)
         for k in list(d):
@@ -246,6 +251,13 @@ def prepare(ev, m):
             voff = np.cumsum(g) / np.arange(1, len(g) + 1)
             d["voff"] = voff
             d["spot"] = d["spot"] - voff
+            if m.get("venue3") == "okx" and "okmid" in d:
+                # SAME construction for the okx channel: cb is the anchor and
+                # every other venue is shifted by its causal expanding mean
+                # gap to it. This is what makes a USDT-quoted level usable —
+                # it removes the peg exactly as the perp offset removes basis.
+                go = d["okmid"] - d["cbmid"]
+                d["okmid"] = d["okmid"] - np.cumsum(go) / np.arange(1, len(go) + 1)
         if ok.sum() > 0:            # skip events with 0 usable rows — old-schema
             out[t] = d              # days (pre-Jul-8) lack cb/sizes -> features NaN
     print(f"  [{m['label']}] px={m['px']} extras={extras or '-'}: "
@@ -290,7 +302,8 @@ def fair_series(d, m, strike, rho, b_scale, fwd, tte_max, fit_window, refit_step
     cbm = m["cb_mult"]
     cb_p = d["cbmid"][scan][ss] if cbm is not None else None
     krm = m.get("kr_mult")
-    kr_p = d["krmid"][scan][ss] if krm is not None else None
+    kr_src = d["okmid"] if m.get("venue3") == "okx" else d["krmid"]
+    kr_p = kr_src[scan][ss] if krm is not None else None
     age_p = d["cb_age"][scan][ss] if "cb_age" in d else None
     fair = np.full(len(tte_p), np.nan)
     gbar = np.full(len(tte_p), np.nan)
@@ -340,7 +353,7 @@ def fair_series(d, m, strike, rho, b_scale, fwd, tte_max, fit_window, refit_step
                 rho, b_scale, steps=sim.FIT_STEPS if init is None else 60, init=init,
                 extra=d["X"][fitm][fit_sl],
                 cb=d["cbmid"][fitm][fit_sl] if cbm is not None else None, cb_mult=cbm,
-                kr=d["krmid"][fitm][fit_sl] if krm is not None else None, kr_mult=krm,
+                kr=kr_src[fitm][fit_sl] if krm is not None else None, kr_mult=krm,
                 cb_anchor=strike if calib == "dbp" else None,
                 fit_cb=(calib == "2db"),
                 prior=m.get("prior"),
@@ -390,7 +403,7 @@ def fair_series(d, m, strike, rho, b_scale, fwd, tte_max, fit_window, refit_step
                             torch.tensor(d["X"][gi], dtype=torch.float32),
                             torch.tensor(d["cbmid"][gi], dtype=torch.float32) if cbm is not None else None,
                             cbm,
-                            torch.tensor(d["krmid"][gi], dtype=torch.float32) if krm is not None else None,
+                            torch.tensor(kr_src[gi], dtype=torch.float32) if krm is not None else None,
                             krm, b2=b2_cur)
                         g_fair = torch.sigmoid(glo).numpy()
                     g_gap = g_fair - (d["ybid"][gi] + d["yask"][gi]) / 2.0

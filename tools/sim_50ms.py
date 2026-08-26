@@ -198,6 +198,18 @@ def load_samples(path, cb_stale_ms=5000.0):
                     b_px, a_px, age = float(kr_b), float(kr_a), float(kr_age)
                     if b_px > 0 and a_px > 0 and 0 <= age <= 60_000:
                         krmid = (b_px + a_px) / 2.0
+                # okx BBO mid (ok_* columns since 2026-08-26 02:49Z). Same BBO
+                # semantics as kraken: pushes on CHANGE, so an old quote is an
+                # unchanged resting book. 60s feed-death gate, NOT the cb 5s.
+                okmid = float("nan")
+                ok_b, ok_a, ok_age = r.get("ok_bid"), r.get("ok_ask"), r.get("ok_age_ms")
+                if ok_b is not None and ok_a is not None and ok_age is not None:
+                    try:
+                        b_px, a_px, age = float(ok_b), float(ok_a), float(ok_age)
+                        if b_px > 0 and a_px > 0 and 0 <= age <= 60_000:
+                            okmid = (b_px + a_px) / 2.0
+                    except (TypeError, ValueError):
+                        pass
                 fx = []
                 for c in FEAT_COLS:
                     v = r.get(c)
@@ -217,6 +229,7 @@ def load_samples(path, cb_stale_ms=5000.0):
                         cbmid,
                         age_out,
                         krmid,
+                        okmid,
                     )
                     + tuple(fx)
                 )
@@ -226,9 +239,9 @@ def load_samples(path, cb_stale_ms=5000.0):
     for t, rows in ev.items():
         rows.sort()
         a = np.array(rows, dtype=np.float64)
-        out[t] = {"ts": a[:, 0], "tte": a[:, 1], "spot": a[:, 2], "ybid": a[:, 3], "yask": a[:, 4], "imb1n": a[:, 5], "cbmid": a[:, 6], "cb_age": a[:, 7], "krmid": a[:, 8]}
+        out[t] = {"ts": a[:, 0], "tte": a[:, 1], "spot": a[:, 2], "ybid": a[:, 3], "yask": a[:, 4], "imb1n": a[:, 5], "cbmid": a[:, 6], "cb_age": a[:, 7], "krmid": a[:, 8], "okmid": a[:, 9]}
         for i, c in enumerate(FEAT_COLS):
-            out[t][c] = a[:, 9 + i]
+            out[t][c] = a[:, 10 + i]
     return out
 
 
