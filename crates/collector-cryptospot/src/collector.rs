@@ -30,11 +30,17 @@ pub struct CryptoSpotCfg {
     pub kraken: bool,
     pub bitstamp: bool,
     pub gemini: bool,
+    /// OKX spot. NOT a BRTI constituent — added 2026-08-25 as a fair-model
+    /// feature after the venue-latency study found okx spot among the fastest
+    /// feeds to this box (mean rank 2.14, tied with binance perp).
+    /// ⚠️ BTC-USDT, so it carries a USDT basis that BTC-USD venues do not.
+    pub okx: bool,
     pub coinbase_product: String, // "BTC-USD"
     pub binanceus_symbol: String, // "btcusd"
     pub kraken_symbol: String,    // "BTC/USD"
     pub bitstamp_symbol: String,  // "btcusd" (channel suffix)
     pub gemini_symbol: String,    // "btcusd"
+    pub okx_symbol: String,       // "BTC-USDT"
     pub reconnect_base_ms: u64,
     pub reconnect_max_ms: u64,
     pub stale_timeout_s: u64,
@@ -49,11 +55,13 @@ impl Default for CryptoSpotCfg {
             kraken: true,
             bitstamp: true,
             gemini: true,
+            okx: true,
             coinbase_product: "BTC-USD".into(),
             binanceus_symbol: "btcusd".into(),
             kraken_symbol: "BTC/USD".into(),
             bitstamp_symbol: "btcusd".into(),
             gemini_symbol: "btcusd".into(),
+            okx_symbol: "BTC-USDT".into(),
             reconnect_base_ms: 1000,
             reconnect_max_ms: 30000,
             stale_timeout_s: 30,
@@ -90,6 +98,9 @@ impl Module for CryptoSpotCollector {
         }
         if self.cfg.bitstamp {
             self.handles.push(tokio::spawn(venue_loop("bitstamp", bitstamp_session, self.cfg.clone(), bus.clone())));
+        }
+        if self.cfg.okx {
+            self.handles.push(tokio::spawn(venue_loop("okx", okx_session, self.cfg.clone(), bus.clone())));
         }
         if self.cfg.gemini {
             self.handles.push(tokio::spawn(venue_loop("gemini", gemini_session, self.cfg.clone(), bus.clone())));
@@ -364,6 +375,56 @@ async fn gemini_session(cfg: CryptoSpotCfg, bus: Arc<dyn Bus>) -> anyhow::Result
                 if changed && bid > 0.0 && ask > 0.0 {
                     publish(&*bus, "gemini", "BTC", bid, bsz, ask, asz, now_ns(), &mut seq);
                 }
+            }
+            Some(Ok(Message::Ping(p))) => ws.send(Message::Pong(p)).await?,
+            Some(Ok(Message::Close(_))) | None => anyhow::bail!("ws closed"),
+            Some(Ok(_)) => {}
+            Some(Err(e)) => anyhow::bail!("ws error: {e}"),
+        }
+    }
+}
+
+/// OKX spot top-of-book via `bbo-tbt` (tick-by-tick BBO — the lowest-latency
+/// public channel). Direct, NO proxy: OKX answers the Ohio box in ~200ms vs
+/// ~450ms through the Tokyo relay, so routing it through the proxy would only
+/// add latency to the feed we added for its speed.
+async fn okx_session(cfg: CryptoSpotCfg, bus: Arc<dyn Bus>) -> anyhow::Result<()> {
+    let (mut ws, _) = connect_async("wss://ws.okx.com:8443/ws/v5/public").await?;
+    let sub = serde_json::json!({
+        "op": "subscribe",
+        "args": [{"channel": "bbo-tbt", "instId": cfg.okx_symbol}]
+    });
+    ws.send(Message::Text(sub.to_string().into())).await?;
+    tracing::info!("okx ws connected: bbo-tbt {}", cfg.okx_symbol);
+    let stale = Duration::from_secs(cfg.stale_timeout_s);
+    let mut seq = 0u64;
+    loop {
+        let msg = tokio::time::timeout(stale, ws.next())
+            .await
+            .map_err(|_| anyhow::anyhow!("stale stream"))?;
+        match msg {
+            Some(Ok(Message::Text(t))) => {
+                let Ok(v) = serde_json::from_str::<Value>(t.as_str()) else { continue };
+                if let Some(ev) = v.get("event").and_then(Value::as_str) {
+                    if ev == "error" {
+                        anyhow::bail!("okx subscribe error: {t}");
+                    }
+                    continue; // subscribe ack
+                }
+                let Some(d) = v.get("data").and_then(Value::as_array).and_then(|a| a.first())
+                else { continue };
+                // levels are ["px","sz","liqOrders","orders"]
+                let top = |side: &str| -> Option<(f64, f64)> {
+                    let l = d.get(side)?.as_array()?.first()?;
+                    Some((num(l.get(0))?, num(l.get(1)).unwrap_or(0.0)))
+                };
+                let (Some((bid, bsz)), Some((ask, asz))) = (top("bids"), top("asks")) else { continue };
+                let exch = d
+                    .get("ts")
+                    .and_then(|x| x.as_str().and_then(|s| s.parse::<i64>().ok()))
+                    .map(|ms| ms * 1_000_000)
+                    .unwrap_or_else(now_ns);
+                publish_ts(&*bus, "okx", "BTC", bid, bsz, ask, asz, exch, now_ns(), &mut seq);
             }
             Some(Ok(Message::Ping(p))) => ws.send(Message::Pong(p)).await?,
             Some(Ok(Message::Close(_))) | None => anyhow::bail!("ws closed"),
