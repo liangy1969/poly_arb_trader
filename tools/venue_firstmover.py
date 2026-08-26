@@ -15,10 +15,20 @@ Method
    that venue the win by construction. Events are de-overlapped: once one
    fires, the next `--horizon-ms` is skipped.
 3. For each event, the consensus move is the median signed move across feeds.
-   For each feed, find the FIRST grid tick at which it has covered
-   `--cross-frac` of that consensus move, measured from the pre-event price.
-4. Rank feeds by that crossing time. Report win share, mean rank, and the
-   median lead of each feed over the field.
+   For each feed, find the FIRST tick u whose TRAILING `--horizon-ms` window
+   covers `--cross-frac` of that consensus move — i.e. a ROLLING move, not a
+   move from a fixed baseline.
+
+   This matters. An earlier version measured `G[u] - G[t0]` against a fixed
+   pre-event baseline, which folded any move made BEFORE t0 into the feed's
+   own baseline: an early mover read as SLOW, or never crossed and had the
+   whole event discarded. Nearly half of all events were mis-centred that way.
+   A rolling window has no baseline to absorb anything — wherever the move
+   sits, some tick's trailing window contains it, and an early mover crosses
+   at a smaller u, which is exactly "it was first".
+4. Rank feeds by that crossing time, reported relative to the consensus tick
+   (NEGATIVE = registered the move before the field agreed). Report win share,
+   mean rank, and the median lead of each feed over the field.
 
 Uses recv_ts by default: it is clock-free (our box stamps every series), so
 "who arrived first" is answered without trusting any venue's clock.
@@ -44,11 +54,11 @@ def main():
     ap.add_argument("--cross-frac", type=float, default=0.5, help="fraction of the move to call it")
     ap.add_argument("--symbol", default="BTC")
     ap.add_argument("--min-rows", type=int, default=500)
-    ap.add_argument("--max-premove", type=float, default=0.10,
-                    help="skip an event unless EVERY feed moved less than this "
-                         "fraction of the consensus move in the horizon BEFORE the "
-                         "window opens. Guarantees the window contains the move; "
-                         "0 disables (and reintroduces the mis-centring bias).")
+    ap.add_argument("--search-mult", type=int, default=2,
+                    help="search back this many horizons before the consensus tick, "
+                         "so a feed that registered the move early is caught rather "
+                         "than missed. Crossing times are reported relative to the "
+                         "consensus tick, so early feeds show NEGATIVE offsets.")
     a = ap.parse_args()
 
     S, n, kept, bad = load(a.csv, a.clock, -(2**62), 2**62)
@@ -70,8 +80,9 @@ def main():
     thr = np.nanpercentile(absc, a.pct)
 
     f = lambda x: dt.datetime.utcfromtimestamp(x / 1e9).strftime("%H:%M:%S")
-    print("first-mover census | clock=%s step=%dms horizon=%dms cross=%.0f%% | %s..%s"
-          % (a.clock, a.step_ms, a.horizon_ms, 100 * a.cross_frac, f(lo), f(hi)))
+    print("first-mover census | clock=%s step=%dms ROLLING horizon=%dms cross=%.0f%% "
+          "search=+-%dh | %s..%s"
+          % (a.clock, a.step_ms, a.horizon_ms, 100 * a.cross_frac, a.search_mult, f(lo), f(hi)))
     print("feeds: %s" % ", ".join("%s.%s.%s" % k for k in names))
     print("event threshold: |consensus move| >= p%.4g = %.3f bps\n" % (a.pct, thr))
 
@@ -94,38 +105,34 @@ def main():
         t0 = t - h
         target = cons[t] * a.cross_frac
 
-        # --- WINDOW-CENTRING GUARD ---------------------------------------
-        # `seg` is measured from each feed's OWN price at t0, so seg[0] == 0
-        # always and a feed can never "cross at 0ms". The real hazard is the
-        # opposite: a feed that moved BEFORE t0 has that move absorbed into
-        # its own baseline, so it looks SLOW or never crosses at all. Measured
-        # on BTC, the p90 pre-window move was 0.89 of the consensus for
-        # binance perp and 0.98-0.99 for okx perp/spot — i.e. on the worst
-        # decile the move had already happened. Require every feed to be quiet
-        # before t0 so the window provably contains the move being ranked.
-        if a.max_premove > 0:
-            if t0 - h < 0:
-                continue
-            pre = []
-            for i in range(len(names)):
-                if not (np.isfinite(G[i, t0]) and np.isfinite(G[i, t0 - h])):
-                    pre = None
-                    break
-                pre.append(abs(1e4 * (G[i, t0] - G[i, t0 - h]) / cons[t]))
-            if pre is None or max(pre) > a.max_premove:
-                premoved += 1
-                continue
-
+        # --- ROLLING-WINDOW CROSSING -------------------------------------
+        # For each candidate tick u we ask: over the FIXED `horizon_ms` window
+        # ENDING at u, has this feed moved by `cross_frac` of the consensus?
+        # That is exactly `mv[i, u]`, already computed for the whole grid.
+        #
+        # This replaces an earlier fixed-baseline form, seg = G[t0..] - G[t0],
+        # which was subtly wrong: it measured every feed against ITS OWN price
+        # at t0, so a feed that moved BEFORE t0 had the move folded into its
+        # baseline and read as slow, or never crossed and got the whole event
+        # dropped. Nearly half of all events were mis-centred that way (p90
+        # pre-window move 0.89-0.99 of the consensus).
+        #
+        # A rolling window has no baseline to absorb anything: wherever the
+        # move sits, some evaluation tick's trailing window contains it, and
+        # an early mover simply crosses at a smaller u -- which is precisely
+        # "it was first". No centring guard is needed.
+        u0, u1 = t - a.search_mult * h, t + h
+        if u0 - h < 0 or u1 >= mv.shape[1]:
+            continue
         first = {}
         for i, k in enumerate(names):
-            base = G[i, t0]
-            if not np.isfinite(base):
-                continue
-            seg = 1e4 * (G[i, t0 : t + h + 1] - base)
-            ok = seg >= target if cons[t] > 0 else seg <= target
-            w = np.flatnonzero(np.isfinite(seg) & ok)
+            roll = mv[i, u0 : u1 + 1]
+            ok = roll >= target if cons[t] > 0 else roll <= target
+            w = np.flatnonzero(np.isfinite(roll) & ok)
             if len(w):
-                first[k] = int(w[0]) * a.step_ms
+                # ms relative to the consensus tick: NEGATIVE = this feed
+                # registered the move before the field agreed on it.
+                first[k] = (int(w[0]) + u0 - t) * a.step_ms
         if len(first) < len(names):
             # Dropping is necessary (a partial field cannot be ranked) but it
             # is NOT random: on BTC, binance SPOT caused 156 of 249 drops
@@ -164,11 +171,8 @@ def main():
             # how much earlier the field's first print is than THIS feed
             best_of_gain[k].append(v - first[order[0]])
 
-    print("events: %s detected | %s skipped as pre-moved (>%.0f%% of the move "
-          "already made before the window) | %s dropped (a feed never crossed) "
-          "| %s USED"
-          % (format(len(events), ","), format(premoved, ","), 100 * a.max_premove,
-             format(dropped, ","), format(used, ",")))
+    print("events: %s detected | %s dropped (a feed never crossed) | %s USED"
+          % (format(len(events), ","), format(dropped, ","), format(used, ",")))
     if dropped:
         # Drops are NOT random -- surface who caused them so the selection
         # bias is visible rather than silent.
