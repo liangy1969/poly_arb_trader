@@ -68,7 +68,8 @@ for tk, g in T.groupby("ticker"):
                 g_ = 100 * maker_sign * (Dk.fair.iloc[jd] - Dk.mid.iloc[jd])   # + = nowcast says the mid moves in the MAKER's favour
         rows.append({"ticker": tk, "ts_ms": r.ts_ms, "tte_s": tte[k] / 1000.0, "mid0": mid0, "px": fill_px, "count": r["count"],
                      "taker_yes": taker_yes, "at_touch": at_touch, "spread_c": 100 * (ya[k] - yb[k]), "queue": queue,
-                     "capture_c": 100 * maker_sign * (fill_px - mid0), "pnl1": pnl[1], "pnl6": pnl[6], "pnl30": pnl[30], "g": g_})
+                     "capture_c": 100 * maker_sign * (mid0 - fill_px),   # spread capture if the mid stays: long at bid -> mid-bid, short at ask -> ask-mid
+                     "pnl1": pnl[1], "pnl6": pnl[6], "pnl30": pnl[30], "g": g_})
 R = pd.DataFrame(rows)
 print("prints %d (of %d in the tape) | markets %d | at-touch %.0f%% | median size %.2f | in trade window (60-300s): %d" % (
     len(R), len(T), R.ticker.nunique(), 100 * R.at_touch.mean(), R["count"].median(), ((R.tte_s >= 60) & (R.tte_s <= 300)).sum()))
@@ -87,10 +88,12 @@ if W.g.notna().any():
         if len(h) < 20:
             continue
         print("  %-24s n %6d (%4.1f%%) | capture %+5.2fc | P&L @6s %+5.2fc @30s %+5.2fc" % (lab, len(h), 100 * len(h) / max(len(W), 1), h.capture_c.mean(), h.pnl6.mean(), h.pnl30.mean()))
-print("\narrival rate at the touch by tte bucket (prints per market-minute) and by price region:")
+print("\narrival rate at the touch by tte bucket (prints per market-minute of sampler coverage in that bucket) and by price region:")
+Sw = S[(S.tte_ms >= 60000) & (S.tte_ms <= 300000)]
 for lo, hi in ((60, 120), (120, 180), (180, 240), (240, 300)):
     h = W[(W.tte_s >= lo) & (W.tte_s < hi)]
-    print("  tte %3d-%3d: %6d prints | %.2f per market-minute | mean size %.1f" % (lo, hi, len(h), len(h) / max(W.ticker.nunique(), 1), h["count"].mean()))
+    cov_min = ((Sw.tte_ms >= lo * 1000) & (Sw.tte_ms < hi * 1000)).sum() * 0.05 / 60.0     # 50ms rows -> minutes of market coverage
+    print("  tte %3d-%3d: %6d prints | %.2f per market-minute | mean size %.1f" % (lo, hi, len(h), len(h) / max(cov_min, 1e-9), h["count"].mean()))
 for lab, m in (("mid < 0.10", W.mid0 < 0.10), ("0.10-0.90", (W.mid0 >= 0.10) & (W.mid0 <= 0.90)), ("mid > 0.90", W.mid0 > 0.90)):
     h = W[m]
     if len(h):
