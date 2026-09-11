@@ -89,6 +89,39 @@ t > 2 on unseen events; enrol in a Liquidity Incentive Program if one appears fo
 (none listed on 2026-09-09; the crypto-leader, metals and energy 15-minute series have them:
 target size 1000 contracts, period reward, `GET /incentive_programs`).
 
+## 2b. Phase 0 measurements (running log; one day is NOT the gate)
+
+### Day 1: 2026-09-10 (tape 06:13-23:59 UTC, 64 markets, 1.57M prints; `tools/nowcast/maker_tape.py`)
+
+Tape shape: 24.6 prints/s (fills, bursty: median inter-arrival 0 s), median print 9.9 contracts (mean 73, p90 161,
+69% fractional), 51% taker-YES. Touch prints inside the 60-300 s window: ~1,150 per market-minute, 55-110 contracts
+each, 63k-113k contracts per market-minute at the touch; displayed queue at the touch median ~1,400 contracts.
+Spread = one tick everywhere (1c in 10-90c, 0.1c in the tails); 0.3% of sampler book rows crossed (dropped).
+
+Maker at the touch, mark-to-mid, zero fee, every touch print treated as a 1-contract fill (flow-sampling proxy,
+no queue model, no inventory), market-clustered t over 64 markets:
+
+| policy | P&L/fill @6 s | @30 s | @60 s | beta-neutral @6 s |
+|---|---|---|---|---|
+| naive touch quoting | +0.06c (t 1.8) | +0.15c (t 1.5) | +0.10c (t 0.7) | +0.05c (t 1.3) |
+| quiet-only (quote when \|fair-mid\| <= 0.25c, 83% of fills) | +0.10c (t 3.4) | +0.13c (t 1.3) | +0.09c (t 0.6) | +0.09c (t 3.2) |
+| pull policy (drop the flagged side, 11% of fills) | +0.17c (t 5.1) | +0.19c (t 1.6) | +0.15c (t 1.0) | +0.16c (t 4.9) |
+| 1c-tick region (0.10-0.90) only | +0.09c (t 1.8) | +0.22c (t 1.7) | +0.11c (t 0.6) | +0.13c (t 2.8) |
+| 1c-tick region + pull policy | +0.32c (t 5.7) | +0.43c (t 2.8) | +0.31c (t 1.6) | +0.33c (t 7.4) |
+
+Decomposition (all touch fills): capture +0.30c, adverse move at 6 s -0.23c. By nowcast flag (compact 0.2 s
+model): flagged-against fills -0.87c @6 s (10.8%), quiet +0.11c (82.8%), flagged-for +1.18c (5.9%). Tails (0.1c
+tick): capture 0.05c, adverse ~0, P&L ~0. Print size: <1 contract -0.21c @6 s (the only losing size class),
+1-10 +0.18c, 10-100 +0.16c, >=100 +0.22c. Directional split is large this day (long-YES fills -6c @60 s,
+short-YES +6c: the day's drift, cancels in the beta-neutral column).
+
+Reading: uninformed flow exists and is abundant; the naive maker is roughly break-even at the touch; the nowcast
+pull removes the informed 11% of fills and lifts P&L/fill to +0.17c (t 5) in the proxy. Caveats that keep this
+below GATE 0: one day; the proxy fills on every print (a real 1-contract order behind a 1,400 queue fills on a
+subset, and adverse selection concentrates on the fills that do happen); no inventory or expiry risk; the 30 s
+and 60 s marks lose significance as directional variance enters. Next: replicate daily (poller running), then
+Phase 1 print-based queue fills.
+
 ## 3. Risks
 
 - Uninformed flow may be too thin: this market's takers are fast perp-followers (the informed flow
