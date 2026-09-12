@@ -122,6 +122,49 @@ subset, and adverse selection concentrates on the fills that do happen); no inve
 and 60 s marks lose significance as directional variance enters. Next: replicate daily (poller running), then
 Phase 1 print-based queue fills.
 
+## 2c. Quoting rule v0 (what Phase 1 simulates and Phase 2 builds)
+
+Standard signal (user decision 2026-09-12): the 43-input pruned 1 s nowcast `models/resid-prune5-btc.json`
+(fair f, gap g = f - mid in cents). Live twin needs the depth-band features from a deeper perp book, or the
+print-only subset; the compact 0.2 s model is the fallback live signal.
+
+Inputs on every evaluation tick (200 ms grid, and immediately on a book change): best bid b / ask a and displayed
+sizes, our resting orders, f and g, inventory q (YES-equivalent contracts, signed), time to expiry tau, tick size
+(1c in 10-90c, 0.1c in the tails).
+
+R0 Eligibility. Quote only while 0.10 <= mid <= 0.90 (the 0.1c-tick tails capture 0.05c and earn nothing) and
+   tau in [90 s, 300 s]. For tau < 90 s quote only the side that reduces |q|; at tau < 45 s cancel everything.
+   Residual inventory: micro-live holds to settlement (a taker flatten costs ~1.5c at the money, more than the
+   position's expected value); at scale, flatten with a taker order at tau = 45 s.
+R1 Price = the touch, always. Bid at b, ask at a. The spread is one tick, so improving would cross, and a quote
+   one tick behind the touch fills only when the level is swept, which is adverse by construction. The nowcast
+   decides WHETHER a side is quoted, never the level.
+R2 Side selection = the pull rule (measured day 1: fills the model flags against -0.87c at 6 s, 11% of fills).
+   Bid quoted iff g >= -theta; ask quoted iff g <= +theta; theta = 0.25c. Both sides are on ~83% of the time.
+R3 Inventory. Per-market cap Q. q >= +Q: bid off; q <= -Q: ask off. Between, the accumulating side uses a
+   tighter threshold theta * (1 - |q|/Q) (a reservation-price shift of f by lambda * q, expressed as a threshold),
+   the reducing side keeps theta. This is Avellaneda-Stoikov skew in a one-tick book: skew changes which side is
+   quoted, not where.
+R4 Update loop (reconcile targets to resting orders; never modify in place, a replace loses priority anyway):
+   - for each side compute target = touch price or None (R0-R3);
+   - resting order present and (target None or price != resting price) -> cancel;
+   - no resting order and target present -> place post-only GTC at target, size S;
+   - asymmetric hysteresis: pull immediately when the flag fires (the taker arrives within ~1 s; REST cancel
+     ~100 ms is the latency budget); re-join only when |g| <= theta/2 has held for 1 s, so a marginal flag does
+     not churn the queue position (every pull sends us to the back of a ~1,400-contract queue);
+   - action budget <= 2 per second per side (verify the Kalshi tier limits before Phase 3);
+   - position truth from authoritative polls via the reconciler pattern; local fill accounting is advisory only.
+R5 Touch moves. If the touch moves away from our resting order (we are now behind), cancel and re-join at the new
+   touch unless R2 says that side is off. If others cancel and our order is alone at the touch with displayed size
+   below a minimum (Phase 1 knob, start 100 contracts), pull: a lone quote is the one being picked off.
+R6 Size. S = 0.01 contract in micro-live (Phase 3), then 1, then N with the forward bar at each step. At N expect
+   partial fills behind the queue.
+R7 Expected economics from the day-1 proxy: +0.17c per fill with the pull rule, +0.32c inside the 1c-tick region,
+   at 6 s mark-to-mid, zero fee; ~1,150 touch prints per market-minute so fill count is not the constraint. The
+   proxy fills on every print; the real fill subset, the re-join cost and inventory variance are what Phase 1
+   measures. Knobs for the Phase 1 grid: theta, the re-join rule, Q and lambda, the lone-quote minimum, the tau
+   window, S.
+
 ## 3. Risks
 
 - Uninformed flow may be too thin: this market's takers are fast perp-followers (the informed flow
