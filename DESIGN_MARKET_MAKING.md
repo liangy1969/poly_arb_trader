@@ -165,8 +165,10 @@ R4 Update loop (reconcile targets to resting orders; never modify in place, a re
    - resting order present and (target None or price != resting price) -> cancel;
    - no resting order and target present -> place post-only GTC at target, size S;
    - asymmetric hysteresis: pull immediately when the flag fires (the taker arrives within ~1 s; REST cancel
-     ~100 ms is the latency budget); re-join only when |g| <= theta/2 has held for 1 s, so a marginal flag does
-     not churn the queue position (every pull sends us to the back of a ~1,400-contract queue);
+     ~100 ms is the latency budget); re-join a side pulled by the flag only after its own condition has cleared with
+     margin for 1 s: bid when g >= -theta/2 held 1 s, ask when g <= +theta/2 held 1 s (the favourable direction of g is
+     never a reason to stay off), so a marginal flag does not churn the queue position (every pull sends us to the
+     back of a ~1,400-contract queue); cancels for other reasons (touch move, inventory, tau) re-join without the hold;
    - action budget <= 2 per second per side (verify the Kalshi tier limits before Phase 3);
    - position truth from authoritative polls via the reconciler pattern; local fill accounting is advisory only.
 R5 Touch moves. If the touch moves away from our resting order (we are now behind), cancel and re-join at the new
