@@ -115,6 +115,21 @@ tick): capture 0.05c, adverse ~0, P&L ~0. Print size: <1 contract -0.21c @6 s (t
 1-10 +0.18c, 10-100 +0.16c, >=100 +0.22c. Directional split is large this day (long-YES fills -6c @60 s,
 short-YES +6c: the day's drift, cancels in the beta-neutral column).
 
+Same day, same fills, with the STANDARD 43-input 1 s nowcast as the flag (`models/resid-prune5-btc.json`; it sits
+~0.35c from the mid on average vs 0.13c for the compact model, so it flags more fills: 22% against, 15% for):
+
+| policy (1 s fair) | P&L/fill @6 s | @30 s | @60 s | beta-neutral @6 s |
+|---|---|---|---|---|
+| quiet-only (63% of fills) | +0.10c (t 2.6) | +0.10c (t 1.0) | +0.13c (t 0.9) | +0.09c (t 2.5) |
+| pull policy (drop the 22% flagged against) | +0.25c (t 6.0) | +0.24c (t 1.6) | +0.29c (t 1.5) | +0.24c (t 6.1) |
+| 1c-tick region + pull | +0.52c (t 6.3) | +0.65c (t 3.0) | +0.72c (t 2.5) | +0.48c (t 9.1) |
+| 1c-tick region + quiet-only | +0.28c (t 4.4) | +0.44c (t 3.3) | +0.48c (t 2.5) | +0.27c (t 4.6) |
+
+By flag: against -0.58c @6 s (22.2%), quiet +0.12c (62.6%), for +0.82c @6 s / +1.04c @30 s (14.8%). The pull rule
+beats quiet-only because the favourable 15% is the maker's best income; the 1 s fair roughly doubles the compact
+model's per-fill P&L under the same rule (+0.25c vs +0.17c; +0.52c vs +0.32c in the 1c region) and keeps
+significance out to 30-60 s in the 1c region.
+
 Reading: uninformed flow exists and is abundant; the naive maker is roughly break-even at the touch; the nowcast
 pull removes the informed 11% of fills and lifts P&L/fill to +0.17c (t 5) in the proxy. Caveats that keep this
 below GATE 0: one day; the proxy fills on every print (a real 1-contract order behind a 1,400 queue fills on a
