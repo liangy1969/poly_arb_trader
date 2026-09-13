@@ -137,6 +137,24 @@ subset, and adverse selection concentrates on the fills that do happen); no inve
 and 60 s marks lose significance as directional variance enters. Next: replicate daily (poller running), then
 Phase 1 print-based queue fills.
 
+### Pull rule vs favourable-only (day 1, 1 s fair, 64 markets, touch fills 60-300 s)
+
+| policy (fills taken) | share of touch fills | P&L/fill @6 s | @30 s | @60 s | bid in the book (1c region) |
+|---|---|---|---|---|---|
+| pull rule, quote unless flagged against (g >= -0.25c) | 77.7% | +0.25c (t 6.0) | +0.24c | +0.29c | 73.6% of the time |
+| favourable-only, quote only when flagged for (g > +0.25c) | 14.8% | +0.72c (t 7.6) | +0.81c | +0.91c | 30.8% |
+| pull rule, 1c region | 35.1% | +0.52c (t 6.3) | +0.65c | +0.72c | |
+| favourable-only, 1c region | 13.4% | +0.94c (t 6.2) | +0.99c | +1.22c | |
+
+Favourable fills stay good as g grows (g 1-2c: +1.02c @6 s, +2.22c @30 s), unlike the passive-ENTRY study on big
+gaps: a resting order that is hit while the model says the move is in its favour is the late/uninformed flow.
+Hit rate by state (fills share / time share): quiet 1.46x, favourable 0.48x, against 0.84x - the touch is hit
+most in the quiet state, least when the flow is already going our way. Income per unit time in the 1c region:
+pull rule ~0.31c per unit vs favourable-only ~0.14c (2.3x), because the pull rule is in the book 2.4x longer and
+the quiet fills earn +0.28c; favourable-only earns ~2x per fill and per contract of inventory. Pull rule is the
+default when fills are presence-limited (tiny size vs abundant flow); favourable-only when inventory-limited
+(small Q). Both are Phase 1 grid rows; the difference is only whether the quiet zone is quoted.
+
 ## 2c. Quoting rule v0 (what Phase 1 simulates and Phase 2 builds)
 
 Standard signal (user decision 2026-09-12): the 43-input pruned 1 s nowcast `models/resid-prune5-btc.json`
