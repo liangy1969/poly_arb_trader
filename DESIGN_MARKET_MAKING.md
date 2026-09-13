@@ -200,6 +200,38 @@ R7 Expected economics from the day-1 proxy: +0.17c per fill with the pull rule, 
    measures. Knobs for the Phase 1 grid: theta, the re-join rule, Q and lambda, the lone-quote minimum, the tau
    window, S.
 
+## 2d. Phase 1 result, day 1: QUEUE-based fills reverse the proxy (`tools/nowcast/maker_queue_sim.py`)
+
+Model: one contract per side at the touch, joining BEHIND the displayed size; the queue ahead drains with prints
+at our price on our side and is bounded by the displayed size (cancels ahead); a fill when prints exhaust the
+queue (partial allowed) or when a sweep prints beyond our level; decisions on the 50 ms rows with 300 ms cancel /
+150 ms post latency; R0-R5 as in §2c (1c region, tau 90-300 s, Q = 5, lone-quote < 100, re-join hold 1 s).
+2026-09-10, 64 markets, standard 1 s fair as the flag, market-clustered t.
+
+| policy | fills / market | P&L per fill @6 s | @30 s | settle per contract | per-market P&L to settlement |
+|---|---|---|---|---|---|
+| naive | 120 | -1.05c (t -9.3) | -1.17c (t -6.5) | -1.65c (t -3.9) | -85c (t -4.1) |
+| pull (theta 0.25c) | 32 | -0.90c (t -4.0) | -0.21c (t -0.5) | -0.71c (t -0.8) | -3c (t -0.2) |
+| favourable-only | 16 | -0.89c (t -2.8) | -0.57c (t -1.0) | -2.18c (t -1.2) | -26c (t -1.5) |
+| pull, queue ahead halved | 38 | -0.58c (t -3.1) | -0.20c | -0.83c | -14c (t -0.8) |
+
+Where the fills come from (pull): 44% queue-exhaustion fills at +0.04c @6 s / +1.53c @30 s, 56% SWEEP fills
+(the level eaten through) at -1.49c / -0.64c; 82-90% of fills arrive within 1 s of posting (a 1,400 queue lasts
+~2 s at 500-900 contracts/s per side). Time priority is not the constraint; the direction of the consumption is.
+Front-of-queue variants (post only when the displayed size <= 200 / 500): pull -1.39c / -1.49c @6 s, naive -1.08c,
+favourable-only 1 fill per market at -1.82c -> being first in line = being picked off (the lone-quote rule).
+
+Sensitivity (pull): cancel latency 300 ms -0.90c @6 s -> 50 ms -0.45c (t -1.9) -> 0 ms -0.06c (t -0.3, per-market
++13c t 0.8); threshold 0.10c at 300 ms -0.65c, at 50 ms -0.80c (more churn). Even the zero-latency bound is
+break-even: sweep fills remain 39% at -0.78c.
+
+VERDICT (day 1): GATE 1 not met. Under realistic fills the touch maker on KXBTC15M loses ~1c per fill at 6 s in
+every configuration; the nowcast pull only cuts the fill count and brings the per-market total to ~0 (-3c, t -0.2).
+The +0.25c/fill of §2b was the flow-sampling proxy counting fills the queue never delivers. What would have to be
+true for Phase 2 to proceed: a fill model calibrated on REAL micro-live fills that shows sweep fills below ~40% of
+fills at <= 300 ms, or a sub-100 ms cancel path (FIX) plus a day-replicated positive per-market total. Until then
+the maker build stops at Phase 1; the trade tape keeps accumulating for replication.
+
 ## 3. Risks
 
 - Uninformed flow may be too thin: this market's takers are fast perp-followers (the informed flow
