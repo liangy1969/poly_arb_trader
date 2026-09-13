@@ -37,6 +37,7 @@ dependencies = [
  "arb-collector-databento",
  "arb-collector-kalshi",
  "arb-collector-polymarket",
+ "arb-collector-venuelat",
  "arb-core",
  "arb-executor",
  "arb-processor",
@@ -155,6 +156,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "arb-collector-venuelat"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arb-core",
+ "futures-util",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-socks",
+ "tokio-tungstenite",
+ "tracing",
+]
+
+[[package]]
 name = "arb-core"
 version = "0.1.0"
 dependencies = [
@@ -172,6 +188,8 @@ dependencies = [
  "arb-core",
  "async-trait",
  "base64",
+ "chrono",
+ "futures-util",
  "rand 0.8.6",
  "reqwest 0.12.28",
  "rsa",
@@ -179,6 +197,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tokio",
+ "tokio-tungstenite",
  "tracing",
 ]
 

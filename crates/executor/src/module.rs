@@ -183,11 +183,18 @@ fn translated_close_fill(held_inst: &str, order_id: &str, seq: u64, qty: f64, cl
 pub struct Executor {
     cfg: ExecutorCfg,
     handles: Vec<tokio::task::JoinHandle<()>>,
+    /// Live order/position owner (executor.order_manager.enabled, kalshi adapter only).
+    order_manager: Option<crate::order_manager::OrderManager>,
 }
 
 impl Executor {
     pub fn new(cfg: ExecutorCfg) -> Self {
-        Executor { cfg, handles: Vec::new() }
+        Executor { cfg, handles: Vec::new(), order_manager: None }
+    }
+
+    /// The order manager handle, once started (None when disabled or not kalshi).
+    pub fn order_manager(&self) -> Option<crate::order_manager::OrderManager> {
+        self.order_manager.clone()
     }
 }
 
@@ -247,6 +254,18 @@ impl Module for Executor {
         // near-expiry liquidator) push async fills onto `fill_tx` — the §8.6
         // fill-ingestion path a live adapter would feed from the user WS + pull.
         let source: Arc<dyn BookSource> = Arc::new(MirrorSource(mirror.clone()));
+        // The kalshi adapter is built once and shared: the trade path sees it as a
+        // `TradingVenue`, the order manager (when enabled) as the concrete adapter
+        // for its private-WS feed + signed REST sync.
+        let kalshi: Option<Arc<crate::venue_kalshi::KalshiVenue>> = if self.cfg.venue.adapter == "kalshi" {
+            Some(Arc::new(crate::venue_kalshi::KalshiVenue::new(
+                &self.cfg.venue.key_id,
+                &self.cfg.venue.private_key_path,
+                &self.cfg.venue.network,
+            )?))
+        } else {
+            None
+        };
         let venue: Arc<dyn TradingVenue> = match self.cfg.venue.adapter.as_str() {
             "sim" => Arc::new(SimVenue::new(
                 spec.taker_delay_ms,
@@ -255,11 +274,7 @@ impl Module for Executor {
                 self.cfg.sim.force_check_ms,
                 source,
             )),
-            "kalshi" => Arc::new(crate::venue_kalshi::KalshiVenue::new(
-                &self.cfg.venue.key_id,
-                &self.cfg.venue.private_key_path,
-                &self.cfg.venue.network,
-            )?),
+            "kalshi" => kalshi.clone().expect("built above") as Arc<dyn TradingVenue>,
             other => anyhow::bail!(
                 "venue adapter '{other}' not implemented (have: sim, kalshi; polymarket_clob is P2)"
             ),
@@ -274,6 +289,20 @@ impl Module for Executor {
 
         let (fill_tx, fill_rx) = tokio::sync::mpsc::unbounded_channel();
         self.handles.extend(venue.start(fill_tx.clone()));
+
+        // Order manager: private WS (user_orders/fill/market_positions) + REST sync.
+        // A read-only observer of the live account until a rule places through it.
+        if self.cfg.order_manager.enabled {
+            match &kalshi {
+                Some(kv) => {
+                    let om = crate::order_manager::OrderManager::new(self.cfg.order_manager.clone(), venue.clone());
+                    self.handles.extend(crate::order_manager_kalshi::spawn(om.clone(), kv.clone()));
+                    tracing::info!(target: "oms", "order manager started (ws={}, sync_ms={})", self.cfg.order_manager.ws, self.cfg.order_manager.sync_ms);
+                    self.order_manager = Some(om);
+                }
+                None => tracing::warn!(target: "oms", "order_manager.enabled but adapter is not kalshi: not started"),
+            }
+        }
 
         let slots: Slots = Arc::new(Mutex::new(HashMap::new()));
         let entries_halted = Arc::new(AtomicBool::new(false));

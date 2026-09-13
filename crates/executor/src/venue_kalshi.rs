@@ -49,6 +49,10 @@ const PROD_BASE: &str = "https://external-api.kalshi.com/trade-api/v2";
 const DEMO_BASE: &str = "https://external-api.demo.kalshi.co/trade-api/v2";
 /// Path component that is signed (must match the request path exactly).
 const ORDERS_PATH: &str = "/trade-api/v2/portfolio/events/orders";
+/// Private WS endpoints (order manager feed); the signed path is the same for both.
+const PROD_WS: &str = "wss://external-api-ws.kalshi.com/trade-api/ws/v2";
+const DEMO_WS: &str = "wss://external-api-ws.demo.kalshi.co/trade-api/ws/v2";
+const WS_PATH: &str = "/trade-api/ws/v2";
 
 /// RSA-PSS request signer (DESIGN_KALSHI_VENUE §2). Minimal copy of
 /// `arb_collector_kalshi::auth::Signer`; TODO factor a shared `kalshi-auth` crate.
@@ -313,9 +317,10 @@ impl TradingVenue for KalshiVenue {
     /// Kalshi if it would cross). Returns the venue order_id.
     async fn place_resting(&self, intent: &OrderIntent) -> Result<String, String> {
         let ko = map_order(intent, false); // post-only: round AWAY from the cross so it rests
-        let count = intent.size.floor().max(0.0) as i64;
-        if count < 1 {
-            return Err(format!("size {:.2} < 1 contract", intent.size));
+        // Fixed-point contracts, 2 decimals (Kalshi allows 0.01 since 2026-01-26; micro-live quotes 0.01).
+        let count = (intent.size * 100.0).round() / 100.0;
+        if count < 0.01 {
+            return Err(format!("size {:.2} < 0.01 contract", intent.size));
         }
         let Some(ticker) = market_id_of(&intent.instrument) else {
             return Err(format!("no ticker in {}", intent.instrument));
@@ -324,7 +329,7 @@ impl TradingVenue for KalshiVenue {
             "ticker": ticker,
             "client_order_id": intent.client_id,
             "side": ko.side,
-            "count": format!("{count}.00"),
+            "count": format!("{count:.2}"),
             "price": format!("{:.2}", ko.cents as f64 / 100.0),
             "time_in_force": "good_till_canceled",
             "post_only": true,
@@ -508,6 +513,55 @@ impl TradingVenue for KalshiVenue {
     }
 
     fn start(&self, fills: FillSender) -> Vec<JoinHandle<()>> {
+        self.start_impl(fills)
+    }
+
+    fn name(&self) -> &'static str {
+        "kalshi"
+    }
+}
+
+impl KalshiVenue {
+    /// Signed GET against `/trade-api/v2{path}{query}` (the signature covers the
+    /// path only, never the query string). Used by the order manager REST sync.
+    pub(crate) async fn signed_get(&self, path: &str, query: &str) -> Result<serde_json::Value, String> {
+        let signed_path = format!("/trade-api/v2{path}");
+        let ts_ms = now_ns() / 1_000_000;
+        let (ts, sig) = self.signer.sign("GET", &signed_path, ts_ms).map_err(|e| format!("sign: {e}"))?;
+        let url = format!("{}{path}{query}", self.base);
+        let resp = self
+            .http
+            .get(&url)
+            .header("KALSHI-ACCESS-KEY", self.signer.key_id.as_str())
+            .header("KALSHI-ACCESS-TIMESTAMP", ts)
+            .header("KALSHI-ACCESS-SIGNATURE", sig)
+            .send()
+            .await
+            .map_err(|e| format!("http: {e}"))?;
+        if !resp.status().is_success() {
+            let code = resp.status();
+            return Err(format!("kalshi GET {path} {code}: {}", resp.text().await.unwrap_or_default()));
+        }
+        resp.json::<serde_json::Value>().await.map_err(|e| format!("parse: {e}"))
+    }
+
+    /// Signed WebSocket upgrade request for the private channels.
+    pub(crate) fn ws_request(&self) -> Result<tokio_tungstenite::tungstenite::handshake::client::Request> {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
+        let url = if self.base == PROD_BASE { PROD_WS } else { DEMO_WS };
+        let ts_ms = now_ns() / 1_000_000;
+        let (ts, sig) = self.signer.sign("GET", WS_PATH, ts_ms)?;
+        let mut req = url.into_client_request()?;
+        let h = req.headers_mut();
+        h.insert(HeaderName::from_static("kalshi-access-key"), HeaderValue::from_str(&self.signer.key_id)?);
+        h.insert(HeaderName::from_static("kalshi-access-timestamp"), HeaderValue::from_str(&ts)?);
+        h.insert(HeaderName::from_static("kalshi-access-signature"), HeaderValue::from_str(&sig)?);
+        h.insert(HeaderName::from_static("user-agent"), HeaderValue::from_static("Mozilla/5.0"));
+        Ok(req)
+    }
+
+    fn start_impl(&self, fills: FillSender) -> Vec<JoinHandle<()>> {
         // Keep the fill sender alive — if it drops, the executor's fill_rx closes
         // and its select! loop breaks on the first poll (no signals ever processed).
         let keeper = tokio::spawn(async move {
@@ -529,10 +583,6 @@ impl TradingVenue for KalshiVenue {
             }
         });
         vec![keeper, warmer]
-    }
-
-    fn name(&self) -> &'static str {
-        "kalshi"
     }
 }
 

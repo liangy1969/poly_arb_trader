@@ -21,3 +21,7 @@ rsa = { version = "0.9", features = ["pem", "sha2"] }
 sha2 = "0.10"
 rand = "0.8"
 base64 = "0.22"
+# Order manager (order_manager_kalshi.rs): private WS channels + RFC-3339 timestamps.
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+futures-util = "0.3"
+chrono = "0.4"

@@ -37,6 +37,9 @@ pub struct ExecutorCfg {
     /// and log bid/ask/mid + delta from the signal price. Tells us whether the
     /// signal was directionally right independent of whether our order filled.
     pub price_probe: PriceProbeCfg,
+    /// Order manager (DESIGN_ORDER_MANAGER.md): private WS + REST sync owner of our
+    /// orders/positions. Off by default; only the kalshi adapter feeds it.
+    pub order_manager: crate::order_manager::OrderManagerCfg,
 }
 
 #[derive(Clone, Deserialize)]
@@ -210,6 +213,7 @@ impl Default for ExecutorCfg {
             hold_probe_ms: Vec::new(),
             maker_probe: MakerProbeCfg::default(),
             price_probe: PriceProbeCfg::default(),
+            order_manager: crate::order_manager::OrderManagerCfg::default(),
         }
     }
 }

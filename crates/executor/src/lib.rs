@@ -9,6 +9,8 @@
 pub mod config;
 pub mod mirror;
 pub mod module;
+pub mod order_manager;
+pub mod order_manager_kalshi;
 pub mod position;
 pub mod risk;
 pub mod types;
@@ -18,5 +20,6 @@ pub mod venue_spec;
 
 pub use config::ExecutorCfg;
 pub use module::Executor;
+pub use order_manager::{BookSide, OmsEvent, OrderManager, OrderManagerCfg, OrderStatus};
 pub use venue::{SimVenue, TradingVenue};
 pub use venue_kalshi::KalshiVenue;
