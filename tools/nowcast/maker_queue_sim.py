@@ -28,6 +28,9 @@ ap.add_argument("--q", type=float, default=5.0); ap.add_argument("--lat-cancel",
 ap.add_argument("--lone", type=float, default=100.0); ap.add_argument("--region", default="1c"); ap.add_argument("--tte", default="90,300")
 ap.add_argument("--rejoin-hold", type=int, default=1000); ap.add_argument("--quiet", action="store_true")
 ap.add_argument("--max-join", type=float, default=1e9, help="post only when the displayed size at the touch is <= this (front-of-queue variant)")
+ap.add_argument("--lat-dist", action="store_true", help="sample cancel/post latency from the measured live distribution (lognormal, median 10 ms, p90 ~46 ms, p99 ~160 ms) instead of constants")
+ap.add_argument("--sweep-guard", type=float, default=0.0, help="print-driven pull: cancel when prints at our price in the last 100 ms consumed >= this fraction of the queue ahead (0 = off)")
+ap.add_argument("--seed", type=int, default=0)
 a = ap.parse_args()
 TTE_LO, TTE_HI = (float(x) for x in a.tte.split(","))
 EPSP = 5e-5
@@ -46,6 +49,14 @@ S = S.dropna(); S = S[(S.yask > S.ybid) & (S.yask - S.ybid <= 0.10)].sort_values
 D = pd.read_csv(a.dump, usecols=["ticker", "ts_ms", "fair", "mid"]).drop_duplicates(["ticker", "ts_ms"]).sort_values(["ticker", "ts_ms"])
 meta = json.load(open("data/samples/meta_cache.json"))
 BID, ASK = 0, 1
+RNG = np.random.default_rng(a.seed)
+
+
+def lat(kind):
+    """decision-to-effect latency in ms for a cancel or a post"""
+    if a.lat_dist:
+        return 5.0 + 10.0 * float(np.exp(1.2 * RNG.standard_normal()))
+    return float(a.lat_cancel if kind == "cancel" else a.lat_post)
 
 
 def policy_on(pol, g, theta_side):
@@ -69,7 +80,7 @@ def sim_market(tk, B, P, Dk):
     else:
         gbid = np.full(len(ts), np.nan)
     pts, ppx, pcnt, ptk = P.ts_ms.to_numpy(), P.yes_price.to_numpy(), P["count"].to_numpy(), P.taker_yes.to_numpy()
-    st = [dict(on=False, price=np.nan, ahead=0.0, rem=0.0, pend=[], off_reason=None, clear_since=None, posted_ts=0) for _ in range(2)]
+    st = [dict(on=False, price=np.nan, ahead=0.0, rem=0.0, pend=[], off_reason=None, clear_since=None, posted_ts=0, burst=[]) for _ in range(2)]
     q = 0.0; fills = []; presence_ms = [0, 0]; actions = 0
     pi = 0; n = len(ts)
 
@@ -109,6 +120,12 @@ def sim_market(tk, B, P, Dk):
             if not s_["on"]:
                 continue
             if abs(px - s_["price"]) < EPSP:
+                if a.sweep_guard > 0:
+                    # print-driven pull: the level is being eaten -> cancel at tape speed (before the rest of the sweep reaches us)
+                    s_["burst"] = [(t_, c_) for (t_, c_) in s_["burst"] if tp - t_ <= 100] + [(tp, cnt)]
+                    burst = sum(c_ for _, c_ in s_["burst"])
+                    if burst >= a.sweep_guard * max(s_["ahead"], 1.0) and not any(k_ == "cancel" for _, k_, _ in s_["pend"]):
+                        s_["pend"].append((tp + lat("cancel"), "cancel", np.nan)); s_["off_reason"] = "sweep_guard"; s_["clear_since"] = None
                 if s_["ahead"] >= cnt:
                     s_["ahead"] -= cnt
                 else:
@@ -156,9 +173,9 @@ def sim_market(tk, B, P, Dk):
                 elif lvl < a.lone:
                     reason = "lone"                                          # R5: alone / thin at the touch
                 if reason:
-                    s_["pend"].append((t + a.lat_cancel, "cancel", np.nan)); s_["off_reason"] = reason; s_["clear_since"] = None
+                    lc = lat("cancel"); s_["pend"].append((t + lc, "cancel", np.nan)); s_["off_reason"] = reason; s_["clear_since"] = None
                     if reason == "move" and want:
-                        s_["pend"].append((t + a.lat_cancel + a.lat_post, "post", touch))
+                        s_["pend"].append((t + lc + lat("post"), "post", touch))
             elif not s_["on"] and not has_pending and want:
                 # R4 re-join hysteresis after a flag pull: the side's own condition with margin, held rejoin_hold ms
                 if s_["off_reason"] == "flag":
@@ -169,9 +186,9 @@ def sim_market(tk, B, P, Dk):
                         if s_["clear_since"] is None:
                             s_["clear_since"] = t
                         if t - s_["clear_since"] >= a.rejoin_hold:
-                            s_["pend"].append((t + a.lat_post, "post", touch)); s_["off_reason"] = None
+                            s_["pend"].append((t + lat("post"), "post", touch)); s_["off_reason"] = None
                 else:
-                    s_["pend"].append((t + a.lat_post, "post", touch)); s_["off_reason"] = None
+                    s_["pend"].append((t + lat("post"), "post", touch)); s_["off_reason"] = None
     # mark fills
     out = []
     m = meta.get(tk) or {}
@@ -202,8 +219,8 @@ def clus(v):
 per_mkt = F.groupby("ticker").agg(n=("qty", "size"), qty=("qty", "sum"), pnl6=("pnl6", "mean"), pnl30=("pnl30", "mean"), pnl_settle_tot=("pnl_settle", lambda x: (x * F.loc[x.index, "qty"]).sum())) if len(F) else pd.DataFrame()
 tot = per_mkt.reindex(mk).fillna({"n": 0, "qty": 0, "pnl_settle_tot": 0})
 pres_min = np.array([(pres[t][0] + pres[t][1]) / 60000.0 for t in mk])
-print("policy=%s queue=%s size=%g theta=%.2f Q=%g lat cancel/post %d/%d ms lone<%g region=%s tte=%s | markets %d" % (
-    a.policy, a.queue, a.size, a.theta, a.q, a.lat_cancel, a.lat_post, a.lone, a.region, a.tte, len(mk)))
+print("policy=%s queue=%s size=%g theta=%.2f Q=%g lat %s lone<%g sweep-guard %.2f region=%s tte=%s | markets %d" % (
+    a.policy, a.queue, a.size, a.theta, a.q, "measured-dist" if a.lat_dist else "%d/%d ms" % (a.lat_cancel, a.lat_post), a.lone, a.sweep_guard, a.region, a.tte, len(mk)))
 nf, tnf, _ = clus(tot["n"]); ntot = int(tot["n"].sum())
 print("fills: total %d | per market %.1f | contracts per market %.2f | side-minutes in book per market %.1f -> fills per side-minute %.2f | actions per market %.0f" % (
     ntot, nf, tot["qty"].mean(), pres_min.mean(), ntot / max(pres_min.sum(), 1e-9), np.mean(list(acts.values()))))

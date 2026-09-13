@@ -225,6 +225,25 @@ Sensitivity (pull): cancel latency 300 ms -0.90c @6 s -> 50 ms -0.45c (t -1.9) -
 +13c t 0.8); threshold 0.10c at 300 ms -0.65c, at 50 ms -0.80c (more churn). Even the zero-latency bound is
 break-even: sweep fills remain 39% at -0.78c.
 
+Measured latency and print-driven reaction (2026-09-12): the live REST order path on the box (us-east-2, warm
+connection) is median 10 ms, p75 14 ms, p90 71 ms, p99 153 ms signal-to-fill over 2,699 IOC fills; perp ticks reach
+the box within ~50 ms; the book WS is in-region. Re-run with latency SAMPLED from that distribution (lognormal,
+median 10 ms, p90 ~46 ms) and, as the higher-frequency variant, a sweep guard that reacts to every print at our
+level at tape speed (cancel when prints at our price in the last 100 ms consumed >= f of the queue ahead):
+
+| pull rule, measured latency | fills / market | P&L per fill @6 s | sweep share | per-market to settlement |
+|---|---|---|---|---|
+| no guard | 16 | -0.26c (t -1.1) | 44% at -1.27c | +7.6c (t +0.5) |
+| sweep guard f = 0.5 | 13 | -0.24c (t -1.0) | 55% | -4.7c (t -0.3) |
+| sweep guard f = 0.25 | 12 | -0.32c (t -1.2) | 60% | -13.6c (t -0.9) |
+| sweep guard f = 0.1 | 12 | -0.28c (t -1.0) | 62% | -20.5c (t -1.7) |
+| naive + guard 0.5 | 111 | -0.87c (t -6.5) | 48% | -56c (t -2.9) |
+
+Reacting faster to the tape does not remove the sweep fills: a level is eaten within one print burst, so by the
+time the first print at our level is visible the rest of the sweep is already matching; the guard only adds
+cancel/re-post churn (actions per market 186 -> 232-298). At measured latency the pull maker sits at -0.26c per
+fill, statistically zero on one day but negative in point estimate, with the same 44% sweep share.
+
 VERDICT (day 1): GATE 1 not met. Under realistic fills the touch maker on KXBTC15M loses ~1c per fill at 6 s in
 every configuration; the nowcast pull only cuts the fill count and brings the per-market total to ~0 (-3c, t -0.2).
 The +0.25c/fill of §2b was the flow-sampling proxy counting fills the queue never delivers. What would have to be
