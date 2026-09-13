@@ -284,6 +284,13 @@ queue-type fills at the new level are ~0 to +0.7c. It halves the per-fill loss o
 -0.07c) and is the most promising placement rule tested; still statistically zero on one day (t -0.3, per-market
 +9.7c t 0.6). Replication on further tape days is the next step before any build.
 
+Day 2 replication (2026-09-12 tape, a quiet Saturday: 96 markets, 296k prints, sweeps 28% of fills vs 44% on 09-10):
+naive -0.38c/fill @6 s (t -4.5, -26c/market); pull at the touch +0.11c (t +0.8, -11c/market); pull + jump 0.50 +0.04c
+(t +0.2, -21c/market; jump-queue fills +0.61c, jump-sweep -0.68c); pull + jump 0.50 + imbalance pull 0.30 +0.06c
+(t +0.4, -3.7c/market). Two-day read: the pull rule at the touch is -0.28c / +0.11c per fill, the jump -0.07c / +0.04c:
+both average to ~0; the jump narrows the day-to-day spread (it helps on the busy day where sweeps dominate, adds nothing
+on the quiet day). Per-market settlement totals are negative on both days for every variant except day-1 jump.
+
 VERDICT (day 1): GATE 1 not met. Under realistic fills the touch maker on KXBTC15M loses ~1c per fill at 6 s in
 every configuration; the nowcast pull only cuts the fill count and brings the per-market total to ~0 (-3c, t -0.2).
 The +0.25c/fill of §2b was the flow-sampling proxy counting fills the queue never delivers. What would have to be
