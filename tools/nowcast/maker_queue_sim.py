@@ -34,6 +34,8 @@ ap.add_argument("--seed", type=int, default=0)
 ap.add_argument("--imb-pull", type=float, default=0.0, help="queue-imbalance pull: cancel our side when own-side share of the touch sizes < this (Gould-Bonart / Lehalle-Mounjid)")
 ap.add_argument("--imb-post", type=float, default=0.0, help="post only when own-side share of the touch sizes >= this")
 ap.add_argument("--fresh-ms", type=int, default=0, help="post only within this many ms after the touch level formed (front-of-queue by timing; 0 = off)")
+ap.add_argument("--jump", type=float, default=0.0, help="anticipate the move: when g toward us > this (cents) and the opposite touch level just cleared, post at that price (ahead of the current touch), first in the new queue; 0 = off")
+ap.add_argument("--jump-hold", type=int, default=500, help="ms the jump target stays valid after the level cleared")
 a = ap.parse_args()
 TTE_LO, TTE_HI = (float(x) for x in a.tte.split(","))
 EPSP = 5e-5
@@ -83,7 +85,8 @@ def sim_market(tk, B, P, Dk):
     else:
         gbid = np.full(len(ts), np.nan)
     pts, ppx, pcnt, ptk = P.ts_ms.to_numpy(), P.yes_price.to_numpy(), P["count"].to_numpy(), P.taker_yes.to_numpy()
-    st = [dict(on=False, price=np.nan, ahead=0.0, rem=0.0, pend=[], off_reason=None, clear_since=None, posted_ts=0, burst=[]) for _ in range(2)]
+    st = [dict(on=False, price=np.nan, ahead=0.0, rem=0.0, pend=[], off_reason=None, clear_since=None, posted_ts=0, burst=[], jumped=False) for _ in range(2)]
+    jump_px = [np.nan, np.nan]; jump_until = [0, 0]
     q = 0.0; fills = []; presence_ms = [0, 0]; actions = 0
     level_since = [ts[0], ts[0]]; last_touch = [yb[0], ya[0]]
     pi = 0; n = len(ts)
@@ -95,10 +98,11 @@ def sim_market(tk, B, P, Dk):
             if eff <= now:
                 if act == "post" and not s_["on"]:
                     s_["on"] = True; s_["price"] = px; s_["rem"] = a.size; s_["posted_ts"] = eff
+                    s_["jumped"] = bool(a.jump > 0 and abs(px - jump_px[side]) < EPSP) if not np.isnan(jump_px[side]) else False
                     # queue ahead = displayed size at that price at posting time (row at/before eff)
                     k = np.searchsorted(ts, eff, side="right") - 1
                     k = max(k, 0)
-                    lvl = (ybs[k] if side == BID else yas[k]) if abs((yb[k] if side == BID else ya[k]) - px) < EPSP else 0.0
+                    lvl = (ybs[k] if side == BID else yas[k]) if abs((yb[k] if side == BID else ya[k]) - px) < EPSP else 0.0   # at a jump level nobody displays yet -> first in line
                     s_["ahead"] = lvl if a.queue == "back" else 0.5 * lvl
                     actions += 1
                 elif act == "cancel" and s_["on"]:
@@ -111,7 +115,7 @@ def sim_market(tk, B, P, Dk):
         nonlocal q
         sign = 1.0 if side == BID else -1.0
         q += sign * qty
-        fills.append((t, side, px, qty, kind, t - st[side]["posted_ts"]))
+        fills.append((t, side, px, qty, ("jump-" + kind) if st[side]["jumped"] else kind, t - st[side]["posted_ts"]))
 
     for i in range(n):
         t = ts[i]
@@ -156,6 +160,12 @@ def sim_market(tk, B, P, Dk):
             lvl = ybs[i] if side == BID else yas[i]
             if abs(touch - last_touch[side]) >= EPSP:
                 level_since[side] = t; last_touch[side] = touch          # a new touch level formed on this side
+            # jump target: the opposite touch level just cleared in our direction (ask moved up for a bid; bid moved down for an ask)
+            if a.jump > 0 and i > 0:
+                if side == BID and ya[i] > ya[i - 1] + EPSP:
+                    jump_px[side] = ya[i - 1]; jump_until[side] = t + a.jump_hold
+                if side == ASK and yb[i] < yb[i - 1] - EPSP:
+                    jump_px[side] = yb[i - 1]; jump_until[side] = t + a.jump_hold
             opp = yas[i] if side == BID else ybs[i]
             share = lvl / max(lvl + opp, 1e-9)                          # own-side share of the touch sizes
             gs = gbid[i] if side == BID else -gbid[i]
@@ -177,19 +187,26 @@ def sim_market(tk, B, P, Dk):
             # bound the queue ahead by what is displayed at our price now
             if s_["on"]:
                 s_["ahead"] = min(s_["ahead"], lvl if abs(touch - s_["price"]) < EPSP else s_["ahead"])
+            # jump price: ahead of the current touch, only while it does not cross and the model still says the move is toward us
+            jp = np.nan
+            if a.jump > 0 and want and t <= jump_until[side] and not np.isnan(jump_px[side]) and not np.isnan(gs) and gs > a.jump:
+                cand = jump_px[side]
+                if (side == BID and cand < ya[i] - EPSP and cand > yb[i] - EPSP) or (side == ASK and cand > yb[i] + EPSP and cand < ya[i] + EPSP):
+                    jp = cand
+            target_px = jp if not np.isnan(jp) else touch
             has_pending = bool(s_["pend"])
             if s_["on"] and not has_pending:
                 reason = None
                 if not want:
                     reason = "flag" if (eligible and not closing) else "window"
-                elif abs(touch - s_["price"]) >= EPSP:
-                    reason = "move"                                          # R5: touch moved, re-join at the new touch
-                elif lvl < a.lone:
+                elif abs(target_px - s_["price"]) >= EPSP and (np.isnan(jp) or target_px > s_["price"] + EPSP if side == BID else True) and (np.isnan(jp) or target_px < s_["price"] - EPSP if side == ASK else True):
+                    reason = "move"                                          # R5: touch moved (or a jump level opened ahead of us): re-post at target
+                elif lvl < a.lone and np.isnan(jp) and not s_["jumped"]:
                     reason = "lone"                                          # R5: alone / thin at the touch
                 if reason:
                     lc = lat("cancel"); s_["pend"].append((t + lc, "cancel", np.nan)); s_["off_reason"] = reason; s_["clear_since"] = None
                     if reason == "move" and want:
-                        s_["pend"].append((t + lc + lat("post"), "post", touch))
+                        s_["pend"].append((t + lc + lat("post"), "post", target_px))
             elif not s_["on"] and not has_pending and want:
                 # R4 re-join hysteresis after a flag pull: the side's own condition with margin, held rejoin_hold ms
                 if s_["off_reason"] == "flag":
@@ -200,9 +217,9 @@ def sim_market(tk, B, P, Dk):
                         if s_["clear_since"] is None:
                             s_["clear_since"] = t
                         if t - s_["clear_since"] >= a.rejoin_hold:
-                            s_["pend"].append((t + lat("post"), "post", touch)); s_["off_reason"] = None
+                            s_["pend"].append((t + lat("post"), "post", target_px)); s_["off_reason"] = None
                 else:
-                    s_["pend"].append((t + lat("post"), "post", touch)); s_["off_reason"] = None
+                    s_["pend"].append((t + lat("post"), "post", target_px)); s_["off_reason"] = None
     # mark fills
     out = []
     m = meta.get(tk) or {}
@@ -243,7 +260,7 @@ if len(F):
         m_, t_, n_ = clus(F.groupby("ticker")[col].mean()); print("  %-22s %+6.2fc  (market-clustered t %+5.2f, n=%d markets with fills; raw mean %+6.2fc over %d fills)" % (lab, m_, t_, n_, F[col].mean(), len(F)))
     m_, t_, n_ = clus(tot["pnl_settle_tot"]); print("  per-MARKET P&L to settlement (net inventory held): %+6.2fc per market (t %+5.2f, n=%d incl. zero-fill markets) | inventory at expiry: mean |q| %.2f" % (m_, t_, n_, np.mean([abs(v) for v in inv.values()])))
     print("  fills by side: bid %d ask %d | markets with 0 fills: %d" % ((F.side == BID).sum(), (F.side == ASK).sum(), (tot["n"] == 0).sum()))
-    for k in ("queue", "sweep"):
+    for k in ("queue", "sweep", "jump-queue", "jump-sweep"):
         h = F[F.kind == k]
         if len(h):
             print("  fill type %-6s %5.1f%% | P&L @6s %+6.2fc @30s %+6.2fc settle %+6.2fc | age since post: median %.1fs p10 %.1fs" % (k, 100 * len(h) / len(F), h.pnl6.mean(), h.pnl30.mean(), h.pnl_settle.mean(), h.age_ms.median() / 1000, h.age_ms.quantile(.1) / 1000))

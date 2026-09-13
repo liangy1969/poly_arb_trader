@@ -264,6 +264,26 @@ drops below ~44%: the sweeps that hurt arrive without a visible imbalance warnin
 imbalance alone does not rescue naive quoting. Freshness (front of the queue by timing) is worse, consistent with
 the front-of-queue result above.
 
+Anticipating the level ("ahead of the current bid", 2026-09-13): when g toward a side exceeds a jump threshold and the
+OPPOSITE touch level has just cleared (ask moved up for a bid; bid moved down for an ask), post at the price that just
+cleared instead of the current touch: it rests as the new best quote, first in a queue nobody displays yet, one tick
+ahead of the crowd. Valid for `jump-hold` 500 ms while it does not cross. Pull rule, measured latency, lone rule off:
+
+| variant | fills / market | P&L per fill @6 s | jump fills (share, @6 s) | per-market to settlement |
+|---|---|---|---|---|
+| reference (pull, lone off) | 17 | -0.28c (t -1.3) | - | +5.8c (t +0.4) |
+| jump at g > 0.25c | 18 | -0.14c (t -0.7) | 54%: queue-type +0.18c, sweep-type -0.66c | +9.9c (t +0.7) |
+| jump at g > 0.50c | 17 | -0.07c (t -0.3) | 52%: queue-type -0.09c, sweep-type -0.20c | +9.7c (t +0.6) |
+| jump at g > 1.00c | 16 | -0.43c (t -1.7) | 52% | +8.3c |
+| jump 0.50 + imbalance pull 0.30 | 10 | +0.07c (t +0.2) | 53%: queue-type +0.74c, sweep-type -0.31c | -3.9c |
+| favourable-only + jump 0.50 | 5 | -0.34c (t -0.7) | 48%: queue-type +2.51c | -33c (t -2.0) |
+
+Mechanism: a jumped order that gets swept loses -0.2..-0.7c instead of the -1.4..-1.6c of a sweep at the old level,
+because it sits at the front of a thin fresh level and the adverse move is at most the tick it just gained; the
+queue-type fills at the new level are ~0 to +0.7c. It halves the per-fill loss of the pull rule on day 1 (-0.28c ->
+-0.07c) and is the most promising placement rule tested; still statistically zero on one day (t -0.3, per-market
++9.7c t 0.6). Replication on further tape days is the next step before any build.
+
 VERDICT (day 1): GATE 1 not met. Under realistic fills the touch maker on KXBTC15M loses ~1c per fill at 6 s in
 every configuration; the nowcast pull only cuts the fill count and brings the per-market total to ~0 (-3c, t -0.2).
 The +0.25c/fill of §2b was the flow-sampling proxy counting fills the queue never delivers. What would have to be
