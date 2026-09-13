@@ -244,6 +244,26 @@ time the first print at our level is visible the rest of the sweep is already ma
 cancel/re-post churn (actions per market 186 -> 232-298). At measured latency the pull maker sits at -0.26c per
 fill, statistically zero on one day but negative in point estimate, with the same 44% sweep share.
 
+Placement-timing tactics from the large-tick literature (Gould-Bonart queue imbalance as the one-tick-ahead
+predictor; Lehalle-Mounjid cancel-on-imbalance eroded by latency; Moallemi-Yuan queue-position value; Huang-Lehalle-
+Rosenbaum queue-reactive intensities), tested 2026-09-13 on the day-1 tape, pull rule, measured latency:
+
+| tactic | fills / market | P&L per fill @6 s | sweep share | per-market to settlement |
+|---|---|---|---|---|
+| imbalance pull: cancel when own-side share of the touch sizes < 0.30 | 10 | +0.09c (t +0.35) | 48% | +1.2c (t +0.1) |
+| imbalance pull < 0.40 | 7.5 | -0.32c (t -0.9) | 52% | -10.6c |
+| imbalance post gate: post only when own share >= 0.50 | 15 | -0.51c (t -2.0) | 44% | -11.4c |
+| post gate 0.60 + pull 0.35 | 8 | +0.05c (t +0.15) | 52% | -14.5c |
+| naive + imbalance pull 0.35 | 24 | -0.64c (t -2.4) | 54% | -46c (t -2.3) |
+| freshness: post only within 500 ms of level formation | 13 | -0.54c (t -2.3) | 44% | -8.0c |
+| freshness 500 ms + imbalance pull 0.35 | 7 | -0.34c (t -1.0) | 49% | +0.7c |
+
+The queue-imbalance pull at 0.30 is the first configuration with a non-negative point estimate under queue fills
+(+0.09c per fill, +1.2c per market) but it is statistically zero, and 0.40 over-pulls. The sweep share never
+drops below ~44%: the sweeps that hurt arrive without a visible imbalance warning at 50 ms resolution. The
+imbalance alone does not rescue naive quoting. Freshness (front of the queue by timing) is worse, consistent with
+the front-of-queue result above.
+
 VERDICT (day 1): GATE 1 not met. Under realistic fills the touch maker on KXBTC15M loses ~1c per fill at 6 s in
 every configuration; the nowcast pull only cuts the fill count and brings the per-market total to ~0 (-3c, t -0.2).
 The +0.25c/fill of §2b was the flow-sampling proxy counting fills the queue never delivers. What would have to be

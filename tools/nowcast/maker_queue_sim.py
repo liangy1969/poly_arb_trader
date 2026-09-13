@@ -31,6 +31,9 @@ ap.add_argument("--max-join", type=float, default=1e9, help="post only when the 
 ap.add_argument("--lat-dist", action="store_true", help="sample cancel/post latency from the measured live distribution (lognormal, median 10 ms, p90 ~46 ms, p99 ~160 ms) instead of constants")
 ap.add_argument("--sweep-guard", type=float, default=0.0, help="print-driven pull: cancel when prints at our price in the last 100 ms consumed >= this fraction of the queue ahead (0 = off)")
 ap.add_argument("--seed", type=int, default=0)
+ap.add_argument("--imb-pull", type=float, default=0.0, help="queue-imbalance pull: cancel our side when own-side share of the touch sizes < this (Gould-Bonart / Lehalle-Mounjid)")
+ap.add_argument("--imb-post", type=float, default=0.0, help="post only when own-side share of the touch sizes >= this")
+ap.add_argument("--fresh-ms", type=int, default=0, help="post only within this many ms after the touch level formed (front-of-queue by timing; 0 = off)")
 a = ap.parse_args()
 TTE_LO, TTE_HI = (float(x) for x in a.tte.split(","))
 EPSP = 5e-5
@@ -82,6 +85,7 @@ def sim_market(tk, B, P, Dk):
     pts, ppx, pcnt, ptk = P.ts_ms.to_numpy(), P.yes_price.to_numpy(), P["count"].to_numpy(), P.taker_yes.to_numpy()
     st = [dict(on=False, price=np.nan, ahead=0.0, rem=0.0, pend=[], off_reason=None, clear_since=None, posted_ts=0, burst=[]) for _ in range(2)]
     q = 0.0; fills = []; presence_ms = [0, 0]; actions = 0
+    level_since = [ts[0], ts[0]]; last_touch = [yb[0], ya[0]]
     pi = 0; n = len(ts)
 
     def apply_pending(side, now):
@@ -150,12 +154,22 @@ def sim_market(tk, B, P, Dk):
                 presence_ms[side] += 50
             touch = yb[i] if side == BID else ya[i]
             lvl = ybs[i] if side == BID else yas[i]
+            if abs(touch - last_touch[side]) >= EPSP:
+                level_since[side] = t; last_touch[side] = touch          # a new touch level formed on this side
+            opp = yas[i] if side == BID else ybs[i]
+            share = lvl / max(lvl + opp, 1e-9)                          # own-side share of the touch sizes
             gs = gbid[i] if side == BID else -gbid[i]
             adds = (side == BID and q >= 0) or (side == ASK and q <= 0)      # this side would increase |q|
             theta_side = a.theta * max(0.0, 1.0 - abs(q) / a.q) if adds else a.theta
             want = eligible and not closing and not (adds and abs(q) >= a.q) and not np.isnan(gs) and policy_on(a.policy, gs, theta_side)
             if not s_["on"] and lvl > a.max_join:
                 want = False                                             # front-of-queue variant: only join thin levels
+            if not s_["on"] and a.imb_post > 0 and share < a.imb_post:
+                want = False                                             # imbalance post gate: only post behind the bigger queue
+            if not s_["on"] and a.fresh_ms > 0 and t - level_since[side] > a.fresh_ms:
+                want = False                                             # freshness gate: only join a level that just formed
+            if s_["on"] and a.imb_pull > 0 and share < a.imb_pull:
+                want = False                                             # imbalance pull: our queue is the small one -> it gets consumed first
             if closing and adds:
                 want = False
             if closing or tte[i] < TTE_LO:
@@ -219,8 +233,8 @@ def clus(v):
 per_mkt = F.groupby("ticker").agg(n=("qty", "size"), qty=("qty", "sum"), pnl6=("pnl6", "mean"), pnl30=("pnl30", "mean"), pnl_settle_tot=("pnl_settle", lambda x: (x * F.loc[x.index, "qty"]).sum())) if len(F) else pd.DataFrame()
 tot = per_mkt.reindex(mk).fillna({"n": 0, "qty": 0, "pnl_settle_tot": 0})
 pres_min = np.array([(pres[t][0] + pres[t][1]) / 60000.0 for t in mk])
-print("policy=%s queue=%s size=%g theta=%.2f Q=%g lat %s lone<%g sweep-guard %.2f region=%s tte=%s | markets %d" % (
-    a.policy, a.queue, a.size, a.theta, a.q, "measured-dist" if a.lat_dist else "%d/%d ms" % (a.lat_cancel, a.lat_post), a.lone, a.sweep_guard, a.region, a.tte, len(mk)))
+print("policy=%s queue=%s size=%g theta=%.2f Q=%g lat %s lone<%g sweep-guard %.2f imb-pull %.2f imb-post %.2f fresh %dms region=%s tte=%s | markets %d" % (
+    a.policy, a.queue, a.size, a.theta, a.q, "measured-dist" if a.lat_dist else "%d/%d ms" % (a.lat_cancel, a.lat_post), a.lone, a.sweep_guard, a.imb_pull, a.imb_post, a.fresh_ms, a.region, a.tte, len(mk)))
 nf, tnf, _ = clus(tot["n"]); ntot = int(tot["n"].sum())
 print("fills: total %d | per market %.1f | contracts per market %.2f | side-minutes in book per market %.1f -> fills per side-minute %.2f | actions per market %.0f" % (
     ntot, nf, tot["qty"].mean(), pres_min.mean(), ntot / max(pres_min.sum(), 1e-9), np.mean(list(acts.values()))))
