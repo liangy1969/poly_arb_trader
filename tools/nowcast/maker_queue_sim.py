@@ -36,6 +36,9 @@ ap.add_argument("--imb-post", type=float, default=0.0, help="post only when own-
 ap.add_argument("--fresh-ms", type=int, default=0, help="post only within this many ms after the touch level formed (front-of-queue by timing; 0 = off)")
 ap.add_argument("--jump", type=float, default=0.0, help="anticipate the move: when g toward us > this (cents) and the opposite touch level just cleared, post at that price (ahead of the current touch), first in the new queue; 0 = off")
 ap.add_argument("--jump-hold", type=int, default=500, help="ms the jump target stays valid after the level cleared")
+ap.add_argument("--perp-pull", type=float, default=0.0, help="perp-tick pull: cancel a side when the binance perp moved >= this many bps against it within --perp-win ms (lake prints, tick cadence); 0 = off")
+ap.add_argument("--perp-win", type=int, default=300); ap.add_argument("--perp-delay", type=int, default=40, help="ms from perp exchange time to the box")
+ap.add_argument("--perp-rejoin", type=int, default=1500, help="ms after a perp pull before the side may re-post")
 a = ap.parse_args()
 TTE_LO, TTE_HI = (float(x) for x in a.tte.split(","))
 EPSP = 5e-5
@@ -53,6 +56,16 @@ for c in ("ts_ms", "tte_ms", "ybid", "yask", "ybid_sz", "yask_sz"):
 S = S.dropna(); S = S[(S.yask > S.ybid) & (S.yask - S.ybid <= 0.10)].sort_values(["ticker", "ts_ms"])
 D = pd.read_csv(a.dump, usecols=["ticker", "ts_ms", "fair", "mid"]).drop_duplicates(["ticker", "ts_ms"]).sort_values(["ticker", "ts_ms"])
 meta = json.load(open("data/samples/meta_cache.json"))
+PERP = None
+if a.perp_pull > 0:
+    fs = sorted(glob.glob(f"E:/crypto/data/parquet/stream=trade/venue=binance/market=USDT_PERP/symbol=BTCUSDT/date={a.day}/*.parquet"))
+    P_ = pd.concat([pd.read_parquet(f, columns=["exch_ts_ns", "price"]) for f in fs]).sort_values("exch_ts_ns")
+    pts_ = (P_.exch_ts_ns.to_numpy() // 1_000_000) + a.perp_delay; ppx_ = P_.price.to_numpy()
+    j_ = np.searchsorted(pts_, pts_ - a.perp_win, side="right") - 1
+    mv_ = np.where(j_ >= 0, 1e4 * (ppx_ - ppx_[np.clip(j_, 0, len(ppx_) - 1)]) / ppx_, 0.0)      # bps move over the trailing window
+    trig = np.abs(mv_) >= a.perp_pull
+    PERP = (pts_[trig], mv_[trig])
+    print("perp-pull: %d perp prints, %d triggers >= %.1f bps / %d ms" % (len(pts_), trig.sum(), a.perp_pull, a.perp_win))
 BID, ASK = 0, 1
 RNG = np.random.default_rng(a.seed)
 
@@ -89,6 +102,13 @@ def sim_market(tk, B, P, Dk):
     jump_px = [np.nan, np.nan]; jump_until = [0, 0]
     q = 0.0; fills = []; presence_ms = [0, 0]; actions = 0
     level_since = [ts[0], ts[0]]; last_touch = [yb[0], ya[0]]
+    perp_block = [0, 0]
+    if PERP is not None:
+        lo_, hi_ = np.searchsorted(PERP[0], ts[0]), np.searchsorted(PERP[0], ts[-1], side="right")
+        ev_ts, ev_mv = PERP[0][lo_:hi_], PERP[1][lo_:hi_]
+    else:
+        ev_ts, ev_mv = np.zeros(0), np.zeros(0)
+    ei = 0
     pi = 0; n = len(ts)
 
     def apply_pending(side, now):
@@ -148,6 +168,14 @@ def sim_market(tk, B, P, Dk):
                 if qty > 0:
                     record_fill(side, tp, s_["price"], qty, "sweep")
                 s_["on"] = False; s_["price"] = np.nan; s_["rem"] = 0.0; s_["off_reason"] = "filled"; s_["clear_since"] = tp
+        # perp-tick pulls since the previous row (tick cadence): a down move threatens the bid, an up move the ask
+        while ei < len(ev_ts) and ev_ts[ei] <= t:
+            te, mv = ev_ts[ei], ev_mv[ei]; ei += 1
+            side = BID if mv < 0 else ASK
+            s_ = st[side]
+            perp_block[side] = te + a.perp_rejoin
+            if s_["on"] and not any(k_ == "cancel" for _, k_, _ in s_["pend"]):
+                s_["pend"].append((te + lat("cancel"), "cancel", np.nan)); s_["off_reason"] = "perp"; s_["clear_since"] = None
         for side in (BID, ASK):
             apply_pending(side, t)
         eligible = (TTE_LO <= tte[i] <= TTE_HI) and (a.region == "all" or 0.10 <= mid[i] <= 0.90)
@@ -172,6 +200,8 @@ def sim_market(tk, B, P, Dk):
             adds = (side == BID and q >= 0) or (side == ASK and q <= 0)      # this side would increase |q|
             theta_side = a.theta * max(0.0, 1.0 - abs(q) / a.q) if adds else a.theta
             want = eligible and not closing and not (adds and abs(q) >= a.q) and not np.isnan(gs) and policy_on(a.policy, gs, theta_side)
+            if not s_["on"] and t < perp_block[side]:
+                want = False                                             # perp pull cool-down
             if not s_["on"] and lvl > a.max_join:
                 want = False                                             # front-of-queue variant: only join thin levels
             if not s_["on"] and a.imb_post > 0 and share < a.imb_post:

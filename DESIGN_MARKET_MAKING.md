@@ -291,6 +291,23 @@ naive -0.38c/fill @6 s (t -4.5, -26c/market); pull at the touch +0.11c (t +0.8, 
 both average to ~0; the jump narrows the day-to-day spread (it helps on the busy day where sweeps dominate, adds nothing
 on the quiet day). Per-market settlement totals are negative on both days for every variant except day-1 jump.
 
+Perp-tick pull (2026-09-15, "quote faster by leveraging the model's leading input"): cancel a side when the binance
+perp moved >= x bps against it within 300 ms, evaluated at perp-tick cadence (lake prints, +40 ms feed delay, measured
+cancel latency), 1.5 s cool-down. Pull rule, both tape days:
+
+| perp threshold | 09-10 P&L/fill @6 s (sweep share) | 09-12 P&L/fill @6 s (sweep share) |
+|---|---|---|
+| none (reference) | -0.28c (44%) | +0.11c (28%) |
+| 2 bps (91k triggers/day) | -0.37c (44%) | +0.15c (29%) |
+| 3 bps (47k) | -0.28c (43%) | +0.08c (28%) |
+| 5 bps (18k) | -0.50c (44%) | +0.18c (28%) |
+| 3 bps + jump 0.5 | -0.11c (41%) | +0.01c (27%) |
+
+The sweep share does not move at any threshold: the Kalshi sweeps that hit a resting order are not preceded by a
+2-5 bps perp move in the prior 300 ms, so the perp tick is not an earlier warning at this resolution. Faster
+reaction (tape-speed sweep guard, perp-tick pull, 0 ms latency bound) never removes the sweep fills; only the
+nowcast flag (pull) and the jump change the per-fill number.
+
 VERDICT (day 1): GATE 1 not met. Under realistic fills the touch maker on KXBTC15M loses ~1c per fill at 6 s in
 every configuration; the nowcast pull only cuts the fill count and brings the per-market total to ~0 (-3c, t -0.2).
 The +0.25c/fill of §2b was the flow-sampling proxy counting fills the queue never delivers. What would have to be
