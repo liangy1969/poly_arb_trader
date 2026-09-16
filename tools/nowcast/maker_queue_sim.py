@@ -39,6 +39,8 @@ ap.add_argument("--jump-hold", type=int, default=500, help="ms the jump target s
 ap.add_argument("--perp-pull", type=float, default=0.0, help="perp-tick pull: cancel a side when the binance perp moved >= this many bps against it within --perp-win ms (lake prints, tick cadence); 0 = off")
 ap.add_argument("--perp-win", type=int, default=300); ap.add_argument("--perp-delay", type=int, default=40, help="ms from perp exchange time to the box")
 ap.add_argument("--perp-rejoin", type=int, default=1500, help="ms after a perp pull before the side may re-post")
+ap.add_argument("--maxrange", type=float, default=0.0, help="regime gate: quote only when the trailing 60 s mid range <= this (cents); 0 = off")
+ap.add_argument("--flatten", action="store_true", help="exit the net inventory as a TAKER at the touch (fee 0.07 p(1-p)) at tte < 45 s instead of holding to settlement")
 ap.add_argument("--tag", default="", help="write data/nowcast/qsim_<day>_<tag>.parquet (fills) and _mkts.parquet (per-market incl. zero-fill) for maker_days.py")
 ap.add_argument("--stepback", type=float, default=0.0, help="instead of pulling a side flagged against by more than this (cents), rest it ONE TICK behind the touch (early queue at the level the move goes to); 0 = off")
 a = ap.parse_args()
@@ -93,6 +95,7 @@ def sim_market(tk, B, P, Dk):
     ts = B.ts_ms.to_numpy(); tte = B.tte_ms.to_numpy() / 1000.0
     yb, ya, ybs, yas = (B[c].to_numpy() for c in ("ybid", "yask", "ybid_sz", "yask_sz"))
     mid = 0.5 * (yb + ya)
+    rng60 = (pd.Series(mid).rolling(1200, min_periods=1).max() - pd.Series(mid).rolling(1200, min_periods=1).min()).to_numpy() * 100   # trailing 60 s mid range, cents
     if len(Dk):
         dts = Dk.ts_ms.to_numpy(); jd = np.searchsorted(dts, ts, side="right") - 1
         okd = (jd >= 0) & (ts - dts[np.clip(jd, 0, len(dts) - 1)] <= 400)
@@ -182,7 +185,9 @@ def sim_market(tk, B, P, Dk):
                 s_["pend"].append((te + lat("cancel"), "cancel", np.nan)); s_["off_reason"] = "perp"; s_["clear_since"] = None
         for side in (BID, ASK):
             apply_pending(side, t)
-        eligible = (TTE_LO <= tte[i] <= TTE_HI) and (a.region == "all" or 0.10 <= mid[i] <= 0.90)
+        eligible = (TTE_LO <= tte[i] <= TTE_HI) and (a.region == "all" or (a.region == "1c" and 0.10 <= mid[i] <= 0.90) or (a.region == "atm" and 0.30 <= mid[i] <= 0.70) or (a.region == "wings" and (0.10 <= mid[i] < 0.30 or 0.70 < mid[i] <= 0.90)))
+        if a.maxrange > 0 and rng60[i] > a.maxrange:
+            eligible = False                                             # regime gate: too volatile in the last minute
         closing = tte[i] < 45.0
         for side in (BID, ASK):
             s_ = st[side]
@@ -262,6 +267,13 @@ def sim_market(tk, B, P, Dk):
                             s_["pend"].append((t + lat("post"), "post", target_px)); s_["off_reason"] = None
                 else:
                     s_["pend"].append((t + lat("post"), "post", target_px)); s_["off_reason"] = None
+    # optional taker flatten of the net inventory at tte < 45 s (fee + touch), replacing settlement for the carried position
+    flat_px = np.nan
+    if a.flatten and abs(q) > 1e-9:
+        k = np.searchsorted(-tte, -45.0)
+        if k < n:
+            flat_px = yb[k] if q > 0 else ya[k]
+            fee_c = 100 * 0.07 * flat_px * (1 - flat_px)
     # mark fills
     out = []
     m = meta.get(tk) or {}
@@ -272,7 +284,10 @@ def sim_market(tk, B, P, Dk):
         marks = []
         for h in (6, 30, 60):
             j = min(np.searchsorted(ts, t + 1000 * h, side="left"), n - 1); marks.append(100 * sign * (mid[j] - px))
-        out.append(dict(ticker=tk, ts_ms=t, side=side, px=px, qty=qty, kind=kind, age_ms=age, pnl6=marks[0], pnl30=marks[1], pnl60=marks[2], pnl_settle=100 * sign * (settle - px)))
+        pnl_s = 100 * sign * (settle - px)
+        if a.flatten and not np.isnan(flat_px):
+            pnl_s = 100 * sign * (flat_px - px) - fee_c          # every contract of the carried inventory exits at the flatten price (round trips already netted in q)
+        out.append(dict(ticker=tk, ts_ms=t, side=side, px=px, qty=qty, kind=kind, age_ms=age, pnl6=marks[0], pnl30=marks[1], pnl60=marks[2], pnl_settle=pnl_s))
     return out, q, presence_ms, actions
 
 
@@ -289,7 +304,7 @@ mk = list(inv.keys())
 def clus(v):
     v = np.asarray(v, float); v = v[np.isfinite(v)]
     return v.mean(), (v.mean() / (v.std(ddof=1) / np.sqrt(len(v))) if len(v) > 3 and v.std() > 0 else 0.0), len(v)
-per_mkt = F.groupby("ticker").agg(n=("qty", "size"), qty=("qty", "sum"), pnl6=("pnl6", "mean"), pnl30=("pnl30", "mean"), pnl_settle_tot=("pnl_settle", lambda x: (x * F.loc[x.index, "qty"]).sum())) if len(F) else pd.DataFrame()
+per_mkt = F.groupby("ticker").agg(n=("qty", "size"), qty=("qty", "sum"), pnl6=("pnl6", "mean"), pnl30=("pnl30", "mean"), pnl_settle_tot=("pnl_settle", lambda x: (x * F.loc[x.index, "qty"]).sum())) if len(F) else pd.DataFrame(columns=["n", "qty", "pnl6", "pnl30", "pnl_settle_tot"])
 tot = per_mkt.reindex(mk).fillna({"n": 0, "qty": 0, "pnl_settle_tot": 0})
 pres_min = np.array([(pres[t][0] + pres[t][1]) / 60000.0 for t in mk])
 print("policy=%s queue=%s size=%g theta=%.2f Q=%g lat %s lone<%g sweep-guard %.2f imb-pull %.2f imb-post %.2f fresh %dms region=%s tte=%s | markets %d" % (

@@ -368,6 +368,52 @@ the maker build stops at Phase 1; the trade tape keeps accumulating for replicat
 - Live evaluation cadence: the Rust rule evaluates on perp ticks too (2.1x the simulated signal
   count); `eval_on_ref: false` reproduces the simulated semantics.
 
+## 5. Strategy landscape (2026-09-16): what has been tested, what the literature offers, what is left
+
+Literature scanned this round: Feil and Nendel, "Optimal Market Making in Prediction Markets" (arXiv 2607.17991, July
+2026): binary-settlement HJB with a terminal penalty gamma*q^2*p(1-p); optimal quotes skew against inventory, spreads
+narrow into resolution except near p = 0.5 where settlement risk peaks; the numerical gain is almost entirely risk
+reduction (terminal |q| 49 -> 15, VaR -87%) at unchanged expected P&L (12.39 vs 12.47) - i.e. active unwinding buys
+safety, not profit; no adverse-selection term in the model. Turbine, "5,000 strategy backtest on KXBTC15M" (30 days
+to 2026-04-29): 102 of 4,904 strategies profitable, all one family (fade a hard intra-window move, size 100), median
+strategy ROI -14.5%. "Market Informedness and Market-Maker Profitability" (arXiv 2606.05882): makers suffer most when
+the informed segment is small but reversal-prone. OddsShopper on the last minute: settlement = 60-sample CF index
+average, 45 samples locked before the final 15 s, index-reading programs dominate the final seconds. Plus the earlier
+set: Avellaneda-Stoikov, Glosten-Milgrom, Gould-Bonart, Lehalle-Mounjid, Moallemi-Yuan, queue-reactive.
+
+Families tested on our data (harness / queue simulator), all at real fees and measured latency:
+
+| family | best cell found | verdict |
+|---|---|---|
+| taker on the nowcast gap (0.2 s / 1 s / 3 s / 5 s targets; delta ladder; stability and open gates; tails; bands) | w5 r0.5 delta 0.5c +0.46c (t 0.4) on 09-05..12 | dead: market completes the tick within 1 s, fee+spread > move; every grid cell fails its fresh slice |
+| fade the nowcast at large gaps (reverse trades, both legs costed) | OOS bands -0.2..-4c | dead: both directions lose the round trip |
+| panic fade (model-free, the Turbine archetype), 79 days | every cell -2..-4c (t -3.6..-7.1) | dead: an April regime |
+| settlement fine-tuning of the nowcast | harmful OOS (+0.002 BCE, t 2.4) | closed |
+| maker at the touch: naive | -0.57c/fill, -56c/market (t -8) | dead |
+| maker: nowcast pull (theta 0.25c) | -0.13c/fill (t -1.6), -8.6c/market (t -1.6), 6 days | ~zero per fill, consistent loss to settlement |
+| maker: favourable-only | -0.32c/fill, +0.9c/market on 4 fills/market | too thin to matter |
+| maker: jump (post at the level that just cleared) | -0.06c/fill (t -0.7), -11c/market | best per fill, not per market |
+| maker: queue-imbalance pull / post gates, level freshness, step-back, faster re-join | all <= pull | none rescue the sweep fills |
+| maker: reaction speed (tape sweep guard, perp-tick pull, 0 ms bound) | sweep share unchanged | speed is not the lever |
+| maker: inventory caps Q = 1 / 2 | -5.3c / -7.3c per market (t -3.6 / -2.9) | smaller loss, more certain loss |
+| maker: taker flatten at tau < 45 s | -14.2c/market | worse than holding: the drift is done by then, the fee is extra |
+| maker: price regions (ATM only, wings only) | -3.5c / -8.5c per market | no region is positive |
+| maker: volatility regime gate (60 s mid range <= 4/6/10c) | 0.3-3.3 fills/market, per-market -0.3..-5.6c | trades away the volume, remainder not positive |
+
+What the six-day maker numbers say structurally: per-fill marks at 6-30 s are ~0 for the pull family, the loss appears
+by settlement (~-10c per market, t -1.6..-2.3) and is NOT recoverable by flattening at 45 s, so it is adverse
+selection realised over minutes (the maker ends up holding the side the informed flow left it with), consistent with
+the informedness paper. The Feil-Nendel prescription (unwind actively) reduces variance here, not the mean (Q = 1 is
+the practical version: -5.3c/market with t -3.6).
+
+Not testable with current data or infrastructure: (a) fills measured on a real micro-live order (the one unknown
+that could move every maker number; needs the order manager enabled and 0.01-contract quotes); (b) level-2 Kalshi
+depth (the recorder's raw book stream on the box, unexamined); (c) delta-hedging inventory on the perp (needs a
+Binance futures account; hedge cost ~0.5-1.3c per contract-equivalent vs a 0.5c capture, so unlikely to pay);
+(d) other series (KXETH15M, the 15-min leaders with Liquidity Incentive Programs) where a maker rebate would change
+the arithmetic - the poller can be pointed at them; (e) the endgame index-average trade, already found dominated by
+faster index readers in the earlier program.
+
 ## 4. References
 
 - Avellaneda & Stoikov (2008) reservation price / inventory skew; Glosten & Milgrom (1985) adverse
