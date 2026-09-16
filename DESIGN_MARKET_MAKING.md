@@ -308,6 +308,26 @@ The sweep share does not move at any threshold: the Kalshi sweeps that hit a res
 reaction (tape-speed sweep guard, perp-tick pull, 0 ms latency bound) never removes the sweep fills; only the
 nowcast flag (pull) and the jump change the per-fill number.
 
+Joining the queue early on the prediction (2026-09-16). Three legal forms in a one-tick book: (1) rest before the
+flow (priority accrues only while resting; the lever is the re-join hold after a flag clears); (2) STEP BACK instead
+of pulling: when a side is flagged against, rest it one tick behind the touch so it is already queued at the level
+the predicted move goes to (level-2 depth proxied by the touch size, conservative); (3) the jump (post at the level
+that just cleared, first in a fresh queue). Pull rule, measured latency, both days (reference pull: -0.28c / +0.11c):
+
+| variant | 09-10 P&L/fill @6 s (fills/mkt, actions/mkt) | 09-12 P&L/fill @6 s (fills/mkt) |
+|---|---|---|
+| re-join hold 0 ms | -0.46c t -2.6 (38, 504) | +0.07c (38) |
+| re-join hold 250 ms | -0.41c t -1.9 (27, 329) | +0.08c (30) |
+| step back at 0.25c | -0.55c t -3.2 (49, 557) | -0.20c t -1.4 (52) |
+| step back at 0.50c | -0.54c t -1.9 (19, 178) | -0.21c t -1.1 (24) |
+| step back 0.25c + jump 0.5 | -0.53c t -2.9 (51) | -0.24c t -2.0 (52) |
+
+Faster re-joins add fills and churn and lose more on the busy day (the 1 s hold stands). Stepping back is worse than
+pulling on BOTH days: the flagged sweeps travel more than one tick often enough that the order waiting at the next
+level is the next victim (sweep-type fills -1.3..-1.7c, 3x the fill count of the pull), and the queue-type fills at
+the new level (+0.3..+0.4c) do not cover it. The only early-queue form that pays is the jump, because it waits for
+the level to actually clear and lands at the front of a fresh queue rather than behind an existing level-2 queue.
+
 VERDICT (day 1): GATE 1 not met. Under realistic fills the touch maker on KXBTC15M loses ~1c per fill at 6 s in
 every configuration; the nowcast pull only cuts the fill count and brings the per-market total to ~0 (-3c, t -0.2).
 The +0.25c/fill of §2b was the flow-sampling proxy counting fills the queue never delivers. What would have to be

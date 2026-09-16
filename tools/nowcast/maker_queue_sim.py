@@ -39,6 +39,7 @@ ap.add_argument("--jump-hold", type=int, default=500, help="ms the jump target s
 ap.add_argument("--perp-pull", type=float, default=0.0, help="perp-tick pull: cancel a side when the binance perp moved >= this many bps against it within --perp-win ms (lake prints, tick cadence); 0 = off")
 ap.add_argument("--perp-win", type=int, default=300); ap.add_argument("--perp-delay", type=int, default=40, help="ms from perp exchange time to the box")
 ap.add_argument("--perp-rejoin", type=int, default=1500, help="ms after a perp pull before the side may re-post")
+ap.add_argument("--stepback", type=float, default=0.0, help="instead of pulling a side flagged against by more than this (cents), rest it ONE TICK behind the touch (early queue at the level the move goes to); 0 = off")
 a = ap.parse_args()
 TTE_LO, TTE_HI = (float(x) for x in a.tte.split(","))
 EPSP = 5e-5
@@ -122,7 +123,9 @@ def sim_market(tk, B, P, Dk):
                     # queue ahead = displayed size at that price at posting time (row at/before eff)
                     k = np.searchsorted(ts, eff, side="right") - 1
                     k = max(k, 0)
-                    lvl = (ybs[k] if side == BID else yas[k]) if abs((yb[k] if side == BID else ya[k]) - px) < EPSP else 0.0   # at a jump level nobody displays yet -> first in line
+                    at_touch_ = abs((yb[k] if side == BID else ya[k]) - px) < EPSP
+                    behind_ = (side == BID and px < yb[k] - EPSP) or (side == ASK and px > ya[k] + EPSP)
+                    lvl = (ybs[k] if side == BID else yas[k]) if (at_touch_ or behind_) else 0.0   # behind the touch: level-2 depth ~ touch size (proxy); a jump level nobody displays yet -> first in line
                     s_["ahead"] = lvl if a.queue == "back" else 0.5 * lvl
                     actions += 1
                 elif act == "cancel" and s_["on"]:
@@ -224,11 +227,19 @@ def sim_market(tk, B, P, Dk):
                 if (side == BID and cand < ya[i] - EPSP and cand > yb[i] - EPSP) or (side == ASK and cand > yb[i] + EPSP and cand < ya[i] + EPSP):
                     jp = cand
             target_px = jp if not np.isnan(jp) else touch
+            # step-back: flagged against beyond the step-back threshold -> rest one tick behind the touch instead of pulling
+            stepped = False
+            if a.stepback > 0 and eligible and not closing and not np.isnan(gs) and gs < -a.stepback and not (adds and abs(q) >= a.q):
+                tick = 0.01 if 0.10 <= mid[i] <= 0.90 else 0.001
+                target_px = touch - tick if side == BID else touch + tick
+                want = True; stepped = True
             has_pending = bool(s_["pend"])
             if s_["on"] and not has_pending:
                 reason = None
                 if not want:
                     reason = "flag" if (eligible and not closing) else "window"
+                elif stepped and abs(target_px - s_["price"]) >= EPSP:
+                    reason = "move"                                          # step back (or return to the touch when the flag clears)
                 elif abs(target_px - s_["price"]) >= EPSP and (np.isnan(jp) or target_px > s_["price"] + EPSP if side == BID else True) and (np.isnan(jp) or target_px < s_["price"] - EPSP if side == ASK else True):
                     reason = "move"                                          # R5: touch moved (or a jump level opened ahead of us): re-post at target
                 elif lvl < a.lone and np.isnan(jp) and not s_["jumped"]:
