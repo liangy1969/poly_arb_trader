@@ -328,7 +328,27 @@ level is the next victim (sweep-type fills -1.3..-1.7c, 3x the fill count of the
 the new level (+0.3..+0.4c) do not cover it. The only early-queue form that pays is the jump, because it waits for
 the level to actually clear and lands at the front of a fresh queue rather than behind an existing level-2 queue.
 
-VERDICT (day 1): GATE 1 not met. Under realistic fills the touch maker on KXBTC15M loses ~1c per fill at 6 s in
+SIX-DAY RESULT (2026-09-16; tape days 09-10..15, 545 markets, `tools/nowcast/run_days.sh` + `maker_days.py`; queue
+fills, measured latency, lone rule off; market-clustered t over all day x market cells; per-market settlement P&L
+counts zero-fill markets as 0):
+
+| variant | P&L/fill @6 s | @30 s | settle per contract | per-MARKET settlement P&L | fills/mkt | sweep share |
+|---|---|---|---|---|---|---|
+| naive | -0.57c (t -14.1) | -0.74c | -1.31c (t -8.9) | -55.7c (t -8.4) | 157 | 35% |
+| pull (theta 0.25c) | -0.13c (t -1.6) | -0.04c | -0.80c (t -1.6) | -8.6c (t -1.6) | 16 | 37% |
+| pull + jump 0.5 | -0.06c (t -0.7) | 0.00c | -0.74c (t -1.5) | -11.0c (t -1.9) | 16 | 37% |
+| pull + imbalance pull 0.30 | -0.13c (t -1.3) | -0.17c | -1.59c (t -2.5) | -11.5c (t -2.3) | 10 | 42% |
+| pull + jump + imbalance | -0.11c (t -1.2) | -0.28c | -1.88c (t -2.8) | -9.8c (t -1.8) | 10 | 41% |
+| favourable-only | -0.32c (t -1.7) | -0.43c | -1.30c | +0.9c (t +0.2) | 4 | 52% |
+
+Per day, pull P&L/fill @6 s: 09-10 -0.31c, 09-11 -0.05c, 09-12 +0.12c, 09-13 +0.16c, 09-14 -0.26c, 09-15 -0.62c;
+pull + jump: -0.09 / +0.06 / +0.03 / +0.11 / -0.15 / -0.39c. Excluding the 09-11 lake-gap day changes nothing
+(pull -0.15c / -12.2c per market, t -2.0). Reading: with six days the pull family is a small, consistent loss per
+fill (2 of 6 days positive) and a consistent ~10c loss per market to settlement (t -1.6..-2.3), i.e. the inventory
+carried to expiry costs more than the marks suggest; the jump halves the per-fill loss but not the per-market one;
+the imbalance pull lowers fills and raises the sweep share; favourable-only trades too little to matter.
+
+VERDICT (day 1, confirmed on six days above): GATE 1 not met. Under realistic fills the touch maker on KXBTC15M loses ~1c per fill at 6 s in
 every configuration; the nowcast pull only cuts the fill count and brings the per-market total to ~0 (-3c, t -0.2).
 The +0.25c/fill of §2b was the flow-sampling proxy counting fills the queue never delivers. What would have to be
 true for Phase 2 to proceed: a fill model calibrated on REAL micro-live fills that shows sweep fills below ~40% of

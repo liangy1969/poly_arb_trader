@@ -39,6 +39,7 @@ ap.add_argument("--jump-hold", type=int, default=500, help="ms the jump target s
 ap.add_argument("--perp-pull", type=float, default=0.0, help="perp-tick pull: cancel a side when the binance perp moved >= this many bps against it within --perp-win ms (lake prints, tick cadence); 0 = off")
 ap.add_argument("--perp-win", type=int, default=300); ap.add_argument("--perp-delay", type=int, default=40, help="ms from perp exchange time to the box")
 ap.add_argument("--perp-rejoin", type=int, default=1500, help="ms after a perp pull before the side may re-post")
+ap.add_argument("--tag", default="", help="write data/nowcast/qsim_<day>_<tag>.parquet (fills) and _mkts.parquet (per-market incl. zero-fill) for maker_days.py")
 ap.add_argument("--stepback", type=float, default=0.0, help="instead of pulling a side flagged against by more than this (cents), rest it ONE TICK behind the touch (early queue at the level the move goes to); 0 = off")
 a = ap.parse_args()
 TTE_LO, TTE_HI = (float(x) for x in a.tte.split(","))
@@ -311,3 +312,7 @@ if len(F):
             print("  age %5.0f-%5.0fs %5.1f%% | P&L @6s %+6.2fc @30s %+6.2fc" % (lo / 1000, min(hi, 1e6) / 1000, 100 * len(h) / len(F), h.pnl6.mean(), h.pnl30.mean()))
 if not a.quiet and len(F):
     F.to_parquet(f"data/nowcast/qsim_{a.day}_{a.policy}_{a.queue}.parquet")
+if a.tag:
+    os.makedirs("data/nowcast", exist_ok=True)
+    (F if len(F) else pd.DataFrame(columns=["ticker", "ts_ms", "side", "px", "qty", "kind", "age_ms", "pnl6", "pnl30", "pnl60", "pnl_settle"])).to_parquet(f"data/nowcast/qsim_{a.day}_{a.tag}.parquet")
+    pd.DataFrame({"ticker": mk, "n": tot["n"].to_numpy(), "qty": tot["qty"].to_numpy(), "pnl_settle_tot": tot["pnl_settle_tot"].to_numpy(), "inv": [inv[t] for t in mk]}).to_parquet(f"data/nowcast/qsim_{a.day}_{a.tag}_mkts.parquet")
