@@ -39,6 +39,7 @@ Model spec:  label=path[:px=cb|perp]
   sampler's own columns (imb1 from perp sizes; basis/dbasis/mom from the price
   series) so the join is causally exact -- no cross-collector recv-time join.
 """
+import copy as _copy
 import argparse
 import csv
 import json
@@ -95,10 +96,29 @@ def cell(rows):
 
 
 # ── model / feature prep ─────────────────────────────────────────────────────
+# dynamic-fit-window defaults (the `:dyn` model suffix). At every refit
+# boundary: (1) drop ticks whose Kalshi mid is saturated (outside [lo, hi] —
+# those rows sit in the flat tail of the surface and identify neither the
+# money line nor the width); (2) grow the lookback from the base fit_window in
+# `step`-second increments until the surviving mids span at least `minrange`,
+# capped at `maxw`. If fewer than 30 identified ticks exist even at the cap
+# (an event saturated throughout), fall back to the plain fixed window —
+# i.e. exactly the deployed behavior on those events.
+DYN_DEFAULTS = {"lo": 0.10, "hi": 0.90, "minrange": 0.10, "step": 60.0, "maxw": 600.0}
+
+
 def parse_model(spec):
     if "=" not in spec:
         sys.exit(f"--model needs label=path (got {spec!r})")
     label, rest = spec.split("=", 1)
+    dynfit = None
+    if ":dyn" in rest:
+        rest = rest.replace(":dyn", "")
+        dynfit = dict(DYN_DEFAULTS)
+        # experiment override, e.g. AO_DYN_MINRANGE=0.20 (fraction of 1.00)
+        v = os.environ.get("AO_DYN_MINRANGE")
+        if v:
+            dynfit["minrange"] = float(v)
     parts = rest.split(":px=")
     path = parts[0]
     js = json.load(open(path))
@@ -126,6 +146,12 @@ def parse_model(spec):
             # anchored at the raw strike (fit + inference must both honor it)
             "calib": js.get("calib"), "prior": prior,
             "causal_off": js.get("offset") == "causal",
+            # fitmode="dronly": db is NOT a parameter — b = K (the channels are
+            # pre-anchored to the settlement index); the online fit is dr only.
+            "dronly": js.get("fitmode") == "dronly",
+            "anchor": js.get("anchor"),
+            "fit_window_js": js.get("fit_window"),
+            "dynfit": dynfit,
             # venue3 selects the series behind the THIRD price channel. The
             # channel itself is the existing kraken one; "okx" only repoints
             # it at okmid and gives it its own causal offset, so the 3-price
@@ -258,11 +284,47 @@ def prepare(ev, m):
                 # it removes the peg exactly as the perp offset removes basis.
                 go = d["okmid"] - d["cbmid"]
                 d["okmid"] = d["okmid"] - np.cumsum(go) / np.arange(1, len(go) + 1)
+        if m.get("anchor") == "brti_span" and ok.sum() > 0:
+            # db-free family: shift EVERY price channel by its whole-event
+            # SPAN mean basis to the settlement index (BRTI), so b = K with
+            # no fitted level. (Deployment form = causal expanding mean;
+            # span is the evaluation convention chosen for this family.)
+            bt, bp = _brti_series()
+            g_ts = d["ts"].astype(np.int64)
+            ix = np.searchsorted(bt, g_ts, side="right") - 1
+            okb = ix >= 0
+            st_ms = np.where(okb, g_ts - bt[np.clip(ix, 0, len(bt) - 1)], 10**9)
+            bx = np.where(okb & (st_ms <= 2000),
+                          bp[np.clip(ix, 0, len(bt) - 1)], np.nan)
+            fin = np.isfinite(bx)
+            if fin.mean() < 0.5:
+                continue            # no settlement-index coverage -> drop event
+            d["spot"] = d["spot"] - float(np.mean(d["spot"][fin] - bx[fin]))
+            d["cbmid"] = d["cbmid"] - float(np.mean(d["cbmid"][fin] - bx[fin]))
         if ok.sum() > 0:            # skip events with 0 usable rows — old-schema
             out[t] = d              # days (pre-Jul-8) lack cb/sizes -> features NaN
     print(f"  [{m['label']}] px={m['px']} extras={extras or '-'}: "
           f"kept {kept:,} rows, dropped {dropped:,}")
     return out
+
+
+_BRTI_CACHE = None
+
+
+def _brti_series():
+    """All data/brti/*.npz concatenated, sorted, cached (t ms asc, px)."""
+    global _BRTI_CACHE
+    if _BRTI_CACHE is None:
+        import glob as _g
+        ts_l, px_l = [], []
+        for f in sorted(_g.glob("data/brti/*.npz")):
+            z = np.load(f)
+            ts_l.append(z["t"]); px_l.append(z["px"].astype(np.float64))
+        t = np.concatenate(ts_l); p = np.concatenate(px_l)
+        o = np.argsort(t, kind="stable")
+        _BRTI_CACHE = (t[o], p[o])
+        print(f"  [brti] settlement index: {len(t):,} pts loaded")
+    return _BRTI_CACHE
 
 
 def load_live_calib(path):
@@ -284,6 +346,34 @@ def load_live_calib(path):
     for k in out:
         out[k].sort(key=lambda x: -x[0])
     return out
+
+
+def _fit_shared_dr(fwd, sp, tt, md, ks, ei, n_ev, rho, b_scale, cbm, cb, X,
+                   steps, init, prior):
+    """Stage-1 of the shared-dr protocol: ONE dr across the pooled events,
+    an independent db per event (level nuisances — they absorb cross-event
+    basis/regime differences so they cannot contaminate the width; callers
+    discard them). Returns (db_list, dr)."""
+    db = torch.tensor(list(init[0]) if init else [0.0] * n_ev, requires_grad=True)
+    dr = torch.tensor([init[1] if init else 0.0], requires_grad=True)
+    opt = torch.optim.Adam([db, dr], lr=sim.FIT_LR)
+    sp_t = torch.tensor(sp, dtype=torch.float32)
+    tt_t = torch.tensor(tt, dtype=torch.float32)
+    ks_t = torch.tensor(ks, dtype=torch.float32)
+    ei_t = torch.tensor(ei, dtype=torch.long)
+    X_t = torch.tensor(X, dtype=torch.float32)
+    cb_t = torch.tensor(cb, dtype=torch.float32) if cb is not None else None
+    y = torch.tensor(np.clip(md, sim.P_CLIP, 1 - sim.P_CLIP), dtype=torch.float32)
+    for _ in range(steps):
+        opt.zero_grad()
+        lo = sim.logit_of(fwd, sp_t, tt_t, ks_t + b_scale * db[ei_t],
+                          torch.exp(rho + dr), X_t, cb_t, cbm)
+        loss = torch.nn.functional.binary_cross_entropy_with_logits(lo, y)
+        if prior is not None:
+            loss = loss + prior[3] * (((db - prior[0]) / prior[2]) ** 2).sum()
+        loss.backward()
+        opt.step()
+    return db.detach().tolist(), float(dr)
 
 
 def fair_series(d, m, strike, rho, b_scale, fwd, tte_max, fit_window, refit_step=60, demean_window=0.0, latency_ms=0.0, live_cal=None, fit_stride=None, precomputed=None):
@@ -327,6 +417,7 @@ def fair_series(d, m, strike, rho, b_scale, fwd, tte_max, fit_window, refit_step
     else:
         boundaries = range(int(tte_max), 0, -int(refit_step))
     init = None
+    sh_state = None      # shared-dr protocol: (db_list, dr) warm start
     for B in boundaries:
         if live_cal is not None:
             # consistency mode: take the LIVE calibrator's logged fit at this
@@ -345,18 +436,322 @@ def fair_series(d, m, strike, rho, b_scale, fwd, tte_max, fit_window, refit_step
             fitm = d["tte"] > B
             if fit_window > 0:
                 fitm &= d["tte"] <= B + fit_window
-            if fitm[fit_sl].sum() < (30 if fit_window > 0 else 60):
+            sel = None
+            fb = m.get("fixdb")
+            if fb is not None and "bd_tte" in d and krm is None:
+                # DERIVED-db protocol: db comes from the measured basis to the
+                # settlement index (BRTI) plus a fixed tilt constant — no
+                # per-event fitting of the level. dr is either fit 1-param
+                # (db frozen) or held at the prior centre ("nofit" -> the
+                # calibration involves ZERO per-event optimization).
+                ft = d["bd_tte"]
+                j = int(np.searchsorted(ft, B, side="left"))
+                if j < len(ft):
+                    db_v = float(d["bd_db"][j])
+                    if fb.get("nofit"):
+                        pr = m.get("prior")
+                        dr_v = float(pr[1]) if pr else 0.0
+                    else:
+                        sel2 = np.where(fitm)[0][fit_sl]
+                        if len(sel2) < 30:
+                            continue
+                        mid2 = ((d["ybid"] + d["yask"]) / 2.0)[sel2]
+                        dr0 = (init[1] if init
+                               else (m["prior"][1] if m.get("prior") else 0.0))
+                        _db, _dr = sim.fit_event(
+                            fwd, d["spot"][sel2], d["tte"][sel2], mid2, strike,
+                            rho, b_scale,
+                            steps=sim.FIT_STEPS if init is None else 60,
+                            init=(db_v, dr0),
+                            extra=d["X"][sel2],
+                            cb=d["cbmid"][sel2] if cbm is not None else None,
+                            cb_mult=cbm, prior=m.get("prior"), fix_db=db_v)
+                        dr_v = float(_dr)
+                    db, dr = torch.tensor([db_v]), torch.tensor([dr_v])
+                    init = (db_v, dr_v)
+                    seg = (tte_p <= B) & (tte_p > B - int(refit_step))
+                    if seg.any():
+                        with torch.no_grad():
+                            lo = sim.logit_of(
+                                fwd,
+                                torch.tensor(spot_p[seg], dtype=torch.float32),
+                                torch.tensor(tte_p[seg], dtype=torch.float32),
+                                strike + b_scale * db, torch.exp(rho + dr),
+                                torch.tensor(x_p[seg], dtype=torch.float32),
+                                torch.tensor(cb_p[seg], dtype=torch.float32) if cbm is not None else None,
+                                cbm, None, None, b2=None)
+                        fair[seg] = torch.sigmoid(lo).numpy()
+                        dbs[seg] = db_v
+                        drs[seg] = dr_v
+                    continue
+            fx = m.get("fixdr")
+            if fx is not None and "fd_tte" in d and krm is None:
+                # EXTERNAL-dr protocol: dr comes from a per-tick prediction
+                # series (fd_tte ascending, fd_dr); at boundary B use the most
+                # recent prediction (smallest tick tte >= B). db is still fit
+                # causally on the deployed trailing window with dr FROZEN.
+                # Boundaries before the first prediction fall through to the
+                # plain joint fit (live behavior).
+                ft = d["fd_tte"]
+                j = int(np.searchsorted(ft, B, side="left"))
+                if j < len(ft):
+                    dr_sh = float(d["fd_dr"][j])
+                    sel2 = np.where(fitm)[0][fit_sl]
+                    if len(sel2) < 30:
+                        continue
+                    mid2 = ((d["ybid"] + d["yask"]) / 2.0)[sel2]
+                    db0 = (init[0] if init
+                           else (m["prior"][0] if m.get("prior") else 0.0))
+                    db, dr = sim.fit_event(
+                        fwd, d["spot"][sel2], d["tte"][sel2], mid2, strike,
+                        rho, b_scale,
+                        steps=sim.FIT_STEPS if init is None else 60,
+                        init=(db0, dr_sh),
+                        extra=d["X"][sel2],
+                        cb=d["cbmid"][sel2] if cbm is not None else None,
+                        cb_mult=cbm, prior=m.get("prior"), fix_dr=dr_sh)
+                    init = (float(db), float(dr))
+                    seg = (tte_p <= B) & (tte_p > B - int(refit_step))
+                    if seg.any():
+                        with torch.no_grad():
+                            lo = sim.logit_of(
+                                fwd,
+                                torch.tensor(spot_p[seg], dtype=torch.float32),
+                                torch.tensor(tte_p[seg], dtype=torch.float32),
+                                strike + b_scale * db, torch.exp(rho + dr),
+                                torch.tensor(x_p[seg], dtype=torch.float32),
+                                torch.tensor(cb_p[seg], dtype=torch.float32) if cbm is not None else None,
+                                cbm, None, None, b2=None)
+                        fair[seg] = torch.sigmoid(lo).numpy()
+                        dbs[seg] = float(db)
+                        drs[seg] = float(dr)
+                    continue
+            sh = m.get("shdr")
+            if sh is not None and "hist_spot" in d and krm is None:
+                # SHARED-dr TWO-STAGE protocol.
+                # Stage 1: fit ONE dr on pooled rows — previous event's
+                # [60,300] slice + this event's expanding trading-window rows
+                # — with an INDEPENDENT db per event (nuisances, discarded).
+                # Stage 2: freeze that dr; fit db alone on the deployed
+                # trailing window. Level stays local-adaptive; width comes
+                # from data that actually identifies it.
+                cur = np.where((d["tte"] > max(B, 60.0)) & (d["tte"] <= 300.0))[0][fit_sl]
+                n_h = len(d["hist_spot"])
+                dr_sh = None
+                if n_h + len(cur) >= 30:
+                    mid_cur = ((d["ybid"] + d["yask"]) / 2.0)[cur]
+                    sp_f = np.concatenate([d["hist_spot"], d["spot"][cur]])
+                    tt_f = np.concatenate([d["hist_tte"], d["tte"][cur]])
+                    md_f = np.concatenate([d["hist_mid"], mid_cur])
+                    X_f = np.concatenate([d["hist_X"], d["X"][cur]], axis=0)
+                    cb_f = (np.concatenate([d["hist_cb"], d["cbmid"][cur]])
+                            if cbm is not None else None)
+                    ks_f = np.concatenate([d["hist_strike"], np.full(len(cur), strike)])
+                    # per-row event index: history may span SEVERAL events
+                    # (hist_eidx, 0..n_he-1); the current event gets the next
+                    # index. One nuisance db per event, one shared dr.
+                    ei_h = d.get("hist_eidx")
+                    if ei_h is None:
+                        ei_h = np.zeros(n_h, dtype=np.int64)
+                    n_he = (int(ei_h.max()) + 1) if n_h else 0
+                    ei_f = np.concatenate([ei_h, np.full(len(cur), n_he)])
+                    n_ev = n_he + (1 if len(cur) else 0)
+                    if sh_state is not None and len(sh_state[0]) != n_ev:
+                        sh_state = None
+                    db_l, dr_sh = _fit_shared_dr(
+                        fwd, sp_f, tt_f, md_f, ks_f, ei_f, n_ev, rho, b_scale,
+                        cbm, cb_f, X_f,
+                        steps=sim.FIT_STEPS if sh_state is None else 60,
+                        init=sh_state, prior=m.get("prior"))
+                    sh_state = (db_l, dr_sh)
+                if dr_sh is not None:
+                    # Stage 2: deployed trailing window, db only.
+                    sel2 = np.where(fitm)[0][fit_sl]
+                    if len(sel2) < 30:
+                        continue
+                    mid2 = ((d["ybid"] + d["yask"]) / 2.0)[sel2]
+                    db0 = (init[0] if init
+                           else (m["prior"][0] if m.get("prior") else 0.0))
+                    db, dr = sim.fit_event(
+                        fwd, d["spot"][sel2], d["tte"][sel2], mid2, strike,
+                        rho, b_scale,
+                        steps=sim.FIT_STEPS if init is None else 60,
+                        init=(db0, dr_sh),
+                        extra=d["X"][sel2],
+                        cb=d["cbmid"][sel2] if cbm is not None else None,
+                        cb_mult=cbm, prior=m.get("prior"), fix_dr=dr_sh)
+                    init = (float(db), float(dr))
+                    seg = (tte_p <= B) & (tte_p > B - int(refit_step))
+                    if seg.any():
+                        with torch.no_grad():
+                            lo = sim.logit_of(
+                                fwd,
+                                torch.tensor(spot_p[seg], dtype=torch.float32),
+                                torch.tensor(tte_p[seg], dtype=torch.float32),
+                                strike + b_scale * db, torch.exp(rho + dr),
+                                torch.tensor(x_p[seg], dtype=torch.float32),
+                                torch.tensor(cb_p[seg], dtype=torch.float32) if cbm is not None else None,
+                                cbm, None, None, b2=None)
+                        fair[seg] = torch.sigmoid(lo).numpy()
+                        dbs[seg] = float(db)
+                        drs[seg] = float(dr)
+                    continue
+                # stage 1 impossible (no data yet) -> plain joint fit below.
+            dp = m.get("dynpool")
+            if dp is not None and "hist_spot" in d and krm is None:
+                # DYNAMIC + POOLED: trailing base window first; when the
+                # saturation-filtered mids do not span `minrange` (p5-p95),
+                # extend the lookback in `step`-row (~1s each) chunks — first
+                # through the current event's earlier trading-window rows
+                # (tte<=300), then ACROSS the event boundary into the previous
+                # event's [60,300] slice, most recent rows first (hist_* must
+                # be recency-ordered). History enters the fit only when — and
+                # only as far as — the current data is unidentified, which is
+                # what plain pool1 got wrong (history always present swamped
+                # the level exactly when it had to track).
+                mid_all = (d["ybid"] + d["yask"]) / 2.0
+                cm = (d["tte"] > B) & (d["tte"] <= 300.0)
+                cur = np.where(cm)[0][fit_sl]
+                cur = cur[np.argsort(d["tte"][cur])]          # recent -> old
+                sp_c = np.concatenate([d["spot"][cur], d["hist_spot"]])
+                tt_c = np.concatenate([d["tte"][cur], d["hist_tte"]])
+                md_c = np.concatenate([mid_all[cur], d["hist_mid"]])
+                X_c = np.concatenate([d["X"][cur], d["hist_X"]], axis=0)
+                cb_c = (np.concatenate([d["cbmid"][cur], d["hist_cb"]])
+                        if cbm is not None else None)
+                ks_c = np.concatenate([np.full(len(cur), strike), d["hist_strike"]])
+                idok = (md_c >= dp["lo"]) & (md_c <= dp["hi"])
+                k = int(np.searchsorted(tt_c[:len(cur)], B + max(fit_window, 1.0),
+                                        side="right"))
+                kmax = min(len(tt_c), int(dp["maxw"]))
+                kk = np.zeros(0, dtype=np.int64)
+                while True:
+                    kk = np.where(idok[:max(k, 1)])[0]
+                    if len(kk) >= 30:
+                        q = np.percentile(md_c[kk], [5.0, 95.0])
+                        if q[1] - q[0] >= dp["minrange"] or k >= kmax:
+                            break
+                    elif k >= kmax:
+                        break
+                    k = min(kmax, k + int(dp["step"]))
+                if len(kk) >= 30:
+                    fit_out = sim.fit_event(
+                        fwd, sp_c[kk], tt_c[kk], md_c[kk], ks_c[kk], rho, b_scale,
+                        steps=sim.FIT_STEPS if init is None else 60, init=init,
+                        extra=X_c[kk],
+                        cb=cb_c[kk] if cbm is not None else None, cb_mult=cbm,
+                        prior=m.get("prior"))
+                    db, dr = fit_out
+                    init = (float(db), float(dr))
+                    seg = (tte_p <= B) & (tte_p > B - int(refit_step))
+                    if seg.any():
+                        with torch.no_grad():
+                            lo = sim.logit_of(
+                                fwd,
+                                torch.tensor(spot_p[seg], dtype=torch.float32),
+                                torch.tensor(tte_p[seg], dtype=torch.float32),
+                                strike + b_scale * db, torch.exp(rho + dr),
+                                torch.tensor(x_p[seg], dtype=torch.float32),
+                                torch.tensor(cb_p[seg], dtype=torch.float32) if cbm is not None else None,
+                                cbm, None, None, b2=None)
+                        fair[seg] = torch.sigmoid(lo).numpy()
+                        dbs[seg] = float(db)
+                        drs[seg] = float(dr)
+                    continue
+                # <30 identified ticks anywhere -> plain fixed window below.
+            pool = m.get("poolfit")
+            if pool is not None and "hist_spot" in d and krm is None:
+                # POOLED cross-event fit: only trading-window rows (tte in
+                # [60, 300]) of the current event seen so far, PLUS the
+                # [60, 300] slices of the previous event(s). Strike-relative:
+                # (db, dr) are shared, every row keeps its OWN strike in
+                # b = K + 50*db (fit_event accepts a per-row strike array).
+                # fit_window is ignored in this mode.
+                cur = np.where((d["tte"] > max(B, 60.0)) & (d["tte"] <= 300.0))[0][fit_sl]
+                if len(d["hist_spot"]) + len(cur) < 30:
+                    continue
+                mid_cur = ((d["ybid"] + d["yask"]) / 2.0)[cur]
+                sp_f = np.concatenate([d["hist_spot"], d["spot"][cur]])
+                tt_f = np.concatenate([d["hist_tte"], d["tte"][cur]])
+                md_f = np.concatenate([d["hist_mid"], mid_cur])
+                X_f = np.concatenate([d["hist_X"], d["X"][cur]], axis=0)
+                cb_f = (np.concatenate([d["hist_cb"], d["cbmid"][cur]])
+                        if cbm is not None else None)
+                ks_f = np.concatenate([d["hist_strike"], np.full(len(cur), strike)])
+                fit_out = sim.fit_event(
+                    fwd, sp_f, tt_f, md_f, ks_f, rho, b_scale,
+                    steps=sim.FIT_STEPS if init is None else 60, init=init,
+                    extra=X_f, cb=cb_f, cb_mult=cbm,
+                    cb_anchor=strike if calib == "dbp" else None,
+                    fit_cb=(calib == "2db"), prior=m.get("prior"))
+                db, dr = fit_out
+                init = (float(db), float(dr))
+                b2_cur = strike if calib == "dbp" else None
+                seg = (tte_p <= B) & (tte_p > B - int(refit_step))
+                if seg.any():
+                    with torch.no_grad():
+                        lo = sim.logit_of(
+                            fwd,
+                            torch.tensor(spot_p[seg], dtype=torch.float32),
+                            torch.tensor(tte_p[seg], dtype=torch.float32),
+                            strike + b_scale * db, torch.exp(rho + dr),
+                            torch.tensor(x_p[seg], dtype=torch.float32),
+                            torch.tensor(cb_p[seg], dtype=torch.float32) if cbm is not None else None,
+                            cbm, None, None, b2=b2_cur)
+                    fair[seg] = torch.sigmoid(lo).numpy()
+                    dbs[seg] = float(db)
+                    drs[seg] = float(dr)
                 continue
-            mid_f = ((d["ybid"] + d["yask"]) / 2.0)[fitm][fit_sl]
+            dyn = m.get("dynfit")
+            if dyn is not None:
+                # dynamic window: drop saturated-mid ticks, then grow the
+                # lookback until the surviving mids span enough range to
+                # identify the (db, dr) ridge (a level-only window lets the
+                # db prior anchor b and the fit narrow dr to compensate —
+                # the steep-operating-point failure).
+                mid_all = (d["ybid"] + d["yask"]) / 2.0
+                idok = (mid_all >= dyn["lo"]) & (mid_all <= dyn["hi"])
+                hi = B + max(fit_window, 1.0)
+                hi_cap = B + dyn["maxw"]
+                cand = np.zeros(0, dtype=np.int64)
+                while True:
+                    wm = (d["tte"] > B) & (d["tte"] <= hi) & idok
+                    cand = np.where(wm)[0][fit_sl]
+                    if len(cand) >= 30:
+                        # p5-p95 span, not min-max: a 2-second spike can put
+                        # 10c+ between min and max while the mid never DWELLS
+                        # away from one level — that identifies nothing. The
+                        # percentile span requires time spent at different
+                        # levels before the window counts as informative.
+                        q = np.percentile(mid_all[cand], [5.0, 95.0])
+                        if q[1] - q[0] >= dyn["minrange"] or hi >= hi_cap:
+                            break
+                    elif hi >= hi_cap:
+                        break
+                    hi += dyn["step"]
+                if len(cand) >= 30:
+                    sel = cand
+                # else: saturated throughout -> plain fixed window below.
+            if sel is None:
+                if fitm[fit_sl].sum() < (30 if fit_window > 0 else 60):
+                    continue
+                sel = np.where(fitm)[0][fit_sl]
+            mid_f = ((d["ybid"] + d["yask"]) / 2.0)[sel]
             fit_out = sim.fit_event(
-                fwd, d["spot"][fitm][fit_sl], d["tte"][fitm][fit_sl], mid_f, strike,
-                rho, b_scale, steps=sim.FIT_STEPS if init is None else 60, init=init,
-                extra=d["X"][fitm][fit_sl],
-                cb=d["cbmid"][fitm][fit_sl] if cbm is not None else None, cb_mult=cbm,
-                kr=kr_src[fitm][fit_sl] if krm is not None else None, kr_mult=krm,
+                fwd, d["spot"][sel], d["tte"][sel], mid_f, strike,
+                rho, b_scale,
+                steps=((m["fit_steps"][0] if init is None else m["fit_steps"][1])
+                       if m.get("fit_steps") else
+                       (sim.FIT_STEPS if init is None else 60)),
+                init=init,
+                extra=d["X"][sel],
+                cb=d["cbmid"][sel] if cbm is not None else None, cb_mult=cbm,
+                kr=kr_src[sel] if krm is not None else None, kr_mult=krm,
                 cb_anchor=strike if calib == "dbp" else None,
                 fit_cb=(calib == "2db"),
                 prior=m.get("prior"),
+                fix_db=0.0 if m.get("dronly") else None,
+                dr_prior=m.get("dr_prior"),
             )
             if calib == "2db":
                 db, dr, dbc = fit_out
@@ -534,8 +929,94 @@ def event_calib_report(a, models):
                       f"{bias[sel].mean() * 100:>+7.2f}c")
 
 
+def _gate_precompute(wins, tte_p, mid_p, dbs_p, drs_p, dbcs_p, spot_p, x_p,
+                     cb_p, kr_p, fwd, strike, rho_f, b_scale, cbm, krm, calib_m,
+                     fair_p=None):
+    """Vectorized per-window gate inputs, replacing the per-crossing scalar
+    walk + fx_fair torch calls that made grid runs take ~18h/model:
+      j[k]      youngest row with tte_j - tte_k >= w
+      valid[k]  window inside [w, w+9] (the old <=400/800-row walk caps only
+                bind above 20s of rows -- impossible for w<=14s on this grid)
+      mrange[k] max-min of mid over [j[k], k]   (monotone-deque sweep, O(n))
+      fthen[k]  net at row j[k] under row k's calibration -- BATCHED once per
+                refit segment (calibration is piecewise-constant), identical
+                to fx_fair(j, k) row by row.
+    """
+    import collections as _cl
+    n = len(tte_p)
+    chg = np.zeros(n, dtype=bool)
+    if n > 1:
+        with np.errstate(invalid="ignore"):
+            chg[1:] = (np.diff(dbs_p) != 0) | (np.diff(drs_p) != 0)
+    segid = np.cumsum(chg)
+    out = {}
+    karr = np.arange(n)
+    for w in sorted(set(float(x) for x in wins)):
+        idx = np.searchsorted(-tte_p, -(tte_p + w), side="right") - 1
+        j = np.clip(idx, 0, max(n - 1, 0))
+        # realign to the WALK's exact float predicate (gap = tte[j]-tte[k]
+        # >= w): "tte[j] >= tte[k]+w" and "tte[j]-tte[k] >= w" can disagree
+        # at knife-edge rows (FP non-associativity), and the scalar walk uses
+        # the latter. Bounded local shifts; no-ops except at those rows.
+        for _ in range(2):
+            up = (j + 1 < karr) & ((tte_p[np.minimum(j + 1, n - 1)] - tte_p) >= w)
+            j = np.where(up, j + 1, j)
+        for _ in range(2):
+            dn = (j > 0) & ((tte_p[j] - tte_p) < w)
+            j = np.where(dn, j - 1, j)
+        gapw = tte_p[j] - tte_p
+        valid = (idx >= 0) & (gapw >= w) & (gapw <= w + 9.0)
+        mrange = np.full(n, np.nan)
+        qmax, qmin = _cl.deque(), _cl.deque()
+        for k in range(n):
+            while qmax and qmax[0] < j[k]:
+                qmax.popleft()
+            while qmin and qmin[0] < j[k]:
+                qmin.popleft()
+            v = mid_p[k]
+            while qmax and mid_p[qmax[-1]] <= v:
+                qmax.pop()
+            qmax.append(k)
+            while qmin and mid_p[qmin[-1]] >= v:
+                qmin.pop()
+            qmin.append(k)
+            if valid[k]:
+                mrange[k] = mid_p[qmax[0]] - mid_p[qmin[0]]
+        fthen = np.full(n, np.nan)
+        if fwd is None and fair_p is not None:
+            # calibration-free fair (kind="resid"): no refit drift to strip,
+            # the refit-immune "fair then" IS the fair at the lookback row
+            fthen[valid] = fair_p[j[valid]]
+        for sid in np.unique(segid) if fwd is not None else ():
+            ks = np.where((segid == sid) & valid & ~np.isnan(dbs_p))[0]
+            if len(ks) == 0:
+                continue
+            db_s, dr_s = float(dbs_p[ks[0]]), float(drs_p[ks[0]])
+            if calib_m == "2db":
+                b2c = strike + b_scale * float(dbcs_p[ks[0]])
+            elif calib_m == "dbp":
+                b2c = strike
+            else:
+                b2c = None
+            jr = j[ks]
+            with torch.no_grad():
+                lo = sim.logit_of(
+                    fwd,
+                    torch.tensor(spot_p[jr], dtype=torch.float32),
+                    torch.tensor(tte_p[jr], dtype=torch.float32),
+                    strike + b_scale * db_s, math.exp(rho_f + dr_s),
+                    torch.tensor(x_p[jr], dtype=torch.float32),
+                    torch.tensor(cb_p[jr], dtype=torch.float32) if cb_p is not None else None,
+                    cbm,
+                    torch.tensor(kr_p[jr], dtype=torch.float32) if kr_p is not None else None,
+                    krm, b2=b2c)
+                fthen[ks] = torch.sigmoid(lo).numpy()
+        out[w] = (j, valid, mrange, fthen)
+    return out
+
+
 def generate_trades(sig, m_label, gap, fair, mid_p, tte_p, ybid_p, yask_p, ts_p, outc, t, a,
-                    fill_ybid, fill_yask, fx_fair=None, cb_age_p=None):
+                    fill_ybid, fill_yask, fx_fair=None, cb_age_p=None, pre=None):
     """Arm/gate/entry episode loop for ONE entry signal on ONE event -> trade
     dicts labeled `m_label`. `sig` (raw gap or demeaned gap) drives the threshold,
     direction and re-arm; the ride gate and closure use the RAW fair/mid/gap.
@@ -546,6 +1027,13 @@ def generate_trades(sig, m_label, gap, fair, mid_p, tte_p, ybid_p, yask_p, ts_p,
     requirement, no ride gate (the dominance test IS the gate). Episode:
     disarm on fire, re-arm when |dfair_1s| <= delta * move_rearm."""
     out = []
+    # entry price filters: zero the signal where the mid is outside the allowed region, so no crossing can fire there
+    if getattr(a, "px_tails", ""):
+        lo, hi = (float(x) for x in a.px_tails.split(","))
+        sig = np.where((mid_p < lo) | (mid_p > hi), sig, 0.0)
+    elif getattr(a, "px_band", ""):
+        lo, hi = (float(x) for x in a.px_band.split(","))
+        sig = np.where((mid_p >= lo) & (mid_p <= hi), sig, 0.0)
     dfair_arr = dmid_arr = None
     if a.trigger == "move":
         # vectorized 1s-lookback moves: youngest j with tte_j >= tte_k + 1s
@@ -641,16 +1129,27 @@ def generate_trades(sig, m_label, gap, fair, mid_p, tte_p, ybid_p, yask_p, ts_p,
                 # to lookback_max (10s); fair_then is RECOMPUTED from the
                 # lookback row's raw inputs under the CURRENT calibration
                 # (refit-jump immune), not read from the stored causal series.
-                j = k - 1
-                while j > 0 and (tte_p[j] - tte_p[k]) < a.lookback_s and (k - j) < 400:
-                    j -= 1
-                if j >= 0 and a.lookback_s <= (tte_p[j] - tte_p[k]) <= a.lookback_s + 9.0:
-                    fair_then = fx_fair(j, k) if fx_fair is not None else float("nan")
-                    if math.isnan(fair_then):
-                        fair_then = fair[j]
-                    dfair1, dmid1 = fair[k] - fair_then, mid_p[k] - mid_p[j]
+                if pre is not None and a.lookback_s in pre:
+                    jP, vP, _mrP, ftP = pre[a.lookback_s]
+                    if vP[k]:
+                        j = int(jP[k])
+                        fair_then = float(ftP[k])
+                        if math.isnan(fair_then):
+                            fair_then = fair[j]
+                        dfair1, dmid1 = fair[k] - fair_then, mid_p[k] - mid_p[j]
+                    else:
+                        dfair1 = dmid1 = float("nan")
                 else:
-                    dfair1 = dmid1 = float("nan")
+                    j = k - 1
+                    while j > 0 and (tte_p[j] - tte_p[k]) < a.lookback_s and (k - j) < 400:
+                        j -= 1
+                    if j >= 0 and a.lookback_s <= (tte_p[j] - tte_p[k]) <= a.lookback_s + 9.0:
+                        fair_then = fx_fair(j, k) if fx_fair is not None else float("nan")
+                        if math.isnan(fair_then):
+                            fair_then = fair[j]
+                        dfair1, dmid1 = fair[k] - fair_then, mid_p[k] - mid_p[j]
+                    else:
+                        dfair1 = dmid1 = float("nan")
                 push, pull = s * dfair1, -s * dmid1
                 tot = push + pull
                 share = push / tot if tot and not math.isnan(tot) else float("nan")
@@ -682,19 +1181,29 @@ def generate_trades(sig, m_label, gap, fair, mid_p, tte_p, ybid_p, yask_p, ts_p,
                     # share gate cannot tell fair-led from mid-moved-and-bounced
                     # (the 1215-15 entry-#33 pathology: share 2.19 on a dip the
                     # market had already faded).
-                    jw = k - 1
-                    while jw > 0 and (tte_p[jw] - tte_p[k]) < a.stab_window and (k - jw) < 800:
-                        jw -= 1
                     ok = False
-                    if (jw >= 0 and a.stab_window <= (tte_p[jw] - tte_p[k]) <= a.stab_window + 9.0
-                            and (k - jw) >= 10):
-                        mid_seg = mid_p[jw:k + 1]
-                        mrange = float(np.max(mid_seg) - np.min(mid_seg))
-                        fair_then_w = fx_fair(jw, k) if fx_fair is not None else float("nan")
-                        if math.isnan(fair_then_w):
-                            fair_then_w = fair[jw]
-                        ok = (mrange <= a.stab_max_c
-                              and s * (fair[k] - fair_then_w) >= open_eff)
+                    if pre is not None and a.stab_window in pre:
+                        jP, vP, mrP, ftP = pre[a.stab_window]
+                        jw = int(jP[k])
+                        if vP[k] and (k - jw) >= 10:
+                            fair_then_w = float(ftP[k])
+                            if math.isnan(fair_then_w):
+                                fair_then_w = fair[jw]
+                            ok = (mrP[k] <= a.stab_max_c
+                                  and s * (fair[k] - fair_then_w) >= open_eff)
+                    else:
+                        jw = k - 1
+                        while jw > 0 and (tte_p[jw] - tte_p[k]) < a.stab_window and (k - jw) < 800:
+                            jw -= 1
+                        if (jw >= 0 and a.stab_window <= (tte_p[jw] - tte_p[k]) <= a.stab_window + 9.0
+                                and (k - jw) >= 10):
+                            mid_seg = mid_p[jw:k + 1]
+                            mrange = float(np.max(mid_seg) - np.min(mid_seg))
+                            fair_then_w = fx_fair(jw, k) if fx_fair is not None else float("nan")
+                            if math.isnan(fair_then_w):
+                                fair_then_w = fair[jw]
+                            ok = (mrange <= a.stab_max_c
+                                  and s * (fair[k] - fair_then_w) >= open_eff)
                     if not ok:
                         _ungate(); k += 1
                         continue
@@ -1062,7 +1571,7 @@ def _fs_worker(payload):
     """Worker-process entry: fair_series for ONE event. The per-event (db, dr)
     fits are independent, so events parallelize perfectly; the torch surface is
     rebuilt once per (worker, model) and cached by the model's path."""
-    key, js, cb_mult, kr_mult, t, d, strike, lc, fsargs, fit_stride = payload
+    key, js, cb_mult, kr_mult, t, d, strike, lc, fsargs, fit_stride, dynfit = payload
     torch.set_num_threads(1)  # tiny per-fit tensors; intra-op threads only add overhead
     ent = _WORKER_CACHE.get(key)
     if ent is None:
@@ -1077,20 +1586,295 @@ def _fs_worker(payload):
     # always correct — worker parity must mirror parse_model exactly).
     pr = js.get("prior")
     mm = {"js": js, "cb_mult": cb_mult, "kr_mult": kr_mult, "calib": js.get("calib"),
+          "dynfit": dynfit,
+          # ⚠ every fit-behavior flag parse_model derives MUST be mirrored here
+          # (2026-08-29: a missing "dronly" silently ran the db-free model with
+          # the 2-param fit in pooled runs — same class as the 2026-08-19
+          # missing-prior worker bug)
+          "dronly": js.get("fitmode") == "dronly",
+          "anchor": js.get("anchor"),
+          "fit_window_js": js.get("fit_window"),
           "prior": ((float(pr["center"][0]), float(pr["center"][1]),
                      float(pr["psd"][0]), float(pr["lam"])) if pr else None)}
     return t, fair_series(d, mm, strike, rho, b_scale, fwd, *fsargs,
                           live_cal=lc, fit_stride=fit_stride)
 
 
+# ── kind="resid": residual-on-market nowcast fair (tools/nowcast) ─────────────
+# fair = sigmoid(logit(mid) + mean_k f_k(x)); f_k are torch nets trained by
+# train_outcome.py on the 200ms-ahead mid with the market as the residual base.
+# Features are rebuilt here on the sampler rows by WALL-CLOCK lag (j ticks =
+# 200*j ms), matching the offline 200ms-grid construction. No calibration.
+_RESID_LAGS = np.array([1, 2, 3, 4, 5, 7, 10, 15, 20, 30, 50, 75, 100, 150, 200, 300])
+_RESID_LB = np.array([1, 2, 3, 5, 10, 25, 50])
+
+
+class _ResHAD(torch.nn.Module):
+    def __init__(s, nin, h, drop):
+        super().__init__(); nn = torch.nn
+        s.a = nn.Linear(nin, h); s.b = nn.Linear(nin, h); s.c = nn.Linear(nin, h)
+        s.drop = nn.Dropout(drop); s.h2 = nn.Linear(h, h); s.out = nn.Linear(h, 1)
+
+    def forward(s, x):
+        return s.out(torch.relu(s.h2(s.drop(torch.relu(s.c(x) + s.a(x) * s.b(x))))))
+
+
+class _ResFILM(torch.nn.Module):
+    def __init__(s, nin, sidx, h, drop):
+        super().__init__(); nn = torch.nn
+        s.register_buffer("sidx", torch.tensor(sidx, dtype=torch.long))
+        s.g = nn.Linear(len(sidx), h); s.b = nn.Linear(len(sidx), h); s.f = nn.Linear(nin, h)
+        s.drop = nn.Dropout(drop); s.h2 = nn.Linear(h, h); s.out = nn.Linear(h, 1)
+
+    def forward(s, x):
+        st = x[:, s.sidx]; z = torch.relu(s.f(x)) * (1 + torch.tanh(s.g(st))) + s.b(st)
+        return s.out(torch.relu(s.h2(s.drop(z))))
+
+
+_RESID_CACHE = {}
+# lake side-features (tools/nowcast/build_lake.py, LAKE_BARS=1): per-day 100ms bar matrices of
+# binance-perp print/depth/liquidation features; a row takes the bar of (ts - 50ms), as in training.
+_LAKE_BARS_DIR = os.environ.get("LAKE_BARS_DIR", "data/nowcast/lake_bars")
+_LAKE_CACHE = {}
+# minimal print-only subsets (train_outcome.py LMIN): aggTrade-reproducible live
+_LSUB = {"tfi": ["flow_tfi_1s", "flow_tfi_5s", "flow_tfi_30s"], "vol": ["flow_vol_1s", "flow_vol_5s", "flow_vol_30s"],
+         "n": ["flow_n_1s", "flow_n_5s"], "fother": ["flow_big_30s", "flow_burst", "flow_vwap1_bps"],
+         "dimb": ["depth_imb1", "depth_imb5", "depth_imb20", "depth_micro_bps"],
+         "dband": ["depth_band5", "depth_band10", "depth_band25", "depth_depth10", "depth_spread_bps"],
+         "ddelta": ["depth_dimb5_1s", "depth_dimb5_5s", "depth_dband10_1s"], "liq": ["liq_buy_30s", "liq_sell_30s", "liq_net_300s"]}
+_LMIN = {"lmin2": ["flow_n_1s", "flow_tfi_1s"], "lmin5": ["flow_n_1s", "flow_tfi_1s", "flow_tfi_5s", "flow_vwap1_bps", "flow_burst"]}
+
+
+def _lake_bars(day):
+    if day not in _LAKE_CACHE:
+        if len(_LAKE_CACHE) >= 3:
+            _LAKE_CACHE.pop(next(iter(_LAKE_CACHE)))
+        p = os.path.join(_LAKE_BARS_DIR, day + ".bars.npz")
+        if os.path.exists(p):
+            z = np.load(p)
+            _LAKE_CACHE[day] = (z["M"], int(z["day0"]), [str(x) for x in z["names"]])
+        else:
+            _LAKE_CACHE[day] = None
+    return _LAKE_CACHE[day]
+
+
+def _lake_feats(ts_rows, groups):
+    """-> (n x k float32, ok mask): lake features at the rows; rows on a day without bars -> not ok"""
+    import datetime as _dt
+    ts_rows = np.asarray(ts_rows, np.int64)
+    dcode = ts_rows // 86400000
+    out = None; ok = np.zeros(len(ts_rows), bool)
+    for dc in np.unique(dcode):
+        day = _dt.datetime.utcfromtimestamp(int(dc) * 86400).strftime("%Y-%m-%d")
+        b = _lake_bars(day)
+        if b is None:
+            continue
+        M, day0, names = b
+        selg = set()
+        for g in groups:
+            if g == "lake": selg |= set(names)
+            elif g == "lflow": selg |= {n for n in names if n.startswith("flow_")}
+            elif g == "ldepth": selg |= {n for n in names if n.startswith("depth_")}
+            elif g == "lliq": selg |= {n for n in names if n.startswith("liq_")}
+            elif g in _LMIN: selg |= set(_LMIN[g])
+            elif g.startswith("lake-"): selg |= set(names) - set(_LSUB[g[5:]])
+            elif g.startswith("lsub_"): selg |= set(_LSUB[g[5:]])
+            elif g.startswith("lf_"): selg.add(g[3:])
+        want = [i for i, nm in enumerate(names) if nm in selg]
+        if out is None:
+            out = np.zeros((len(ts_rows), len(want)), np.float32)
+        m = dcode == dc
+        rb = np.clip((ts_rows[m] - day0 - 50) // 100, 0, len(M) - 1)
+        X = M[rb][:, want]
+        out[m] = np.where(np.isfinite(X), X, 0.0); ok[m] = True
+    if out is None:
+        sys.exit("resid fair: lake groups need %s/<day>.bars.npz (tools/nowcast/build_lake.py with LAKE_BARS=1)" % _LAKE_BARS_DIR)
+    return out, ok
+
+
+def _resid_members(m):
+    """load (net, mu, sd, spec) per checkpoint listed in the model json"""
+    key = m["path"]
+    if key in _RESID_CACHE:
+        return _RESID_CACHE[key]
+    base = os.path.dirname(os.path.abspath(m["path"]))
+    out = []
+    for rel in m["js"]["members"]:
+        ck = torch.load(rel if os.path.isabs(rel) else os.path.join(base, rel), map_location="cpu")
+        nf, h, dr = int(ck["nf"]), int(ck["hidden"]), float(ck.get("dropout", 0.1))
+        if ck["arch"] == "had":
+            net = _ResHAD(nf, h, dr)
+        elif ck["arch"] == "film":
+            net = _ResFILM(nf, list(ck["sidx"]), h, dr)
+        else:
+            nn = torch.nn
+            net = nn.Sequential(nn.Linear(nf, h), nn.ReLU(), nn.Dropout(dr),
+                                nn.Linear(h, h), nn.ReLU(), nn.Linear(h, 1))
+        net.load_state_dict(ck["state"]); net.eval()
+        out.append((net, np.asarray(ck["mu"], np.float32), np.asarray(ck["sd"], np.float32), ck))
+    _RESID_CACHE[key] = out
+    return out
+
+
+def resid_fair_series(d, m, a):
+    """fair_series-compatible 16-tuple for kind="resid" (dbs/drs NaN)."""
+    members = _resid_members(m)
+    spec = members[0][3]
+    lookback = float(spec.get("lookback", 6.0))
+    use = np.asarray(spec["use"], int) if spec.get("use") is not None else _RESID_LAGS[_RESID_LAGS <= lookback * 5 + 0.5]
+    groups = set(str(spec.get("feat", "hist,book,bookl")).split(","))
+    ts = d["ts"].astype(np.int64); tte = d["tte"]
+    yb, ya = d["ybid"], d["yask"]; mid = 0.5 * (yb + ya); spr = ya - yb
+    perp = d["spot"]
+    ybs, yas = d.get("ybid_sz"), d.get("yask_sz")
+    pbs, pas = d.get("perp_bid_sz"), d.get("perp_ask_sz")
+    if ybs is None or pbs is None:
+        sys.exit("resid fair: sampler lacks size columns (ybid_sz/perp_bid_sz)")
+    n = len(ts)
+    eps = 1e-4
+    lg = lambda p: np.log(np.clip(p, eps, 1 - eps) / (1 - np.clip(p, eps, 1 - eps)))
+
+    def lagidx(j_ticks):
+        dt = 200.0 * j_ticks
+        idx = np.searchsorted(ts, ts - dt, side="right") - 1
+        ok = idx >= 0
+        ok[ok] &= (ts[ok] - ts[idx[ok]]) <= dt + 300.0
+        return np.clip(idx, 0, n - 1), ok
+
+    # sigma: trailing-120s std of the 1s perp move (offline: rolling 600 x 200ms)
+    i1, ok1 = lagidx(5)
+    c1 = np.where(ok1, perp - perp[i1], np.nan)
+    import pandas as _pd
+    sig = _pd.Series(c1).rolling(2400, min_periods=800).std().to_numpy()
+    sig = np.maximum(np.where(np.isfinite(sig), sig, 1.25), 1.25)
+    ssum = np.maximum(ybs + yas, 1e-6); imb = (ybs - yas) / ssum
+    micro = (yb * yas + ya * ybs) / ssum - mid
+    psum = np.maximum(pbs + pas, 1e-6); pimb = (pbs - pas) / psum
+    l0 = lg(mid)
+    scan = np.where(tte <= a.tte_max)[0][::SCAN_STRIDE]
+    F = []; valid = np.ones(len(scan), bool)
+    mkt = spec.get("market", "residual")
+    i1_, ok1_ = lagidx(1); l1 = lg(mid[i1_]); m1 = mid[i1_]          # lag-1 (200ms) mid
+    if "histp" in groups:                # LEVEL model: history vs the lag-1 mid, perp vs now
+        valid &= ok1_[scan]
+        for j in use:
+            idx, ok = lagidx(int(j)); valid &= ok[scan]
+            F.append(lg(mid[idx[scan]]) - l1[scan])
+        for j in use:
+            idx, ok = lagidx(int(j)); valid &= ok[scan]
+            F.append((perp[idx[scan]] - perp[scan]) / sig[scan])
+    if "hist" in groups:
+        for j in use:
+            idx, ok = lagidx(int(j)); valid &= ok[scan]
+            F.append(lg(mid[idx[scan]]) - l0[scan])
+        for j in use:
+            idx, ok = lagidx(int(j)); valid &= ok[scan]
+            F.append((perp[idx[scan]] - perp[scan]) / sig[scan])
+    if "book" in groups:
+        F += [np.log1p(ybs[scan]), np.log1p(yas[scan]), imb[scan], 100 * micro[scan],
+              np.log1p(pbs[scan]), np.log1p(pas[scan]), pimb[scan]]
+    # venue split of the book block (same order as train_outcome.py)
+    if "kbook" in groups:
+        F += [np.log1p(ybs[scan]), np.log1p(yas[scan]), imb[scan], 100 * micro[scan]]
+    if "pbook" in groups:
+        F += [np.log1p(pbs[scan]), np.log1p(pas[scan]), pimb[scan]]
+    if "ksz" in groups:
+        F += [np.log1p(ybs[scan]), np.log1p(yas[scan])]
+    if "kimb" in groups:
+        F += [imb[scan], 100 * micro[scan]]
+    if "psz" in groups:
+        F += [np.log1p(pbs[scan]), np.log1p(pas[scan])]
+    if "pimb" in groups:
+        F += [pimb[scan]]
+    for g, col in (("kbs", np.log1p(ybs)), ("kas", np.log1p(yas)), ("kim", imb), ("kmi", 100 * micro), ("pbs", np.log1p(pbs)), ("pas", np.log1p(pas))):
+        if g in groups:                      # single book columns (pruned models)
+            F += [col[scan]]
+    if any(g in {"lake", "lflow", "ldepth", "lliq"} or g in _LMIN or g.startswith("lake-") or g.startswith("lsub_") or g.startswith("lf_") for g in groups):      # same slot as train_outcome.py: after the book blocks, before act
+        Xl, okl = _lake_feats(ts[scan], groups); valid &= okl
+        F += [Xl[:, i] for i in range(Xl.shape[1])]
+    if "act" in groups:
+        # activity on a 200ms grid exactly as build_v10: mid = last sample at/before each
+        # grid time; tsl = ticks since the last mid change (<=300), n5/n30 = changes in the
+        # last 25/150 ticks, lastdir = sign of the last change; each row takes the latest
+        # grid point at/before it (staleness < 400ms else invalid)
+        grid = np.arange(ts[0] + 1000, ts[-1] + 1, 200)
+        gi = np.clip(np.searchsorted(ts, grid, side="right") - 1, 0, n - 1)
+        gm = mid[gi]
+        dm = np.diff(gm, prepend=gm[0]); chg = dm != 0
+        gidx = np.arange(len(grid))
+        last_chg = np.maximum.accumulate(np.where(chg, gidx, 0))
+        tsl = np.minimum(gidx - last_chg, 300).astype(np.float32)
+        cs_ = np.cumsum(chg)
+        n5 = cs_ - np.concatenate([np.zeros(25), cs_[:-25]])[:len(cs_)] if len(cs_) > 25 else cs_.astype(float)
+        n30 = cs_ - np.concatenate([np.zeros(150), cs_[:-150]])[:len(cs_)] if len(cs_) > 150 else cs_.astype(float)
+        lastdir = np.sign(dm[last_chg])
+        ri = np.searchsorted(grid, ts[scan], side="right") - 1
+        okr = ri >= 0
+        okr[okr] &= (ts[scan][okr] - grid[ri[okr]]) < 400
+        valid &= okr
+        ri = np.clip(ri, 0, len(grid) - 1)
+        F += [tsl[ri] / 50.0, n5[ri].astype(np.float32), n30[ri].astype(np.float32) / 10.0, lastdir[ri].astype(np.float32)]
+    if "bookl" in groups:
+        idxs = []
+        for j in _RESID_LB:
+            idx, ok = lagidx(int(j)); valid &= ok[scan]; idxs.append(idx[scan])
+        F += [imb[i] for i in idxs] + [100 * micro[i] for i in idxs] + [pimb[i] for i in idxs] \
+             + [100 * spr[i] for i in idxs] + [100 * ((mid + micro)[i] - mid[scan]) for i in idxs]
+    if "kz" in groups:
+        sys.exit("resid fair: 'kz' group not supported in the harness")
+    if mkt == "prev":
+        valid &= ok1_[scan]
+        F += [np.log(np.maximum(tte[scan], 1.0)), sig[scan], 100 * spr[i1_[scan]], l1[scan], m1[scan] * (1 - m1[scan])]
+    else:
+        F += [np.log(np.maximum(tte[scan], 1.0)), sig[scan], 100 * spr[scan]]
+        if mkt != "none":
+            F += [l0[scan], mid[scan] * (1 - mid[scan])]
+    X = np.column_stack(F).astype(np.float32)
+    valid &= np.isfinite(X).all(1)
+    fair = np.full(len(scan), np.nan)
+    if valid.any():
+        acc = np.zeros(int(valid.sum()), np.float32)
+        with torch.no_grad():
+            for net, mu, sd, ck in members:
+                Z = torch.from_numpy((X[valid] - mu) / sd)
+                acc += net(Z).squeeze(1).numpy()
+        acc /= len(members)
+        if mkt == "residual":
+            acc = acc + l0[scan][valid]
+        elif mkt == "prev":
+            acc = acc + l1[scan][valid]
+        fair[valid] = 1.0 / (1.0 + np.exp(-acc))
+    ts_p, tte_p = ts[scan].astype(d["ts"].dtype), tte[scan]
+    ybid_p, yask_p = yb[scan], ya[scan]
+    lat = float(a.latency_ms)
+    if lat > 0:
+        w = tte <= a.tte_max
+        ts_full, yb_full, ya_full = ts[w], yb[w], ya[w]
+        idx = np.clip(np.searchsorted(ts_full, ts_p + lat, side="left"), 0, len(ts_full) - 1)
+        fill_ybid, fill_yask = yb_full[idx].copy(), ya_full[idx].copy()
+        elapsed = ts_full[idx] - ts_p
+        bad = (elapsed < lat * 0.5) | (elapsed > lat + 250.0)
+        fill_ybid[bad], fill_yask[bad] = ybid_p[bad], yask_p[bad]
+    else:
+        fill_ybid, fill_yask = ybid_p, yask_p
+    ok = ~np.isnan(fair)
+    nanv = np.full(int(ok.sum()), np.nan)
+    return (ts_p[ok], tte_p[ok], ybid_p[ok], yask_p[ok], fair[ok], nanv.copy(),
+            fill_ybid[ok], fill_yask[ok], nanv.copy(), nanv.copy(), nanv.copy(),
+            perp[scan][ok], np.zeros((int(ok.sum()), 0)), None, None, None)
+
+
 def simulate(m, ev, meta, a):
     """-> (trades, bce_rows). One pass per event; all deltas scored together."""
     if m["js"].get("kind") == "adj":
         return simulate_adj(m, ev, meta, a)
-    net_s, mode, clamp = sim.build_surface(m["js"])
-    fwd = sim.make_fwd(net_s, mode, clamp)
-    rho = torch.tensor(float(m["js"]["rho_bar"]))
-    b_scale = float(m["js"].get("b_scale", 50.0))
+    if m["js"].get("kind") == "resid":
+        fwd, rho, b_scale = None, torch.tensor(0.0), 50.0     # no surface, no calibration
+    else:
+        net_s, mode, clamp = sim.build_surface(m["js"])
+        fwd = sim.make_fwd(net_s, mode, clamp)
+        rho = torch.tensor(float(m["js"]["rho_bar"]))
+        b_scale = float(m["js"].get("b_scale", 50.0))
     trades, bce_rows = [], []
 
     # eligibility pass (meta + coverage + live-calib), preserving event order
@@ -1112,9 +1896,12 @@ def simulate(m, ev, meta, a):
     # fair_series precompute — the fit-dominated part — across a process pool.
     # Results are bit-identical to the serial path (same inputs, same init,
     # single-threaded torch either way); only wall-clock changes.
-    fsargs = (a.tte_max, a.fit_window, a.refit_step, a.demean_window, a.latency_ms)
+    fw = m.get("fit_window_js") or a.fit_window
+    if fw != a.fit_window:
+        print(f"  [{m['label']}] fit_window override: {fw:.0f}s (model json)")
+    fsargs = (a.tte_max, fw, a.refit_step, a.demean_window, a.latency_ms)
     payloads = [(m["path"], m["js"], m["cb_mult"], m.get("kr_mult"),
-                 t, ev[t], strike, lc, fsargs, a.fit_stride)
+                 t, ev[t], strike, lc, fsargs, a.fit_stride, m.get("dynfit"))
                 for t, strike, outc, lc in elig]
     series = {}
     if (getattr(a, "batch_calib", False) and m.get("calib") == "shared2p"
@@ -1130,6 +1917,10 @@ def simulate(m, ev, meta, a):
             series[t] = fair_series(ev[t], m, strike, rho, b_scale, fwd,
                                     *fsargs, live_cal=None,
                                     fit_stride=a.fit_stride, precomputed=pre[t])
+        payloads = []
+    if m["js"].get("kind") == "resid":
+        for t, strike, outc, lc in elig:
+            series[t] = resid_fair_series(ev[t], m, a)
         payloads = []
     jobs = getattr(a, "jobs", 1)
     if jobs > 1 and len(payloads) > 1:
@@ -1271,13 +2062,53 @@ def simulate(m, ev, meta, a):
             strats.append(("+adj", gap2, gap2, fair2, None))
             if a.demean_window > 0:
                 strats.append((f"+adj.dm{int(a.demean_window)}", gap2 - gbar, gap2, fair2, None))
+        # vectorized gate inputs shared by the base strats and every grid
+        # cell: one O(n) sweep + ~segments batched net calls per window,
+        # replacing per-crossing scalar walks + torch calls (the 18h/model
+        # sink of the first row-universe grid run).
+        wins_needed = {a.lookback_s}
+        if a.gate == "stable":
+            wins_needed.add(a.stab_window)
+        if a.gate == "ride":
+            wins_needed.update(lb_ for _, _, lb_ in getattr(a, "gate_grid_cells", []))
+        else:
+            wins_needed.update(w_ for _, w_, _ in getattr(a, "gate_grid_cells", []))
+        pre = _gate_precompute(wins_needed, tte_p, mid_p, dbs_p, drs_p, dbcs_p,
+                               spot_p, x_p, cb_p, kr_p, fwd, strike, rho_f,
+                               b_scale, cbm, krm, calib_m, fair_p=fair)
         for suffix, sig, g_, f_, fx_ in strats:
             trades += generate_trades(sig, m["label"] + suffix, g_, f_, mid_p,
                                       tte_p, ybid_p, yask_p, ts_p, outc, t, a,
                                       fill_ybid, fill_yask, fx_fair=fx_,
                                       # live parity: the stale veto only guards
                                       # 2-price surfaces (rule.rs two_price())
-                                      cb_age_p=cb_age_p if cbm is not None else None)
+                                      cb_age_p=cb_age_p if cbm is not None else None,
+                                      pre=pre if suffix == "" else None)
+        # row-universe gate grid: same fair series, the REAL episode gate per
+        # cell. fx_fair=None: the closure counterfactual columns are not
+        # needed for cell RANKING and cost a torch call per trade.
+        # grid entry signal: RAW gap, or the DEMEANED gap (gap - trailing-W
+        # mean) when --demean-window > 0, so the grid can be swept on the
+        # innovation instead of the level. The gate/closure still use the raw
+        # fair/gap, exactly as in the base `.dm` strat.
+        grid_streams = [("", gap)]
+        if a.demean_window > 0:
+            grid_streams = [(".dm%d" % int(a.demean_window), gap - gbar)]
+        for op_, c2_, c3_ in getattr(a, "gate_grid_cells", []):
+            a2 = _copy.copy(a)
+            if a.gate == "ride":
+                a2.ride_open, a2.ride_share, a2.lookback_s = op_, c2_, c3_
+                cell = "o%gs%gl%g" % (100 * op_, 100 * c2_, c3_)
+            else:
+                a2.ride_open, a2.stab_window, a2.stab_max_c = op_, c2_, c3_
+                cell = "o%gw%gr%g" % (100 * op_, c2_, 100 * c3_)
+            for gsuf, gsig in grid_streams:
+                lbl = "%s%s@%s" % (m["label"], gsuf, cell)
+                trades += generate_trades(gsig, lbl, gap, fair, mid_p,
+                                          tte_p, ybid_p, yask_p, ts_p, outc, t, a2,
+                                          fill_ybid, fill_yask, fx_fair=None,
+                                          cb_age_p=cb_age_p if cbm is not None else None,
+                                          pre=pre)
     return trades, bce_rows
 
 
@@ -1614,6 +2445,10 @@ def main():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     p.add_argument("--samples", required=True,
                    help="comma-separated sampler CSV(.gz) paths")
+    p.add_argument("--px-tails", default="", metavar="LO,HI",
+                   help="entries only when the YES mid is < LO or > HI (the signal is zeroed elsewhere); e.g. 0.10,0.90")
+    p.add_argument("--px-band", default="", metavar="LO,HI",
+                   help="entries only when LO <= YES mid <= HI (signal zeroed elsewhere)")
     p.add_argument("--model", action="append", required=True, metavar="label=path[:px=cb|perp]",
                    help="repeatable; price input defaults from surface train.venue")
     p.add_argument("--deltas", default="0.03,0.05", help="entry |gap| thresholds")
@@ -1645,6 +2480,13 @@ def main():
     p.add_argument("--ride-open", type=float, default=None,
                    help="ride-gate open_min; DEFAULT = the gap threshold (delta), "
                         "per the 2026-08-03 convention (live open_min: 0.02 = delta)")
+    p.add_argument("--gate-grid", default="", metavar="open=1,2,3;win=2,3,5;rng=1.5,2.5,4",
+                   help="ROW-UNIVERSE stable-gate grid (cents/seconds/cents): every cell "
+                        "runs the REAL per-row episode gate off one shared fair series — "
+                        "exact gate timing and fills. Preferred over re-scoring a "
+                        "--stab-stats crossing dump, which fires at the crossing only "
+                        "and is pessimistic for late-stabilizing episodes. "
+                        "Requires --gate stable; cells label trades <model>@oXwYrZ.")
     p.add_argument("--stab-stats", action="store_true",
                    help="record per-trade mid-range + fair-move over windows "
                         "{1.5,2,3,5}s into trades.csv (offline stable-gate sweeps)")
@@ -1767,6 +2609,25 @@ def main():
     a.misses = []   # signals blocked by the chase cap (post-latency ask ran away)
     a.vetoes = []   # trade-only vetoes (stale-signal / disarm-cooldown)
     a.deltas = [float(x) for x in a.deltas.split(",")]
+    a.gate_grid_cells = []
+    if a.gate_grid:
+        gg = {}
+        for part in a.gate_grid.split(";"):
+            k, v = part.split("=")
+            gg[k.strip()] = [float(x) for x in v.split(",")]
+        if a.gate == "stable":
+            a.gate_grid_cells = [(op / 100.0, w, rg / 100.0)
+                                 for op in gg["open"] for w in gg["win"]
+                                 for rg in gg["rng"]]
+        elif a.gate == "ride":
+            # (ride_open, ride_share, lookback_s): fire when the 1s move is
+            # fair-LED — tot > open AND push/tot > share.
+            a.gate_grid_cells = [(op / 100.0, sh / 100.0, lb)
+                                 for op in gg["open"] for sh in gg["share"]
+                                 for lb in gg["lb"]]
+        else:
+            sys.exit("--gate-grid supports --gate stable or --gate ride")
+        print(f"gate grid ({a.gate}): {len(a.gate_grid_cells)} row-universe cells")
     a.tte_max, a.tte_min = (float(x) for x in a.tte.split(":"))
     if a.tte_max > 300:
         BUCKETS[:0] = [b for b in BUCKETS_EARLY if b[1] < a.tte_max]
