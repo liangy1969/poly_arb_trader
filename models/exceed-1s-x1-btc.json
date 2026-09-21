@@ -1,0 +1,6 @@
+{
+ "kind": "exceed",
+ "note": "Exceedance classifier for the harness (analyze_online kind=exceed): two sigmoid heads P(mid +1s - mid >= 1c), P(<= -1c) on the STANDARD 43 nowcast inputs (same feature pipeline as resid-prune5-btc.json, lake bars required); entry signal = P(up) - P(down) averaged over 3 seeds, thresholded by --deltas; fair = mid. Trained 07-25..08-26, VAL 08-27..31, TEST 09-01..04 (tools/nowcast/train_exceed.py --export, 2026-09-21).",
+ "members": ["../data/nowcast/exceed_models/exceed_mid5_x1_s0.pt", "../data/nowcast/exceed_models/exceed_mid5_x1_s1.pt", "../data/nowcast/exceed_models/exceed_mid5_x1_s2.pt"],
+ "extras": []
+}

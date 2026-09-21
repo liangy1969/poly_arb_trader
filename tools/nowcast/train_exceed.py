@@ -23,6 +23,7 @@ ap.add_argument("--tte-min", type=float, default=60); ap.add_argument("--tte-max
 ap.add_argument("--data", default="midmove_v10", help="row dataset dir under the scratchpad (midmove_v11 has the coinbase history + sigma_cb)")
 ap.add_argument("--cb", action="store_true", help="add the COINBASE mid lag history (10 lags / sigma_cb) and sigma_cb to the inputs (needs --data midmove_v11)")
 ap.add_argument("--ks", default="0.5,1,5", help="top-k%% cuts for the precision columns")
+ap.add_argument("--export", default="", help="save each cell's net as a harness checkpoint DIR/exceed_<h>_x<X>_s<seed>.pt (analyze_online kind=exceed; not with --cb)")
 a = ap.parse_args()
 torch.set_num_threads(4); torch.manual_seed(a.seed); np.random.seed(a.seed)
 SP = r"C:/Users/fatli/AppData/Local/Temp/claude/e--poly-crypto-trader/0ed64f57-c300-45f3-b675-113fb239783c/scratchpad"
@@ -142,3 +143,8 @@ for h in HS:
         if a.save_pred:
             os.makedirs(a.save_pred, exist_ok=True)
             np.savez_compressed(os.path.join(a.save_pred, "%s_%s_x%g_s%d.npz" % (a.tag, h, x, a.seed)), p_va=predict(net, "va"), p_te=predict(net, "te"), okva=okva, okte=okte)
+        if a.export and not a.cb and not a.ctx_only:
+            os.makedirs(a.export, exist_ok=True)
+            torch.save({"state": net.state_dict(), "mu": mu.astype(np.float32), "sd": sd.astype(np.float32), "arch": "mlp", "hidden": a.hidden, "dropout": a.dropout,
+                        "feat": FEAT, "lookback": 6.0, "market": "residual", "target": h, "x": x, "nf": NF, "nout": 2, "use": LAGS.tolist(), "kind": "exceed"},
+                       os.path.join(a.export, "exceed_%s_x%g_s%d.pt" % (h, x, a.seed)))

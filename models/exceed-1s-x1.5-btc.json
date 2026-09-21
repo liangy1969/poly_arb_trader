@@ -1,0 +1,6 @@
+{
+ "kind": "exceed",
+ "note": "Exceedance classifier for the harness (analyze_online kind=exceed): two sigmoid heads P(mid +1s - mid >= 1.5c), P(<= -1.5c) on the STANDARD 43 nowcast inputs; entry signal = P(up) - P(down) averaged over 3 seeds, thresholded by --deltas; fair = mid. Same training/validation split as exceed-1s-x1-btc.json (2026-09-21).",
+ "members": ["../data/nowcast/exceed_models/exceed_mid5_x1.5_s0.pt", "../data/nowcast/exceed_models/exceed_mid5_x1.5_s1.pt", "../data/nowcast/exceed_models/exceed_mid5_x1.5_s2.pt"],
+ "extras": []
+}

@@ -1255,6 +1255,17 @@ def generate_trades(sig, m_label, gap, fair, mid_p, tte_p, ybid_p, yask_p, ts_p,
                 continue
             cost = p_entry + sim.fee(p_entry)
             won = int(outc == 1 if side_yes else outc == 0)
+            # fixed-horizon TAKER exit (--exit-h): sell the position at the traded side's bid exit_h seconds
+            # after the entry decision (+ the same latency), paying the taker fee again. Falls back to
+            # settlement (exit_kind "settle") when the tape has no row within 500 ms after the target time.
+            exit_val, exit_px, exit_kind = float(won), float("nan"), "settle"
+            exit_h = float(getattr(a, "exit_h", 0.0) or 0.0)
+            if exit_h > 0:
+                tx = ts_p[k] + exit_h * 1000.0 + a.latency_ms
+                jx = int(np.searchsorted(ts_p, tx, side="left"))
+                if jx < len(ts_p) and (ts_p[jx] - tx) <= 500.0:
+                    exit_px = float(ybid_p[jx] if side_yes else 1.0 - yask_p[jx])
+                    exit_val, exit_kind = exit_px - sim.fee(exit_px), "h"
 
             # closure: first raw |fair-mid| < eps after entry, and who traveled.
             # close_df_fx = the fair move with the ENTRY calibration frozen
@@ -1346,7 +1357,8 @@ def generate_trades(sig, m_label, gap, fair, mid_p, tte_p, ybid_p, yask_p, ts_p,
                 "side_yes": int(side_yes), "gap": float(abs(sig[k])),
                 "fair0": float(fair[k]), "mid0": float(mid_p[k]),
                 "slip": float(p_entry - sig_ask),
-                "cost": float(cost), "won": won, "net": float(won - cost), "outc": int(outc),
+                "cost": float(cost), "won": won, "net": float(exit_val - cost), "outc": int(outc),
+                "exit_px": exit_px, "exit_kind": exit_kind,
                 "dfair1s": dfair1, "dmid1s": dmid1, "ride_share": share,
                 "is_ride": int(is_ride), "close_s": close_s,
                 "close_dfair": close_df, "close_dmid": close_dm,
@@ -1709,7 +1721,7 @@ def _resid_members(m):
         else:
             nn = torch.nn
             net = nn.Sequential(nn.Linear(nf, h), nn.ReLU(), nn.Dropout(dr),
-                                nn.Linear(h, h), nn.ReLU(), nn.Linear(h, 1))
+                                nn.Linear(h, h), nn.ReLU(), nn.Linear(h, int(ck.get("nout", 1))))
         net.load_state_dict(ck["state"]); net.eval()
         out.append((net, np.asarray(ck["mu"], np.float32), np.asarray(ck["sd"], np.float32), ck))
     _RESID_CACHE[key] = out
@@ -1831,19 +1843,32 @@ def resid_fair_series(d, m, a):
             F += [l0[scan], mid[scan] * (1 - mid[scan])]
     X = np.column_stack(F).astype(np.float32)
     valid &= np.isfinite(X).all(1)
-    fair = np.full(len(scan), np.nan)
+    fair = np.full(len(scan), np.nan); sig_x = np.full(len(scan), np.nan)
+    exceed = m["js"].get("kind") == "exceed"
     if valid.any():
-        acc = np.zeros(int(valid.sum()), np.float32)
         with torch.no_grad():
-            for net, mu, sd, ck in members:
-                Z = torch.from_numpy((X[valid] - mu) / sd)
-                acc += net(Z).squeeze(1).numpy()
-        acc /= len(members)
-        if mkt == "residual":
-            acc = acc + l0[scan][valid]
-        elif mkt == "prev":
-            acc = acc + l1[scan][valid]
-        fair[valid] = 1.0 / (1.0 + np.exp(-acc))
+            if exceed:
+                # kind="exceed": two-head exceedance classifier (train_exceed.py --export) on the SAME inputs:
+                # P(up >= X), P(down >= X) at the horizon. Entry signal = P(up) - P(down) (member-averaged),
+                # carried in the gbar slot; there is no fair value, so fair = mid (BCE = market parity, gap = 0).
+                acc = np.zeros((int(valid.sum()), 2), np.float32)
+                for net, mu, sd, ck in members:
+                    Z = torch.from_numpy((X[valid] - mu) / sd)
+                    acc += torch.sigmoid(net(Z)).numpy()
+                acc /= len(members)
+                sig_x[valid] = acc[:, 0] - acc[:, 1]
+                fair[valid] = mid[scan][valid]
+            else:
+                acc = np.zeros(int(valid.sum()), np.float32)
+                for net, mu, sd, ck in members:
+                    Z = torch.from_numpy((X[valid] - mu) / sd)
+                    acc += net(Z).squeeze(1).numpy()
+                acc /= len(members)
+                if mkt == "residual":
+                    acc = acc + l0[scan][valid]
+                elif mkt == "prev":
+                    acc = acc + l1[scan][valid]
+                fair[valid] = 1.0 / (1.0 + np.exp(-acc))
     ts_p, tte_p = ts[scan].astype(d["ts"].dtype), tte[scan]
     ybid_p, yask_p = yb[scan], ya[scan]
     lat = float(a.latency_ms)
@@ -1859,7 +1884,7 @@ def resid_fair_series(d, m, a):
         fill_ybid, fill_yask = ybid_p, yask_p
     ok = ~np.isnan(fair)
     nanv = np.full(int(ok.sum()), np.nan)
-    return (ts_p[ok], tte_p[ok], ybid_p[ok], yask_p[ok], fair[ok], nanv.copy(),
+    return (ts_p[ok], tte_p[ok], ybid_p[ok], yask_p[ok], fair[ok], sig_x[ok],
             fill_ybid[ok], fill_yask[ok], nanv.copy(), nanv.copy(), nanv.copy(),
             perp[scan][ok], np.zeros((int(ok.sum()), 0)), None, None, None)
 
@@ -1868,7 +1893,7 @@ def simulate(m, ev, meta, a):
     """-> (trades, bce_rows). One pass per event; all deltas scored together."""
     if m["js"].get("kind") == "adj":
         return simulate_adj(m, ev, meta, a)
-    if m["js"].get("kind") == "resid":
+    if m["js"].get("kind") in ("resid", "exceed"):
         fwd, rho, b_scale = None, torch.tensor(0.0), 50.0     # no surface, no calibration
     else:
         net_s, mode, clamp = sim.build_surface(m["js"])
@@ -1918,7 +1943,7 @@ def simulate(m, ev, meta, a):
                                     *fsargs, live_cal=None,
                                     fit_stride=a.fit_stride, precomputed=pre[t])
         payloads = []
-    if m["js"].get("kind") == "resid":
+    if m["js"].get("kind") in ("resid", "exceed"):
         for t, strike, outc, lc in elig:
             series[t] = resid_fair_series(ev[t], m, a)
         payloads = []
@@ -2047,7 +2072,11 @@ def simulate(m, ev, meta, a):
         # trades are labeled `<model>.dm<W>` so ONE run reports raw vs demeaned
         # side by side in every section.
         strats = [("", gap, gap, fair, fx_fair)]
-        if a.demean_window > 0:
+        if m["js"].get("kind") == "exceed":
+            # exceedance classifier: the entry signal is P(up) - P(down) (gbar slot), thresholded by --deltas;
+            # gap = 0 everywhere (fair = mid), so the gates/closure carry no information -> run with --gate none
+            strats = [("", gbar, gap, fair, None)]
+        elif a.demean_window > 0:
             strats.append((f".dm{int(a.demean_window)}", gap - gbar, gap, fair, fx_fair))
         # '+adj' twin: fair shifted by the adj head's predicted forward mid
         # move (logit space). Same rows, same fills, same gate machinery — the
@@ -2077,13 +2106,18 @@ def simulate(m, ev, meta, a):
                                spot_p, x_p, cb_p, kr_p, fwd, strike, rho_f,
                                b_scale, cbm, krm, calib_m, fair_p=fair)
         for suffix, sig, g_, f_, fx_ in strats:
-            trades += generate_trades(sig, m["label"] + suffix, g_, f_, mid_p,
-                                      tte_p, ybid_p, yask_p, ts_p, outc, t, a,
-                                      fill_ybid, fill_yask, fx_fair=fx_,
-                                      # live parity: the stale veto only guards
-                                      # 2-price surfaces (rule.rs two_price())
-                                      cb_age_p=cb_age_p if cbm is not None else None,
-                                      pre=pre if suffix == "" else None)
+            # --exit-h: each strat is also run with fixed-horizon taker exits (label suffix .h<sec>); 0 = settlement
+            for h_ in (getattr(a, "exit_hs", None) or [0.0]):
+                a_h = a
+                if h_ > 0:
+                    a_h = _copy.copy(a); a_h.exit_h = h_
+                trades += generate_trades(sig, m["label"] + suffix + (".h%g" % h_ if h_ > 0 else ""), g_, f_, mid_p,
+                                          tte_p, ybid_p, yask_p, ts_p, outc, t, a_h,
+                                          fill_ybid, fill_yask, fx_fair=fx_,
+                                          # live parity: the stale veto only guards
+                                          # 2-price surfaces (rule.rs two_price())
+                                          cb_age_p=cb_age_p if cbm is not None else None,
+                                          pre=pre if suffix == "" else None)
         # row-universe gate grid: same fair series, the REAL episode gate per
         # cell. fx_fair=None: the closure counterfactual columns are not
         # needed for cell RANKING and cost a torch call per trade.
@@ -2141,6 +2175,7 @@ def report(trades, bce_rows, a, models):
         labels.append(m["label"])
         labels += sorted(l for l in seen if l.startswith(m["label"] + ".dm"))
         labels += sorted(l for l in seen if l.startswith(m["label"] + "+adj"))
+        labels += sorted(l for l in seen if l.startswith(m["label"] + ".h"))      # --exit-h variants
 
     lat = a.latency_ms > 0
     for tag, T in panels(trades, a.fresh_from):
@@ -2531,6 +2566,10 @@ def main():
                         "(trader-events.log extract) and use its (db,dr) per boundary "
                         "instead of refitting offline; events live never calibrated "
                         "are skipped")
+    p.add_argument("--exit-h", default="", metavar="SEC[,SEC]",
+                   help="also run every entry strategy with a fixed-horizon TAKER exit (sell at the bid "
+                        "SEC s after entry + latency, fee again; label suffix .h<SEC>); 0 = settlement. "
+                        "Comma list runs several; default = settlement only")
     p.add_argument("--close-cap", type=float, default=0.0, metavar="SECONDS",
                    help="also measure fair/mid moves at min(closure, cap) — a fixed "
                         "horizon uncorrelated with the endogenous closure time; "
@@ -2609,6 +2648,8 @@ def main():
     a.misses = []   # signals blocked by the chase cap (post-latency ask ran away)
     a.vetoes = []   # trade-only vetoes (stale-signal / disarm-cooldown)
     a.deltas = [float(x) for x in a.deltas.split(",")]
+    a.exit_hs = [float(x) for x in a.exit_h.split(",")] if a.exit_h else [0.0]
+    a.exit_h = 0.0
     a.gate_grid_cells = []
     if a.gate_grid:
         gg = {}
