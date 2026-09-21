@@ -20,6 +20,9 @@ ap.add_argument("--seed", type=int, default=0); ap.add_argument("--epochs", type
 ap.add_argument("--hidden", type=int, default=256); ap.add_argument("--lr", type=float, default=1e-3); ap.add_argument("--dropout", type=float, default=0.1)
 ap.add_argument("--ctx-only", action="store_true"); ap.add_argument("--tag", default="ex"); ap.add_argument("--save-pred", default="")
 ap.add_argument("--tte-min", type=float, default=60); ap.add_argument("--tte-max", type=float, default=300)
+ap.add_argument("--data", default="midmove_v10", help="row dataset dir under the scratchpad (midmove_v11 has the coinbase history + sigma_cb)")
+ap.add_argument("--cb", action="store_true", help="add the COINBASE mid lag history (10 lags / sigma_cb) and sigma_cb to the inputs (needs --data midmove_v11)")
+ap.add_argument("--ks", default="0.5,1,5", help="top-k%% cuts for the precision columns")
 a = ap.parse_args()
 torch.set_num_threads(4); torch.manual_seed(a.seed); np.random.seed(a.seed)
 SP = r"C:/Users/fatli/AppData/Local/Temp/claude/e--poly-crypto-trader/0ed64f57-c300-45f3-b675-113fb239783c/scratchpad"
@@ -47,6 +50,13 @@ def load(paths):
         if not a.ctx_only:
             mh = z["mh"][sel][:, LAGS - 1].astype(np.float32)
             F.append(lg(mh) - l0[:, None]); F.append(z["ph"][sel][:, LAGS - 1].astype(np.float32) / sig[:, None])
+            if a.cb:
+                if "ch" in z.files:
+                    ch, sig_cb = z["ch"][sel], np.maximum(z["ctx"][sel, 6], 1.25)
+                else:   # v10 rows: coinbase history from the v11-derived side-file (align_v11.py; keyed by ticker+ts)
+                    zc = np.load(os.path.join(SP, "midmove_v10_cb", os.path.basename(p).replace(".npz", ".cb.npz")))
+                    ch, sig_cb = zc["ch"][sel], np.maximum(zc["sig_cb"][sel], 1.25)
+                F.append(ch[:, LAGS - 1].astype(np.float32) / sig_cb[:, None]); F.append(sig_cb[:, None].astype(np.float32))
             mx = z["mx"][sel]
             for g, col, scale in (("kbs", 0, 1), ("kas", 1, 1), ("kim", 2, 1), ("kmi", 3, 100), ("pbs", 4, 1), ("pas", 5, 1)):
                 if g in groups:
@@ -62,7 +72,7 @@ def load(paths):
     return np.concatenate(X), np.concatenate(MID), np.concatenate(FUT), np.concatenate(MK)
 
 
-days = sorted(glob.glob(os.path.join(SP, "midmove_v10", "*.npz")))
+days = sorted(glob.glob(os.path.join(SP, a.data, "*.npz")))
 split = {"tr": [], "va": [], "te": []}
 for p in days:
     d = os.path.basename(p)[:10]
@@ -72,7 +82,8 @@ mu, sd = D["tr"][0].mean(0), D["tr"][0].std(0) + 1e-6
 for k in D:
     D[k][0][:] = (D[k][0] - mu) / sd
 NF = D["tr"][0].shape[1]
-print("features %d (%s) | rows tr %d va %d te %d" % (NF, "ctx-only" if a.ctx_only else "standard 43", len(D["tr"][0]), len(D["va"][0]), len(D["te"][0])), flush=True)
+KS = [float(k) for k in a.ks.split(",")]
+print("features %d (%s%s, data %s) | rows tr %d va %d te %d" % (NF, "ctx-only" if a.ctx_only else "standard 43", " + cb" if a.cb else "", a.data, len(D["tr"][0]), len(D["va"][0]), len(D["te"][0])), flush=True)
 
 
 def labels(k, h, x):
@@ -100,7 +111,7 @@ def top_bucket(p, y, mv, q=0.9):
     return 100 * y[m].mean(), mv[m].mean(), m.sum()
 
 
-print("%-5s %-4s | %-9s | %-31s | %-31s | %-22s | %s" % ("X", "h", "base% up/dn", "AUC up VAL/TEST", "AUC down VAL/TEST", "top-decile UP: rate%, move", "top-decile DOWN: rate%, move"))
+print("%-5s %-4s | %-11s | %-15s | %-15s | %-26s | %-26s | %s" % ("X", "h", "base% up/dn", "AUC up VAL/TEST", "AUC dn VAL/TEST", "PRECISION up @ top " + "/".join("%g%%" % k for k in KS) + " (VAL | TEST)", "PRECISION dn (VAL | TEST)", "top-decile move up / dn"))
 for h in HS:
     for x in XS:
         oktr, _, ytr = labels("tr", h, x); okva, mvva, yva = labels("va", h, x); okte, mvte, yte = labels("te", h, x)
@@ -124,8 +135,10 @@ for h in HS:
         auc = lambda y, p: roc_auc_score(y, p) if 0 < y.mean() < 1 else float("nan")
         au_v, au_t = auc(yv[:, 0], pva[:, 0]), auc(yt[:, 0], pte[:, 0]); ad_v, ad_t = auc(yv[:, 1], pva[:, 1]), auc(yt[:, 1], pte[:, 1])
         ru, mu_, nu = top_bucket(pte[:, 0], yt[:, 0], mv_t); rd, md_, nd = top_bucket(pte[:, 1], yt[:, 1], -mv_t)
-        print("%-5g %-4s | %4.1f / %4.1f | %.3f / %.3f (base %.3f)      | %.3f / %.3f                  | %5.1f%% (base %4.1f%%), %+5.2fc | %5.1f%% (base %4.1f%%), %+5.2fc" % (
-            x, HNAME[h], 100 * yt[:, 0].mean(), 100 * yt[:, 1].mean(), au_v, au_t, 0.5, ad_v, ad_t, ru, 100 * yt[:, 0].mean(), mu_, rd, 100 * yt[:, 1].mean(), md_), flush=True)
+        def prec(p_, y_):
+            return "/".join("%2.0f" % (100 * y_[p_ >= np.quantile(p_, 1 - k / 100)].mean()) for k in KS)
+        print("%-5g %-4s | %4.1f / %4.1f | %.3f / %.3f   | %.3f / %.3f   | %-12s | %-12s | %-12s | %-12s | %+5.2fc / %+5.2fc" % (
+            x, HNAME[h], 100 * yt[:, 0].mean(), 100 * yt[:, 1].mean(), au_v, au_t, ad_v, ad_t, prec(pva[:, 0], yv[:, 0]), prec(pte[:, 0], yt[:, 0]), prec(pva[:, 1], yv[:, 1]), prec(pte[:, 1], yt[:, 1]), mu_, md_), flush=True)
         if a.save_pred:
             os.makedirs(a.save_pred, exist_ok=True)
             np.savez_compressed(os.path.join(a.save_pred, "%s_%s_x%g_s%d.npz" % (a.tag, h, x, a.seed)), p_va=predict(net, "va"), p_te=predict(net, "te"), okva=okva, okte=okte)
