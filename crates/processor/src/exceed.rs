@@ -711,6 +711,18 @@ impl ExceedRule {
             st.last_eval_ns = now;
         }
         self.n_eval += 1;
+        // periodic stats (60 s), BEFORE the validity check so an all-invalid state is visible:
+        // evaluation/validity counts, σ, lake feed counters
+        if now - self.last_stat_ns >= 60_000_000_000 {
+            if self.last_stat_ns != 0 {
+                tracing::info!(
+                    target: "exceed",
+                    "stats evals={} invalid={} signals={} sigma={:.3} lake_depth={} lake_vol={} tracked={}",
+                    self.n_eval, self.n_invalid, self.n_sig, self.hist.sigma(), self.lake.n_depth, self.lake.n_vol, self.evs.len()
+                );
+            }
+            self.last_stat_ns = now;
+        }
         let mid = 0.5 * (ybid + yask);
         let x = match self.features(inst, now, tte_s, ybid, yask, ybs, yas, perp_now, pbs, pas) {
             Some(x) => x,
@@ -722,18 +734,6 @@ impl ExceedRule {
         let (pup, pdn) = self.model.score(&x);
         let s = pup - pdn;
         let sig = if self.in_region(mid) { s } else { 0.0 }; // harness: signal zeroed outside the region
-
-        // periodic stats (60 s): evaluation/validity counts, σ, lake feed counters
-        if now - self.last_stat_ns >= 60_000_000_000 {
-            if self.last_stat_ns != 0 {
-                tracing::info!(
-                    target: "exceed",
-                    "stats evals={} invalid={} signals={} sigma={:.3} lake_depth={} lake_vol={} tracked={}",
-                    self.n_eval, self.n_invalid, self.n_sig, self.hist.sigma(), self.lake.n_depth, self.lake.n_vol, self.evs.len()
-                );
-            }
-            self.last_stat_ns = now;
-        }
         let cfg_log_ns = (self.cfg.log_every_s * 1e9) as i64;
         let cfg_feat_ns = (self.cfg.feat_log_every_s * 1e9) as i64;
         let cut = self.cfg.cut;
