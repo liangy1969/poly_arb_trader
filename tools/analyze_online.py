@@ -1034,6 +1034,10 @@ def generate_trades(sig, m_label, gap, fair, mid_p, tte_p, ybid_p, yask_p, ts_p,
     elif getattr(a, "px_band", ""):
         lo, hi = (float(x) for x in a.px_band.split(","))
         sig = np.where((mid_p >= lo) & (mid_p <= hi), sig, 0.0)
+    # stale-book guard (--entry-max-spread): a half-updated book (one side pulled, the other not yet) shows as a
+    # wide spread; zero the signal there so no crossing can fire on it
+    if getattr(a, "entry_max_spread", 0.0) > 0:
+        sig = np.where((yask_p - ybid_p) <= a.entry_max_spread + 1e-12, sig, 0.0)
     dfair_arr = dmid_arr = None
     if a.trigger == "move":
         # vectorized 1s-lookback moves: youngest j with tte_j >= tte_k + 1s
@@ -1172,7 +1176,9 @@ def generate_trades(sig, m_label, gap, fair, mid_p, tte_p, ybid_p, yask_p, ts_p,
                     if not ok:
                         _ungate(); k += 1
                         continue
-                if a.gate == "stable":
+                if a.gate in ("stable", "quiet"):
+                    # "quiet" = the market-quiet half alone (mid range <= stab_max_c over the window, no fair
+                    # condition) — for signal models whose fair IS the mid (kind=exceed)
                     # market-STABILITY gate: the mid must have been quiet (range
                     # <= stab_max_c) over the past stab_window seconds while the
                     # FAIR created the gap (moved >= open_min toward the trade
@@ -1190,7 +1196,7 @@ def generate_trades(sig, m_label, gap, fair, mid_p, tte_p, ybid_p, yask_p, ts_p,
                             if math.isnan(fair_then_w):
                                 fair_then_w = fair[jw]
                             ok = (mrP[k] <= a.stab_max_c
-                                  and s * (fair[k] - fair_then_w) >= open_eff)
+                                  and (a.gate == "quiet" or s * (fair[k] - fair_then_w) >= open_eff))
                     else:
                         jw = k - 1
                         while jw > 0 and (tte_p[jw] - tte_p[k]) < a.stab_window and (k - jw) < 800:
@@ -1203,7 +1209,7 @@ def generate_trades(sig, m_label, gap, fair, mid_p, tte_p, ybid_p, yask_p, ts_p,
                             if math.isnan(fair_then_w):
                                 fair_then_w = fair[jw]
                             ok = (mrange <= a.stab_max_c
-                                  and s * (fair[k] - fair_then_w) >= open_eff)
+                                  and (a.gate == "quiet" or s * (fair[k] - fair_then_w) >= open_eff))
                     if not ok:
                         _ungate(); k += 1
                         continue
@@ -1238,12 +1244,16 @@ def generate_trades(sig, m_label, gap, fair, mid_p, tte_p, ybid_p, yask_p, ts_p,
                 # (never below the flat chase_c) — a big model-market gap
                 # justifies paying up; a marginal one does not.
                 chase_lim = max(a.chase_c, a.chase_frac * abs(sig[k])) if a.chase_frac > 0 else a.chase_c
-                if post_ask > sig_ask + chase_lim + 1e-9:
+                # --max-improve-c: a post-latency ask far BELOW the signal ask means the resting side was pulled
+                # and the signal was computed on a book that no longer exists — refuse the "improvement" (miss)
+                too_good = getattr(a, "max_improve", 0.0) > 0 and post_ask < sig_ask - a.max_improve - 1e-9
+                if post_ask > sig_ask + chase_lim + 1e-9 or too_good:
                     a.misses.append({
                         "model": m_label, "delta": dl,
                         "pbucket": price_bucket_of(float(mid_p[k])),
                         "date": utc_date(ts_p[k]), "ticker": t,
                         "tte": float(tte_p[k]), "bucket": bucket_of(tte_p[k]),
+                        "why": "improve" if too_good else "chase",
                     })
                     k += 1
                     continue
@@ -2101,7 +2111,7 @@ def simulate(m, ev, meta, a):
         # replacing per-crossing scalar walks + torch calls (the 18h/model
         # sink of the first row-universe grid run).
         wins_needed = {a.lookback_s}
-        if a.gate == "stable":
+        if a.gate in ("stable", "quiet"):
             wins_needed.add(a.stab_window)
         if a.gate == "ride":
             wins_needed.update(lb_ for _, _, lb_ in getattr(a, "gate_grid_cells", []))
@@ -2509,7 +2519,12 @@ def main():
                         "this window (s), the mean recomputed with the current "
                         "params at 1s resolution (fire on deviations from the "
                         "standing bias, not the bias itself; 0 = off/raw gap)")
-    p.add_argument("--gate", choices=("ride", "fade", "none", "overreact", "stable"), default="ride",
+    p.add_argument("--entry-max-spread", type=float, default=0.0, metavar="PRICE",
+                   help="stale-book guard: no crossing can fire on a row whose YES spread exceeds this (0 = off)")
+    p.add_argument("--max-improve-c", dest="max_improve", type=float, default=0.0, metavar="PRICE",
+                   help="with latency: MISS (refuse) a fill whose post-latency ask is more than this BELOW the "
+                        "signal ask — the resting side was pulled, the signal is stale (0 = off)")
+    p.add_argument("--gate", choices=("ride", "fade", "none", "overreact", "stable", "quiet"), default="ride",
                    help="ride = only gaps opened by the model (share>ride-share); "
                         "overreact = fade a market overshoot (gap flipped past fair, "
                         "mid moved >> fair, same direction)")
@@ -2665,9 +2680,9 @@ def main():
         for part in a.gate_grid.split(";"):
             k, v = part.split("=")
             gg[k.strip()] = [float(x) for x in v.split(",")]
-        if a.gate == "stable":
+        if a.gate in ("stable", "quiet"):
             a.gate_grid_cells = [(op / 100.0, w, rg / 100.0)
-                                 for op in gg["open"] for w in gg["win"]
+                                 for op in gg.get("open", [0.0]) for w in gg["win"]
                                  for rg in gg["rng"]]
         elif a.gate == "ride":
             # (ride_open, ride_share, lookback_s): fire when the 1s move is
