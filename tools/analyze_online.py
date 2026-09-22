@@ -1728,7 +1728,7 @@ def _resid_members(m):
     return out
 
 
-def resid_fair_series(d, m, a):
+def resid_fair_series(d, m, a, ticker=None):
     """fair_series-compatible 16-tuple for kind="resid" (dbs/drs NaN)."""
     members = _resid_members(m)
     spec = members[0][3]
@@ -1858,6 +1858,11 @@ def resid_fair_series(d, m, a):
                 acc /= len(members)
                 sig_x[valid] = acc[:, 0] - acc[:, 1]
                 fair[valid] = mid[scan][valid]
+                if getattr(a, "dump_exceed", ""):
+                    # live-parity dump: every valid scan row's inputs + score (joined to the trader's
+                    # `exceed`/`exceedfeat` log rows by ticker + ts)
+                    a.exceed_rows.append((ticker or "", ts[scan][valid], tte[scan][valid], mid[scan][valid],
+                                          acc[:, 0].copy(), acc[:, 1].copy(), X[valid].copy()))
             else:
                 acc = np.zeros(int(valid.sum()), np.float32)
                 for net, mu, sd, ck in members:
@@ -1945,7 +1950,7 @@ def simulate(m, ev, meta, a):
         payloads = []
     if m["js"].get("kind") in ("resid", "exceed"):
         for t, strike, outc, lc in elig:
-            series[t] = resid_fair_series(ev[t], m, a)
+            series[t] = resid_fair_series(ev[t], m, a, ticker=t)
         payloads = []
     jobs = getattr(a, "jobs", 1)
     if jobs > 1 and len(payloads) > 1:
@@ -2630,7 +2635,11 @@ def main():
     p.add_argument("--dump-fair", default="", metavar="PATH",
                    help="also write the causal fair series (ticker,ts_ms,tte_s,"
                         "fair,mid) here — for replay-parity checks")
+    p.add_argument("--dump-exceed", default="", metavar="PATH",
+                   help="kind=exceed: write every valid scan row's inputs + score (ticker,ts_ms,tte_s,mid,"
+                        "s,p_up,p_dn,x0..) as .npz — the live-parity dump vs the trader's exceed/exceedfeat log")
     a = p.parse_args()
+    a.exceed_rows = []
 
     # fit sample resolution -> scan-grid stride (grid = 50ms * SCAN_STRIDE)
     a.fit_stride = max(1, round(a.fit_sample_ms / (50.0 * SCAN_STRIDE)))
@@ -2748,6 +2757,13 @@ def main():
     gap_report(a, models)
     event_calib_report(a, models)
 
+    if a.dump_exceed and a.exceed_rows:
+        tk = np.concatenate([np.full(len(r[1]), r[0]) for r in a.exceed_rows])
+        np.savez_compressed(a.dump_exceed, ticker=tk, ts=np.concatenate([r[1] for r in a.exceed_rows]).astype(np.int64),
+                            tte=np.concatenate([r[2] for r in a.exceed_rows]), mid=np.concatenate([r[3] for r in a.exceed_rows]),
+                            p_up=np.concatenate([r[4] for r in a.exceed_rows]), p_dn=np.concatenate([r[5] for r in a.exceed_rows]),
+                            x=np.concatenate([r[6] for r in a.exceed_rows]))
+        print(f"\n-> {a.dump_exceed} ({len(tk)} exceed rows)")
     if a.dump_fair and a.fair_rows:
         with open(a.dump_fair, "w", newline="") as f:
             w = csv.writer(f)
