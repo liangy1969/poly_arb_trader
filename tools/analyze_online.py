@@ -2141,7 +2141,9 @@ def simulate(m, ev, meta, a):
         # innovation instead of the level. The gate/closure still use the raw
         # fair/gap, exactly as in the base `.dm` strat.
         grid_streams = [("", gap)]
-        if a.demean_window > 0:
+        if m["js"].get("kind") == "exceed":
+            grid_streams = [("", gbar)]          # exceed: the crossings come from the score, gap is 0
+        elif a.demean_window > 0:
             grid_streams = [(".dm%d" % int(a.demean_window), gap - gbar)]
         for op_, c2_, c3_ in getattr(a, "gate_grid_cells", []):
             a2 = _copy.copy(a)
