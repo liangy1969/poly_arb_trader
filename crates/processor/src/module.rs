@@ -31,6 +31,8 @@ pub struct ProcCfg {
     pub ring_horizon_ms: u64,
     /// FairRide strategy config (used when `strategy == "fair_ride"`).
     pub fair_ride: crate::rule::FairRideCfg,
+    /// Exceedance-classifier strategy config (used when `strategy == "exceed"`).
+    pub exceed: crate::exceed::ExceedCfg,
 }
 
 impl Default for ProcCfg {
@@ -50,6 +52,7 @@ impl Default for ProcCfg {
             ring_cap: 512,
             ring_horizon_ms: 5000,
             fair_ride: crate::rule::FairRideCfg::default(),
+            exceed: crate::exceed::ExceedCfg::default(),
         }
     }
 }
@@ -90,6 +93,17 @@ impl Module for Processor {
             let hash = crate::calib::fnv1a(&bytes);
             tracing::info!("fair_ride rule up: model={} hash={:016x}", frc.model_path, hash);
             vec![Box::new(crate::rule::FairRideRule::new(frc, surface, hash))]
+        } else if self.cfg.strategy == "exceed" {
+            let ec = self.cfg.exceed.clone();
+            let bytes = std::fs::read(&ec.model_path)?;
+            let model = crate::exceed::ExceedModel::from_json(std::str::from_utf8(&bytes)?)?;
+            let hash = crate::calib::fnv1a(&bytes);
+            tracing::info!(
+                "exceed rule up: model={} hash={:016x} nf={} cut={} rearm_eps={} px_mode={} [{},{}] tte {}..{}s",
+                ec.model_path, hash, model.nf, ec.cut, ec.rearm_eps, ec.px_mode, ec.px_lo, ec.px_hi,
+                ec.entry_min_tte_s, ec.entry_max_tte_s
+            );
+            vec![Box::new(crate::exceed::ExceedRule::new(ec, model))]
         } else {
             vec![Box::new(PerpMoveRule::new(
                 self.cfg.strategy.clone(),

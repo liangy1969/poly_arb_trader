@@ -2,6 +2,7 @@
 //! engine, and emits `signal.<strategy>` (DESIGN §6).
 
 pub mod calib;
+pub mod exceed;
 pub mod fair;
 pub mod module;
 pub mod ob_feats;
@@ -11,6 +12,7 @@ pub mod state;
 pub mod window;
 
 pub use calib::{CalibCfg, CalibCore, Calibrator};
+pub use exceed::{ExceedCfg, ExceedModel, ExceedRule};
 pub use fair::{FairSurface, FeatureState, FitRow, MAX_EXTRA};
 pub use ob_feats::{
     ObFeats, ObNet, ObNetKind, OB_FEATS, OB_LOGIT_COLS, OB_NLOGIT, OB_W4_FEATS, OB_W_FEATS,

@@ -75,7 +75,11 @@ async fn main() -> anyhow::Result<()> {
                         // ride episode state transitions (arm/disarm/gate-reject/
                         // re-arm w/ margins) — lets a live-vs-sim divergence be read
                         // from the log instead of reconstructed offline.
-                        .with_target("episode", LevelFilter::INFO),
+                        .with_target("episode", LevelFilter::INFO)
+                        // exceedance-classifier rule: per-market score stream + input
+                        // vectors (offline parity vs the harness's kind=exceed rows)
+                        .with_target("exceed", LevelFilter::INFO)
+                        .with_target("exceedfeat", LevelFilter::INFO),
                 );
             tracing_subscriber::registry().with(stdout_layer).with(events_layer).init();
             tracing::info!("trader events -> {events_path} (append; survives relaunches)");
