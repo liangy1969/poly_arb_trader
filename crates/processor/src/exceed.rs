@@ -292,6 +292,24 @@ impl Hist {
         self.yes.remove(inst);
     }
 
+    /// Range (max − min) of the YES mid in force over [now − window, now], including the mid in force at the
+    /// window start and `mid_now` — the harness's quiet-gate range over its 50 ms rows. None when the history
+    /// does not cover the window start (the harness fails closed there too).
+    pub fn mid_range(&self, inst: &str, now: i64, window_ns: i64, mid_now: f64) -> Option<f64> {
+        let ring = self.yes.get(inst)?;
+        let t0 = now - window_ns;
+        let base = at(ring, t0)?;
+        let (mut lo, mut hi) = (base.min(mid_now), base.max(mid_now));
+        for &(ts, m) in ring.iter().rev() {
+            if ts <= t0 {
+                break;
+            }
+            lo = lo.min(m);
+            hi = hi.max(m);
+        }
+        Some(hi - lo)
+    }
+
     pub fn sigma(&self) -> f64 {
         let n = self.c1.len();
         if n < SIG_MIN {
@@ -557,6 +575,11 @@ pub struct ExceedCfg {
     pub eval_min_ms: i64,
     pub log_every_s: f64,
     pub feat_log_every_s: f64,
+    /// QUIET gate (the harness `--gate quiet --stab-window W --stab-max-c R`): a crossing fires only if the YES
+    /// mid's range over the past `quiet_window_s` seconds is ≤ `quiet_max_range` (price units). A rejected
+    /// crossing still consumes the arm (harness default, no --episode-arm). 0 = off.
+    pub quiet_window_s: f64,
+    pub quiet_max_range: f64,
 }
 
 impl Default for ExceedCfg {
@@ -581,6 +604,8 @@ impl Default for ExceedCfg {
             eval_min_ms: 50,
             log_every_s: 1.0,
             feat_log_every_s: 10.0,
+            quiet_window_s: 0.0,
+            quiet_max_range: 0.03,
         }
     }
 }
@@ -593,6 +618,7 @@ struct EvState {
     last_eval_ns: i64,
     last_log_ns: i64,
     last_feat_log_ns: i64,
+    last_gate_log_ns: i64,
 }
 
 pub struct ExceedRule {
@@ -606,6 +632,7 @@ pub struct ExceedRule {
     n_eval: u64,
     n_invalid: u64,
     n_sig: u64,
+    n_gate_rej: u64,
     last_stat_ns: i64,
 }
 
@@ -624,6 +651,7 @@ impl ExceedRule {
             n_eval: 0,
             n_invalid: 0,
             n_sig: 0,
+            n_gate_rej: 0,
             last_stat_ns: 0,
         }
     }
@@ -717,8 +745,8 @@ impl ExceedRule {
             if self.last_stat_ns != 0 {
                 tracing::info!(
                     target: "exceed",
-                    "stats evals={} invalid={} signals={} sigma={:.3} lake_depth={} lake_vol={} tracked={}",
-                    self.n_eval, self.n_invalid, self.n_sig, self.hist.sigma(), self.lake.n_depth, self.lake.n_vol, self.evs.len()
+                    "stats evals={} invalid={} signals={} gate_rej={} sigma={:.3} lake_depth={} lake_vol={} tracked={}",
+                    self.n_eval, self.n_invalid, self.n_sig, self.n_gate_rej, self.hist.sigma(), self.lake.n_depth, self.lake.n_vol, self.evs.len()
                 );
             }
             self.last_stat_ns = now;
@@ -739,6 +767,10 @@ impl ExceedRule {
         let cut = self.cfg.cut;
         let rearm_eps = self.cfg.rearm_eps;
         let max_entries = self.cfg.max_entries_per_event;
+        // quiet gate input: YES mid range over the past window (None = window not covered → fail closed)
+        let quiet_on = self.cfg.quiet_window_s > 0.0;
+        let qrange = if quiet_on { self.hist.mid_range(inst, now, (self.cfg.quiet_window_s * 1e9) as i64, mid) } else { None };
+        let quiet_max = self.cfg.quiet_max_range;
         let st = self.evs.get_mut(inst)?;
         if now - st.last_log_ns >= cfg_log_ns {
             st.last_log_ns = now;
@@ -768,6 +800,23 @@ impl ExceedRule {
         st.armed = false;
         st.disarm_dir = if sig > 0.0 { 1.0 } else { -1.0 };
         let entry_no = st.entries;
+        // QUIET gate: the crossing has consumed the arm (harness semantics without --episode-arm); reject the
+        // fire if the mid was not quiet over the window or the window is not covered by history
+        if quiet_on {
+            let ok = matches!(qrange, Some(r) if r <= quiet_max + 1e-12);
+            if !ok {
+                self.n_gate_rej += 1;
+                if now - st.last_gate_log_ns >= 1_000_000_000 {
+                    st.last_gate_log_ns = now;
+                    tracing::info!(
+                        target: "exceed",
+                        "{} QUIET-REJECT tte={:.1} s={:+.4} mid={:.4} range={} max={:.4} entry#{}",
+                        inst, tte_s, sig, mid, qrange.map(|r| format!("{r:.4}")).unwrap_or_else(|| "n/a".into()), quiet_max, entry_no
+                    );
+                }
+                return None;
+            }
+        }
         self.n_sig += 1;
         let up = sig > 0.0;
         Some(TradeSignal {
@@ -891,6 +940,24 @@ mod tests {
         assert!((x[5] + 8.0).abs() < 1e-12);
         // lag beyond the first update → None
         assert!(h.hist_block("k", now, &[30], lg(0.60), 110.0, &mut Vec::new()).is_none());
+    }
+
+    #[test]
+    fn quiet_range_over_window() {
+        let mut h = Hist::new();
+        let t0 = 1_000_000_000_000i64;
+        h.on_yes("k", t0, 0.50);
+        h.on_yes("k", t0 + 1_000_000_000, 0.53);
+        h.on_yes("k", t0 + 1_400_000_000, 0.51);
+        let w = 500_000_000; // 0.5 s
+        // now = t0+1.6s: window [1.1s, 1.6s]; mid in force at 1.1s = 0.53, update 0.51 at 1.4s, now 0.52 → range 0.02
+        let r = h.mid_range("k", t0 + 1_600_000_000, w, 0.52).unwrap();
+        assert!((r - 0.02).abs() < 1e-12, "range {r}");
+        // now = t0+2.5s: window [2.0, 2.5]; in force 0.51, no updates, now 0.51 → 0
+        assert!(h.mid_range("k", t0 + 2_500_000_000, w, 0.51).unwrap().abs() < 1e-12);
+        // window start before the first update → None (fail closed)
+        assert!(h.mid_range("k", t0 + 200_000_000, w, 0.50).is_none());
+        assert!(h.mid_range("zzz", t0 + 2_500_000_000, w, 0.5).is_none());
     }
 
     #[test]

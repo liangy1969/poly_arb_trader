@@ -99,9 +99,9 @@ impl Module for Processor {
             let model = crate::exceed::ExceedModel::from_json(std::str::from_utf8(&bytes)?)?;
             let hash = crate::calib::fnv1a(&bytes);
             tracing::info!(
-                "exceed rule up: model={} hash={:016x} nf={} cut={} rearm_eps={} px_mode={} [{},{}] tte {}..{}s",
+                "exceed rule up: model={} hash={:016x} nf={} cut={} rearm_eps={} px_mode={} [{},{}] tte {}..{}s eval_min_ms={} quiet={}s/{}",
                 ec.model_path, hash, model.nf, ec.cut, ec.rearm_eps, ec.px_mode, ec.px_lo, ec.px_hi,
-                ec.entry_min_tte_s, ec.entry_max_tte_s
+                ec.entry_min_tte_s, ec.entry_max_tte_s, ec.eval_min_ms, ec.quiet_window_s, ec.quiet_max_range
             );
             vec![Box::new(crate::exceed::ExceedRule::new(ec, model))]
         } else {
