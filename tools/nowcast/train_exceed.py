@@ -24,6 +24,7 @@ ap.add_argument("--data", default="midmove_v10", help="row dataset dir under the
 ap.add_argument("--cb", action="store_true", help="add the COINBASE mid lag history (10 lags / sigma_cb) and sigma_cb to the inputs (needs --data midmove_v11)")
 ap.add_argument("--ks", default="0.5,1,5", help="top-k%% cuts for the precision columns")
 ap.add_argument("--export", default="", help="save each cell's net as a harness checkpoint DIR/exceed_<h>_x<X>_s<seed>.pt (analyze_online kind=exceed; not with --cb)")
+ap.add_argument("--ba", action="store_true", help="BID/ASK inputs instead of the mid: the 10 mid-logit lags become 10 bid-logit + 10 ask-logit lags (bid = mid - spread/2, ask = mid + spread/2 from the v10 mh/sh histories) and the ctx carries logit(bid), logit(ask) instead of logit(mid); label unchanged")
 a = ap.parse_args()
 torch.set_num_threads(4); torch.manual_seed(a.seed); np.random.seed(a.seed)
 SP = r"C:/Users/fatli/AppData/Local/Temp/claude/e--poly-crypto-trader/0ed64f57-c300-45f3-b675-113fb239783c/scratchpad"
@@ -48,9 +49,15 @@ def load(paths):
         if len(sel) == 0:
             continue
         mid0, sig, spr = z["ctx"][sel, 0], z["ctx"][sel, 2], z["ctx"][sel, 3]; l0 = lg(mid0); F = []
+        bid0, ask0 = z["ctx"][sel, 4], z["ctx"][sel, 5]
         if not a.ctx_only:
             mh = z["mh"][sel][:, LAGS - 1].astype(np.float32)
-            F.append(lg(mh) - l0[:, None]); F.append(z["ph"][sel][:, LAGS - 1].astype(np.float32) / sig[:, None])
+            if a.ba:
+                sh = z["sh"][sel][:, LAGS - 1].astype(np.float32)
+                F.append(lg(mh - 0.5 * sh) - lg(bid0)[:, None]); F.append(lg(mh + 0.5 * sh) - lg(ask0)[:, None])
+            else:
+                F.append(lg(mh) - l0[:, None])
+            F.append(z["ph"][sel][:, LAGS - 1].astype(np.float32) / sig[:, None])
             if a.cb:
                 if "ch" in z.files:
                     ch, sig_cb = z["ch"][sel], np.maximum(z["ctx"][sel, 6], 1.25)
@@ -65,7 +72,10 @@ def load(paths):
             zl = np.load(os.path.join(SP, "midmove_v10_lake", os.path.basename(p).replace(".npz", ".lake.npz")))
             ln = [str(x) for x in zl["names"]]; want = [i for i, nm in enumerate(ln) if ("lf_" + nm) in groups]
             F.append(zl["lk"][sel][:, want].astype(np.float32))
-        F.append(np.column_stack([np.log(np.maximum(tte[sel], 1)), sig, 100 * spr, l0, mid0 * (1 - mid0)]))
+        if a.ba:
+            F.append(np.column_stack([np.log(np.maximum(tte[sel], 1)), sig, 100 * spr, lg(bid0), lg(ask0), mid0 * (1 - mid0)]))
+        else:
+            F.append(np.column_stack([np.log(np.maximum(tte[sel], 1)), sig, 100 * spr, l0, mid0 * (1 - mid0)]))
         fut4 = z["fut"][sel].reshape(len(sel), 4, 3)[:, :, 0]
         fp = os.path.join(SP, "midmove_v10_fut", os.path.basename(p).replace(".npz", ".fut.npz"))
         m3 = np.load(fp)["mid3s"][sel].astype(np.float32)
@@ -84,7 +94,7 @@ for k in D:
     D[k][0][:] = (D[k][0] - mu) / sd
 NF = D["tr"][0].shape[1]
 KS = [float(k) for k in a.ks.split(",")]
-print("features %d (%s%s, data %s) | rows tr %d va %d te %d" % (NF, "ctx-only" if a.ctx_only else "standard 43", " + cb" if a.cb else "", a.data, len(D["tr"][0]), len(D["va"][0]), len(D["te"][0])), flush=True)
+print("features %d (%s%s%s, data %s) | rows tr %d va %d te %d" % (NF, "ctx-only" if a.ctx_only else "standard 43", " + cb" if a.cb else "", " BID/ASK inputs" if a.ba else "", a.data, len(D["tr"][0]), len(D["va"][0]), len(D["te"][0])), flush=True)
 
 
 def labels(k, h, x):
@@ -143,7 +153,7 @@ for h in HS:
         if a.save_pred:
             os.makedirs(a.save_pred, exist_ok=True)
             np.savez_compressed(os.path.join(a.save_pred, "%s_%s_x%g_s%d.npz" % (a.tag, h, x, a.seed)), p_va=predict(net, "va"), p_te=predict(net, "te"), okva=okva, okte=okte)
-        if a.export and not a.cb and not a.ctx_only:
+        if a.export and not a.cb and not a.ctx_only and not a.ba:
             os.makedirs(a.export, exist_ok=True)
             torch.save({"state": net.state_dict(), "mu": mu.astype(np.float32), "sd": sd.astype(np.float32), "arch": "mlp", "hidden": a.hidden, "dropout": a.dropout,
                         "feat": FEAT, "lookback": 6.0, "market": "residual", "target": h, "x": x, "nf": NF, "nout": 2, "use": LAGS.tolist(), "kind": "exceed"},
