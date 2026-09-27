@@ -58,6 +58,9 @@ struct ExceedJson {
     lags: Vec<usize>,
     #[serde(default)]
     lake: Vec<String>,
+    /// perp lag inputs in raw dollars (no ÷σ) — train_exceed.py --perp-raw
+    #[serde(default)]
+    perp_raw: bool,
     mu: Vec<f64>,
     sd: Vec<f64>,
     members: Vec<MemberJson>,
@@ -104,6 +107,8 @@ pub struct ExceedModel {
     pub book: Vec<String>,
     /// lake features in the model's input order (the bars-file column order)
     pub lake: Vec<String>,
+    /// perp lag inputs in raw dollars (no ÷σ)
+    pub perp_raw: bool,
     pub nf: usize,
     mu: Vec<f64>,
     sd: Vec<f64>,
@@ -168,7 +173,7 @@ impl ExceedModel {
             anyhow::ensure!(dims.last().map(|d| d.1) == Some(2), "exceed: member output dim != 2");
             members.push(Mlp { w, b, dims });
         }
-        Ok(ExceedModel { lags: js.lags, book, lake: js.lake, nf, mu: js.mu, sd: js.sd, members })
+        Ok(ExceedModel { lags: js.lags, book, lake: js.lake, perp_raw: js.perp_raw, nf, mu: js.mu, sd: js.sd, members })
     }
 
     /// (P(up ≥ X), P(down ≥ X)) on the RAW feature vector: z-score, member-mean of the sigmoids
@@ -321,7 +326,7 @@ impl Hist {
     }
 
     /// σ + the 2·lags hist block, or None while the histories are incomplete.
-    fn hist_block(&mut self, inst: &str, now: i64, lags: &[usize], l0: f64, perp_now: f64, out: &mut Vec<f64>) -> Option<f64> {
+    fn hist_block(&mut self, inst: &str, now: i64, lags: &[usize], l0: f64, perp_now: f64, perp_raw: bool, out: &mut Vec<f64>) -> Option<f64> {
         if self.pgrid.is_none() || !(perp_now > 0.0) {
             return None;
         }
@@ -332,7 +337,8 @@ impl Hist {
             out.push(lg(at(y, now - GRID_NS * j as i64)?) - l0);
         }
         for &j in lags {
-            out.push((at(&self.perp, now - GRID_NS * j as i64)? - perp_now) / sig);
+            let div = if perp_raw { 1.0 } else { sig };
+            out.push((at(&self.perp, now - GRID_NS * j as i64)? - perp_now) / div);
         }
         Some(sig)
     }
@@ -674,7 +680,7 @@ impl ExceedRule {
         let mid = 0.5 * (ybid + yask);
         let l0 = lg(mid);
         let mut x = Vec::with_capacity(self.model.nf);
-        let sig = self.hist.hist_block(inst, now, &self.model.lags, l0, perp_now, &mut x)?;
+        let sig = self.hist.hist_block(inst, now, &self.model.lags, l0, perp_now, self.model.perp_raw, &mut x)?;
         let ssum = (ybs + yas).max(1e-6);
         for c in &self.model.book {
             x.push(match c.as_str() {
@@ -917,6 +923,25 @@ mod tests {
         assert!(n > 0);
     }
 
+    /// Same torch parity for the raw-dollar perp model, and the perp_raw flag is carried through.
+    #[test]
+    fn exceed_raw_score_matches_torch() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../models/exceed-1s-x1-raw-rs-btc.json");
+        let Ok(text) = std::fs::read_to_string(path) else { return };
+        let js: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let m = ExceedModel::from_json(&text).unwrap();
+        assert!(m.perp_raw, "raw model must set perp_raw");
+        let mut n = 0;
+        for tv in js["test_vectors"].as_array().unwrap() {
+            let x: Vec<f64> = tv["x"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect();
+            let (up, dn) = m.score(&x);
+            let (wu, wd) = (tv["p_up"].as_f64().unwrap(), tv["p_dn"].as_f64().unwrap());
+            assert!((up - wu).abs() < 1e-5 && (dn - wd).abs() < 1e-5, "({up},{dn}) vs torch ({wu},{wd})");
+            n += 1;
+        }
+        assert!(n > 0);
+    }
+
     #[test]
     fn hist_lags_and_sigma() {
         let mut h = Hist::new();
@@ -928,7 +953,7 @@ mod tests {
         h.on_perp(t0 + 3_000_000_000, 110.0);
         let now = t0 + 4_000_000_000;
         let mut x = Vec::new();
-        let sig = h.hist_block("k", now, &[5, 10, 15], lg(0.60), 110.0, &mut x).unwrap();
+        let sig = h.hist_block("k", now, &[5, 10, 15], lg(0.60), 110.0, false, &mut x).unwrap();
         assert_eq!(sig, SIG_FLOOR); // < SIG_MIN grid points
         // mid lags: 1s ago = 0.60, 2s ago = 0.60 (at t0+2s exactly), 3s ago = 0.50
         assert!((x[0] - 0.0).abs() < 1e-12);
@@ -938,8 +963,12 @@ mod tests {
         assert!((x[3] - 0.0).abs() < 1e-12);
         assert!((x[4] + 8.0).abs() < 1e-12);
         assert!((x[5] + 8.0).abs() < 1e-12);
+        // raw-dollar variant: same lags, no ÷σ → (100-110) = -10
+        let mut xr = Vec::new();
+        h.hist_block("k", now, &[5, 10, 15], lg(0.60), 110.0, true, &mut xr).unwrap();
+        assert!((xr[4] + 10.0).abs() < 1e-12 && (xr[5] + 10.0).abs() < 1e-12 && xr[3].abs() < 1e-12);
         // lag beyond the first update → None
-        assert!(h.hist_block("k", now, &[30], lg(0.60), 110.0, &mut Vec::new()).is_none());
+        assert!(h.hist_block("k", now, &[30], lg(0.60), 110.0, false, &mut Vec::new()).is_none());
     }
 
     #[test]

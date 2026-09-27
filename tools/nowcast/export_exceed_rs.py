@@ -20,7 +20,7 @@ for p in cks:
     for li in ("0", "3", "5"):
         layers.append({"w": [[round(float(v), 7) for v in row] for row in st[li + ".weight"].numpy()], "b": [round(float(v), 7) for v in st[li + ".bias"].numpy()]})
     members.append({"layers": layers})
-    s = {k: ck[k] for k in ("feat", "use", "mu", "sd", "nf", "target", "x")}
+    s = {k: ck[k] for k in ("feat", "use", "mu", "sd", "nf", "target", "x")}; s["perp_raw"] = bool(ck.get("perp_raw", False))
     if spec is None:
         spec = s
     else:
@@ -55,7 +55,7 @@ pu, pd_ = torch_score(X)
 tvs = [{"x": [round(float(v), 6) for v in X[i]], "p_up": float(pu[i]), "p_dn": float(pd_[i])} for i in range(len(X))]
 js = {"kind": "exceed", "target": spec["target"], "x": float(spec["x"]),
       "note": "Exceedance classifier for the Rust trader (crates/processor/src/exceed.rs): P(mid+%s - mid >= %gc), P(<= -%gc) on the standard 43 nowcast inputs; %d members (seeds), s = P(up) - P(down). Exported from %s by tools/nowcast/export_exceed_rs.py." % (spec["target"], spec["x"], spec["x"], len(cks), ", ".join(os.path.basename(c) for c in cks)),
-      "feat": spec["feat"], "lags": [int(v) for v in spec["use"]], "lake": lake, "mu": [float(v) for v in mu], "sd": [float(v) for v in sd],
+      "feat": spec["feat"], "lags": [int(v) for v in spec["use"]], "lake": lake, "perp_raw": spec["perp_raw"], "mu": [float(v) for v in mu], "sd": [float(v) for v in sd],
       "members": members, "test_vectors": tvs}
 json.dump(js, open(out, "w"), separators=(",", ":"))
 print("wrote %s: nf %d, lags %s, lake %s, members %d, %.1f MB" % (out, spec["nf"], js["lags"], lake, len(members), os.path.getsize(out) / 1e6))
