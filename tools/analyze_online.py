@@ -1789,9 +1789,10 @@ def resid_fair_series(d, m, a, ticker=None):
         for j in use:
             idx, ok = lagidx(int(j)); valid &= ok[scan]
             F.append(lg(mid[idx[scan]]) - l0[scan])
+        perp_div = 1.0 if spec.get("perp_raw") else sig[scan]      # perp_raw models: dollars, not ÷σ
         for j in use:
             idx, ok = lagidx(int(j)); valid &= ok[scan]
-            F.append((perp[idx[scan]] - perp[scan]) / sig[scan])
+            F.append((perp[idx[scan]] - perp[scan]) / perp_div)
     if "book" in groups:
         F += [np.log1p(ybs[scan]), np.log1p(yas[scan]), imb[scan], 100 * micro[scan],
               np.log1p(pbs[scan]), np.log1p(pas[scan]), pimb[scan]]

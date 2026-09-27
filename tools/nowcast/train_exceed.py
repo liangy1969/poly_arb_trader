@@ -167,8 +167,8 @@ for h in HS:
         if a.save_pred:
             os.makedirs(a.save_pred, exist_ok=True)
             np.savez_compressed(os.path.join(a.save_pred, "%s_%s_x%g_s%d.npz" % (a.tag, h, x, a.seed)), p_va=predict(net, "va"), p_te=predict(net, "te"), okva=okva, okte=okte)
-        if a.export and not a.cb and not a.ctx_only and not a.ba and not a.spr and not a.bam and not a.bam_lags and not a.perp_raw:
+        if a.export and not a.cb and not a.ctx_only and not a.ba and not a.spr and not a.bam and not a.bam_lags:
             os.makedirs(a.export, exist_ok=True)
             torch.save({"state": net.state_dict(), "mu": mu.astype(np.float32), "sd": sd.astype(np.float32), "arch": "mlp", "hidden": a.hidden, "dropout": a.dropout,
-                        "feat": FEAT, "lookback": 6.0, "market": "residual", "target": h, "x": x, "nf": NF, "nout": 2, "use": LAGS.tolist(), "kind": "exceed"},
-                       os.path.join(a.export, "exceed_%s_x%g_s%d.pt" % (h, x, a.seed)))
+                        "feat": FEAT, "lookback": 6.0, "market": "residual", "target": h, "x": x, "nf": NF, "nout": 2, "use": LAGS.tolist(), "kind": "exceed", "perp_raw": bool(a.perp_raw)},
+                       os.path.join(a.export, "exceed%s_%s_x%g_s%d.pt" % ("raw" if a.perp_raw else "", h, x, a.seed)))

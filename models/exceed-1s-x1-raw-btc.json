@@ -1,0 +1,6 @@
+{
+ "kind": "exceed",
+ "note": "Exceedance classifier, RAW-DOLLAR perp variant (train_exceed.py --perp-raw --export): perp lag inputs = perp_lag - perp_now in $, NOT divided by sigma (sigma stays a ctx input; checkpoint spec perp_raw=true, honored by analyze_online). X=1c, 1 s, 3 seeds, standard 43 inputs otherwise. 2026-09-27.",
+ "members": ["../data/nowcast/exceed_models/exceedraw_mid5_x1_s0.pt", "../data/nowcast/exceed_models/exceedraw_mid5_x1_s1.pt", "../data/nowcast/exceed_models/exceedraw_mid5_x1_s2.pt"],
+ "extras": []
+}
