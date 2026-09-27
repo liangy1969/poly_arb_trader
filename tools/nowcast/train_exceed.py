@@ -27,6 +27,7 @@ ap.add_argument("--export", default="", help="save each cell's net as a harness 
 ap.add_argument("--ba", action="store_true", help="BID/ASK inputs instead of the mid: the 10 mid-logit lags become 10 bid-logit + 10 ask-logit lags (bid = mid - spread/2, ask = mid + spread/2 from the v10 mh/sh histories) and the ctx carries logit(bid), logit(ask) instead of logit(mid); label unchanged")
 ap.add_argument("--spr", action="store_true", help="ADD 10 spread-change lags: 100*(spread now - spread at lag j), cents (the side that moved first widens the spread)")
 ap.add_argument("--bam", action="store_true", help="ADD bid/ask MOMENTUM: 10 logit(bid now) - logit(bid at lag j) + 10 for the ask (bid/ask at lag from mh -/+ sh/2); keeps the standard mid lags")
+ap.add_argument("--perp-raw", action="store_true", help="perp lag inputs in raw DOLLARS (perp at lag - perp now), NOT divided by sigma (sigma stays a ctx input)")
 ap.add_argument("--bam-lags", default="", help="ADD bid/ask momentum at ONLY these lags (ticks of 200 ms, e.g. '5' = 1 s -> 2 features)")
 a = ap.parse_args()
 torch.set_num_threads(4); torch.manual_seed(a.seed); np.random.seed(a.seed)
@@ -60,7 +61,7 @@ def load(paths):
                 F.append(lg(mh - 0.5 * sh) - lg(bid0)[:, None]); F.append(lg(mh + 0.5 * sh) - lg(ask0)[:, None])
             else:
                 F.append(lg(mh) - l0[:, None])
-            F.append(z["ph"][sel][:, LAGS - 1].astype(np.float32) / sig[:, None])
+            F.append(z["ph"][sel][:, LAGS - 1].astype(np.float32) / (1.0 if a.perp_raw else sig[:, None]))
             if a.cb:
                 if "ch" in z.files:
                     ch, sig_cb = z["ch"][sel], np.maximum(z["ctx"][sel, 6], 1.25)
@@ -166,7 +167,7 @@ for h in HS:
         if a.save_pred:
             os.makedirs(a.save_pred, exist_ok=True)
             np.savez_compressed(os.path.join(a.save_pred, "%s_%s_x%g_s%d.npz" % (a.tag, h, x, a.seed)), p_va=predict(net, "va"), p_te=predict(net, "te"), okva=okva, okte=okte)
-        if a.export and not a.cb and not a.ctx_only and not a.ba and not a.spr and not a.bam and not a.bam_lags:
+        if a.export and not a.cb and not a.ctx_only and not a.ba and not a.spr and not a.bam and not a.bam_lags and not a.perp_raw:
             os.makedirs(a.export, exist_ok=True)
             torch.save({"state": net.state_dict(), "mu": mu.astype(np.float32), "sd": sd.astype(np.float32), "arch": "mlp", "hidden": a.hidden, "dropout": a.dropout,
                         "feat": FEAT, "lookback": 6.0, "market": "residual", "target": h, "x": x, "nf": NF, "nout": 2, "use": LAGS.tolist(), "kind": "exceed"},
