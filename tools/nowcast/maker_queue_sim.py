@@ -42,6 +42,7 @@ ap.add_argument("--perp-rejoin", type=int, default=1500, help="ms after a perp p
 ap.add_argument("--maxrange", type=float, default=0.0, help="regime gate: quote only when the trailing 60 s mid range <= this (cents); 0 = off")
 ap.add_argument("--flatten", action="store_true", help="exit the net inventory as a TAKER at the touch (fee 0.07 p(1-p)) at tte < 45 s instead of holding to settlement")
 ap.add_argument("--tag", default="", help="write data/nowcast/qsim_<day>_<tag>.parquet (fills) and _mkts.parquet (per-market incl. zero-fill) for maker_days.py")
+ap.add_argument("--theta-pull", type=float, default=None, help="fav policy hysteresis: POST when g > --theta, but keep a resting order until g <= this (default = --theta)")
 ap.add_argument("--stepback", type=float, default=0.0, help="instead of pulling a side flagged against by more than this (cents), rest it ONE TICK behind the touch (early queue at the level the move goes to); 0 = off")
 a = ap.parse_args()
 TTE_LO, TTE_HI = (float(x) for x in a.tte.split(","))
@@ -208,7 +209,7 @@ def sim_market(tk, B, P, Dk):
             gs = gbid[i] if side == BID else -gbid[i]
             adds = (side == BID and q >= 0) or (side == ASK and q <= 0)      # this side would increase |q|
             theta_side = a.theta * max(0.0, 1.0 - abs(q) / a.q) if adds else a.theta
-            want = eligible and not closing and not (adds and abs(q) >= a.q) and not np.isnan(gs) and policy_on(a.policy, gs, theta_side)
+            want = eligible and not closing and not (adds and abs(q) >= a.q) and not np.isnan(gs) and policy_on(a.policy, gs, (a.theta_pull if (s_["on"] and a.policy == "fav" and a.theta_pull is not None) else theta_side))
             if not s_["on"] and t < perp_block[side]:
                 want = False                                             # perp pull cool-down
             if not s_["on"] and lvl > a.max_join:
@@ -307,8 +308,8 @@ def clus(v):
 per_mkt = F.groupby("ticker").agg(n=("qty", "size"), qty=("qty", "sum"), pnl6=("pnl6", "mean"), pnl30=("pnl30", "mean"), pnl_settle_tot=("pnl_settle", lambda x: (x * F.loc[x.index, "qty"]).sum())) if len(F) else pd.DataFrame(columns=["n", "qty", "pnl6", "pnl30", "pnl_settle_tot"])
 tot = per_mkt.reindex(mk).fillna({"n": 0, "qty": 0, "pnl_settle_tot": 0})
 pres_min = np.array([(pres[t][0] + pres[t][1]) / 60000.0 for t in mk])
-print("policy=%s queue=%s size=%g theta=%.2f Q=%g lat %s lone<%g sweep-guard %.2f imb-pull %.2f imb-post %.2f fresh %dms region=%s tte=%s | markets %d" % (
-    a.policy, a.queue, a.size, a.theta, a.q, "measured-dist" if a.lat_dist else "%d/%d ms" % (a.lat_cancel, a.lat_post), a.lone, a.sweep_guard, a.imb_pull, a.imb_post, a.fresh_ms, a.region, a.tte, len(mk)))
+print("policy=%s queue=%s size=%g theta=%.2f theta_pull=%s Q=%g lat %s lone<%g sweep-guard %.2f imb-pull %.2f imb-post %.2f fresh %dms region=%s tte=%s | markets %d" % (
+    a.policy, a.queue, a.size, a.theta, a.theta_pull, a.q, "measured-dist" if a.lat_dist else "%d/%d ms" % (a.lat_cancel, a.lat_post), a.lone, a.sweep_guard, a.imb_pull, a.imb_post, a.fresh_ms, a.region, a.tte, len(mk)))
 nf, tnf, _ = clus(tot["n"]); ntot = int(tot["n"].sum())
 print("fills: total %d | per market %.1f | contracts per market %.2f | side-minutes in book per market %.1f -> fills per side-minute %.2f | actions per market %.0f" % (
     ntot, nf, tot["qty"].mean(), pres_min.mean(), ntot / max(pres_min.sum(), 1e-9), np.mean(list(acts.values()))))
