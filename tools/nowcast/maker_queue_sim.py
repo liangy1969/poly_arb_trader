@@ -11,7 +11,7 @@ skew, R4 asymmetric hysteresis (pull now, re-join after the flag has cleared wit
 touch-move re-join + lone-quote pull. P&L: per fill mark-to-mid at 6/30/60 s; per market the net inventory
 is held to settlement (meta_cache outcome).
 Usage: maker_queue_sim.py DAY DUMP.csv [--policy naive|pull|fav] [--queue back|half] [--size S] [--theta 0.25]
-       [--q 5] [--lat-cancel 300] [--lat-post 150] [--lone 100] [--region 1c|all] [--tte 90,300]"""
+       [--q 5] [--lat-cancel 300] [--lat-post 150] [--lone 100] [--region 1c|all|atm|wings|tails] [--tte 90,300]"""
 import argparse
 import glob
 import json
@@ -185,7 +185,7 @@ def sim_market(tk, B, P, Dk):
                 s_["pend"].append((te + lat("cancel"), "cancel", np.nan)); s_["off_reason"] = "perp"; s_["clear_since"] = None
         for side in (BID, ASK):
             apply_pending(side, t)
-        eligible = (TTE_LO <= tte[i] <= TTE_HI) and (a.region == "all" or (a.region == "1c" and 0.10 <= mid[i] <= 0.90) or (a.region == "atm" and 0.30 <= mid[i] <= 0.70) or (a.region == "wings" and (0.10 <= mid[i] < 0.30 or 0.70 < mid[i] <= 0.90)))
+        eligible = (TTE_LO <= tte[i] <= TTE_HI) and (a.region == "all" or (a.region == "1c" and 0.10 <= mid[i] <= 0.90) or (a.region == "atm" and 0.30 <= mid[i] <= 0.70) or (a.region == "wings" and (0.10 <= mid[i] < 0.30 or 0.70 < mid[i] <= 0.90)) or (a.region == "tails" and (mid[i] < 0.10 or mid[i] > 0.90)))
         if a.maxrange > 0 and rng60[i] > a.maxrange:
             eligible = False                                             # regime gate: too volatile in the last minute
         closing = tte[i] < 45.0
