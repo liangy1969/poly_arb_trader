@@ -311,7 +311,14 @@ async fn resolve_unknown(om: &OrderManager, kv: &KalshiVenue) {
         match kv.signed_get(&format!("/portfolio/orders/{id}"), "").await {
             Ok(v) => {
                 let obj = v.get("order").unwrap_or(&v);
-                if let Some(m) = parse_order(obj) {
+                if let Some(mut m) = parse_order(obj) {
+                    // Force-apply: this by-id fetch IS the current truth. The record's
+                    // local stamp (e.g. a cancel outcome booked with now_ms) is often
+                    // NEWER than the venue's last_updated_ts, so without this the
+                    // update is discarded as stale and the order stays Unknown forever
+                    // (live deadlock 2026-10-04: cancel 26 ms after place -> 404 ->
+                    // Unknown; resolver saw "resting" every second but never applied it).
+                    m.updated_ms = m.updated_ms.max(now_ms());
                     tracing::info!(target: "oms", "resolved {} -> {} filled {:.2}/{:.2}", id, m.status, m.filled, m.initial);
                     om.apply(|st| st.on_order_msg(&m, false));
                 }
