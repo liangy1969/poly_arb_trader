@@ -191,6 +191,7 @@ pub fn key_by_instrument(ev: &Event) -> u64 {
         Payload::TradeRecord(t) => (8, &t.instrument),
         Payload::Position(p) => (9, &p.instrument),
         Payload::Calib(c) => (10, &c.instrument),
+        Payload::Score(s) => (11, &s.instrument),
     };
     let mut h = std::collections::hash_map::DefaultHasher::new();
     tag.hash(&mut h);

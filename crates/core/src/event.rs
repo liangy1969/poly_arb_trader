@@ -31,6 +31,8 @@ pub enum Payload {
     Position(PositionSnapshot),
     /// Online per-event (Δb,Δρ) calibration (FairRide; topic `market.calib.<id>`).
     Calib(CalibUpdate),
+    /// Continuous model score for one market (topic `score.<model>`).
+    Score(ModelScore),
 }
 
 impl Event {

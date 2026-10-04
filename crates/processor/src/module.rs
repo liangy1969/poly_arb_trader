@@ -157,6 +157,14 @@ impl Module for Processor {
                     bus.publish(Event::new(topic, "processor", ts, seq, Payload::Signal(s)));
                     seq += 1;
                 }
+                // Continuous model scores (passive maker input): own topic, no latency
+                // sample; consumers conflate by instrument (only the latest matters).
+                for sc in engine.drain_scores() {
+                    let ts = sc.ts_ns;
+                    let topic = format!("score.{}", sc.model);
+                    bus.publish(Event::new(topic, "processor", ts, seq, Payload::Score(sc)));
+                    seq += 1;
+                }
             }
         });
         self.handle = Some(handle);

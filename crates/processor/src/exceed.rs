@@ -33,7 +33,7 @@ use std::collections::{HashMap, VecDeque};
 use serde::Deserialize;
 
 use arb_core::event::{Event, Payload};
-use arb_core::model::{TradeSignal, Trigger};
+use arb_core::model::{ModelScore, TradeSignal, Trigger};
 
 use crate::rule::Rule;
 use crate::state::MarketState;
@@ -586,6 +586,11 @@ pub struct ExceedCfg {
     /// crossing still consumes the arm (harness default, no --episode-arm). 0 = off.
     pub quiet_window_s: f64,
     pub quiet_max_range: f64,
+    /// Publish every evaluation's score (topic `score.exceed`) while the YES mid is in
+    /// [score_lo, score_hi] — the executor's passive maker quotes off it. Off by default.
+    pub score_publish: bool,
+    pub score_lo: f64,
+    pub score_hi: f64,
 }
 
 impl Default for ExceedCfg {
@@ -612,6 +617,9 @@ impl Default for ExceedCfg {
             feat_log_every_s: 10.0,
             quiet_window_s: 0.0,
             quiet_max_range: 0.03,
+            score_publish: false,
+            score_lo: 0.10,
+            score_hi: 0.90,
         }
     }
 }
@@ -640,6 +648,9 @@ pub struct ExceedRule {
     n_sig: u64,
     n_gate_rej: u64,
     last_stat_ns: i64,
+    /// Scores queued for `drain_scores` (only when `score_publish`).
+    scores: Vec<ModelScore>,
+    n_score: u64,
 }
 
 impl ExceedRule {
@@ -659,6 +670,8 @@ impl ExceedRule {
             n_sig: 0,
             n_gate_rej: 0,
             last_stat_ns: 0,
+            scores: Vec::new(),
+            n_score: 0,
         }
     }
 
@@ -751,8 +764,8 @@ impl ExceedRule {
             if self.last_stat_ns != 0 {
                 tracing::info!(
                     target: "exceed",
-                    "stats evals={} invalid={} signals={} gate_rej={} sigma={:.3} lake_depth={} lake_vol={} tracked={}",
-                    self.n_eval, self.n_invalid, self.n_sig, self.n_gate_rej, self.hist.sigma(), self.lake.n_depth, self.lake.n_vol, self.evs.len()
+                    "stats evals={} invalid={} signals={} gate_rej={} scores={} sigma={:.3} lake_depth={} lake_vol={} tracked={}",
+                    self.n_eval, self.n_invalid, self.n_sig, self.n_gate_rej, self.n_score, self.hist.sigma(), self.lake.n_depth, self.lake.n_vol, self.evs.len()
                 );
             }
             self.last_stat_ns = now;
@@ -767,6 +780,21 @@ impl ExceedRule {
         };
         let (pup, pdn) = self.model.score(&x);
         let s = pup - pdn;
+        if self.cfg.score_publish && mid >= self.cfg.score_lo && mid <= self.cfg.score_hi {
+            self.n_score += 1;
+            self.scores.push(ModelScore {
+                instrument: inst.to_string(),
+                model: "exceed".into(),
+                ts_ns: now,
+                expiry_ns: expiry,
+                s,
+                p_up: pup,
+                p_dn: pdn,
+                mid,
+                best_bid: ybid,
+                best_ask: yask,
+            });
+        }
         let sig = if self.in_region(mid) { s } else { 0.0 }; // harness: signal zeroed outside the region
         let cfg_log_ns = (self.cfg.log_every_s * 1e9) as i64;
         let cfg_feat_ns = (self.cfg.feat_log_every_s * 1e9) as i64;
@@ -849,6 +877,10 @@ impl ExceedRule {
 impl Rule for ExceedRule {
     fn id(&self) -> &str {
         "exceed"
+    }
+
+    fn drain_scores(&mut self) -> Vec<ModelScore> {
+        std::mem::take(&mut self.scores)
     }
 
     fn on_event(&mut self, ev: &Event, state: &MarketState) -> Vec<TradeSignal> {

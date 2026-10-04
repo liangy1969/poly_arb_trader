@@ -69,6 +69,25 @@ pub struct MarketMeta {
 /// Online per-event calibration result from the Calibrator module
 /// (DESIGN_FAIR_RIDE §5): the (Δb, Δρ) the FairRideRule uses to evaluate the
 /// frozen surface for `instrument`.
+/// One model evaluation for a prediction market, published on `score.<model>` for
+/// consumers that need the continuous score rather than discrete fire signals
+/// (the executor's passive maker). `s = p_up − p_dn` is the exceedance classifier's
+/// direction score; `mid` is the YES mid the model saw.
+#[derive(Clone, Debug, Serialize)]
+pub struct ModelScore {
+    /// Target prediction market, YES side (e.g. `kalshi.KXBTC15M-....YES`).
+    pub instrument: String,
+    pub model: String,
+    pub ts_ns: i64,
+    pub expiry_ns: i64,
+    pub s: f64,
+    pub p_up: f64,
+    pub p_dn: f64,
+    pub mid: f64,
+    pub best_bid: f64,
+    pub best_ask: f64,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct CalibUpdate {
     /// Target prediction market (e.g. `kalshi.KXBTC15M-....YES`).

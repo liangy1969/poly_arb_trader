@@ -306,6 +306,33 @@ impl Module for Executor {
 
         let slots: Slots = Arc::new(Mutex::new(HashMap::new()));
         let entries_halted = Arc::new(AtomicBool::new(false));
+        // Per-market exposure shared by the taker path and the passive maker
+        // (the one-position-per-event rule spans both).
+        let exposure = crate::maker::SharedExposure::default();
+
+        // Passive maker (10c–90c band): quotes off `score.#`; live mode places
+        // through the order manager. Shadow mode only logs its decisions.
+        if self.cfg.maker.enabled {
+            if !self.cfg.maker.shadow && self.order_manager.is_none() {
+                anyhow::bail!("maker.enabled with shadow=false requires executor.order_manager.enabled on the kalshi adapter (order truth)");
+            }
+            let ctx = crate::maker::MakerCtx {
+                cfg: self.cfg.maker.clone(),
+                size: self.cfg.sizing.size_shares,
+                cap: self.cfg.sizing.max_open_units * self.cfg.sizing.size_shares,
+                params: MarketParams {
+                    min_order_size: self.cfg.sim.min_order_size,
+                    tick_size: self.cfg.sim.tick_size,
+                    fee_rate: self.cfg.sim.fee_rate,
+                },
+                om: self.order_manager.clone(),
+                exposure: exposure.clone(),
+                halted: entries_halted.clone(),
+            };
+            let score_sub = bus.subscribe("score.#", 2048, Policy::Conflate(key_by_instrument));
+            let book_sub = bus.subscribe(&format!("market.{}.#", spec.prefix), 4096, Policy::Conflate(key_by_instrument));
+            self.handles.push(crate::maker::spawn(ctx, score_sub, book_sub));
+        }
 
         // Real-balance kill switch: poll the venue's ACTUAL balance (never the
         // executor's self-reported P&L — that hid the incident's losses) and
@@ -443,6 +470,7 @@ impl Module for Executor {
             slots,
             fill_tx,
             entries_halted,
+            exposure,
         };
         self.handles.push(tokio::spawn(async move {
             let mut sigsub = sigsub;
@@ -518,6 +546,8 @@ struct Engine {
     fill_tx: FillSender,
     /// Latched by the real-balance watchdog: halt NEW entries (exits keep running).
     entries_halted: Arc<AtomicBool>,
+    /// Per-market exposure shared with the passive maker (one-position rule).
+    exposure: crate::maker::SharedExposure,
 }
 
 /// One entry registered with the hold-period sampler: it samples the realized
@@ -682,6 +712,9 @@ impl Engine {
                 self.report("settlement", &inst, "Settled", &format!("winner={winner}"));
                 self.emit_position(&inst);
                 self.pm.end_trade(now_ns(), self.cfg.risk.cooldown_ms);
+                // settled → flat: unblock the maker's one-position view
+                let market = market_id_of(&inst).unwrap_or("").to_string();
+                self.publish_taker_net(&market, &inst);
             }
         }
     }
@@ -724,6 +757,16 @@ impl Engine {
             return;
         }
 
+        // Shared one-position rule with the passive maker (user 2026-10-04): no
+        // taker entry while a maker order is open/unresolved on this market, and
+        // maker fills count toward the exposure cap below.
+        let market = market_id_of(&instrument).unwrap_or("").to_string();
+        let shared = self.exposure.get(&market);
+        if shared.maker_open {
+            self.report(&trade_id, &instrument, "Rejected", "maker order open on this market (one-position rule)");
+            return;
+        }
+
         // Per-EVENT position cap (§ user 2026-08-20). Directional exposure for
         // this market = qty(traded side) - qty(complement), in shares. A buy
         // that would push exposure beyond `max_open_units * size_shares` is
@@ -733,7 +776,9 @@ impl Engine {
             let cap = self.cfg.sizing.max_open_units * self.cfg.sizing.size_shares;
             let held_same = self.pm.qty(&instrument);
             let held_opp = self.pm.qty(&complement(&instrument));
-            let exposure = held_same - held_opp;
+            // maker fills / the venue's own number, signed into the traded direction
+            let dir_sign = if instrument.ends_with(".NO") { -1.0 } else { 1.0 };
+            let exposure = (held_same - held_opp + dir_sign * shared.maker_net).max(dir_sign * shared.oms_net);
             if exposure + size > cap + 1e-9 {
                 self.report(
                     &trade_id,
@@ -770,19 +815,37 @@ impl Engine {
             expiry_ns,
         };
 
+        // The maker must not post while this entry is in flight; afterwards it
+        // sees the taker's net (one-position rule).
+        self.exposure.update(&market, |e| e.taker_inflight = true);
+
         // Decoupled path: entry only; the exit reconciler owns the close.
         if self.cfg.exit.mode == "reconcile" {
             self.run_entry_reconcile(plan).await;
+            self.publish_taker_net(&market, &instrument);
             return;
         }
 
         // Legacy inline path (cross): one-trade gate + entry→hold→exit.
         if !self.pm.try_begin_trade(&trade_id, now) {
             self.report(&trade_id, &instrument, "Rejected", "active trade / cooldown");
+            self.publish_taker_net(&market, &instrument);
             return;
         }
         self.risk.note_trade(now);
         self.run_trade(plan).await;
+        self.publish_taker_net(&market, &instrument);
+    }
+
+    /// Refresh the shared exposure after a taker path finishes: entry no longer
+    /// in flight, taker net = signed YES position from the PM.
+    fn publish_taker_net(&mut self, market: &str, instrument: &str) {
+        let yes = yes_side_of(instrument);
+        let net = self.pm.qty(&yes) - self.pm.qty(&complement(&yes));
+        self.exposure.update(market, |e| {
+            e.taker_inflight = false;
+            e.taker_net = net;
+        });
     }
 
     /// Resolve per-market economics from the catalog meta, falling back to the

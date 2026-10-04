@@ -40,6 +40,10 @@ pub struct ExecutorCfg {
     /// Order manager (DESIGN_ORDER_MANAGER.md): private WS + REST sync owner of our
     /// orders/positions. Off by default; only the kalshi adapter feeds it.
     pub order_manager: crate::order_manager::OrderManagerCfg,
+    /// Passive maker for the 10c–90c band (maker.rs): rests a post-only bid on the
+    /// model-favoured side off `score.#`, pulls on model/book changes. Off by default;
+    /// live (non-shadow) mode requires the order manager.
+    pub maker: crate::maker::MakerCfg,
 }
 
 #[derive(Clone, Deserialize)]
@@ -214,6 +218,7 @@ impl Default for ExecutorCfg {
             maker_probe: MakerProbeCfg::default(),
             price_probe: PriceProbeCfg::default(),
             order_manager: crate::order_manager::OrderManagerCfg::default(),
+            maker: crate::maker::MakerCfg::default(),
         }
     }
 }

@@ -2,13 +2,18 @@
 //! event + the current `MarketState`, returning zero or more signals.
 
 use arb_core::event::{Event, Payload};
-use arb_core::model::{TradeSignal, Trigger};
+use arb_core::model::{ModelScore, TradeSignal, Trigger};
 
 use crate::state::MarketState;
 
 pub trait Rule: Send {
     fn id(&self) -> &str;
     fn on_event(&mut self, ev: &Event, state: &MarketState) -> Vec<TradeSignal>;
+    /// Continuous model scores produced since the last call (published on
+    /// `score.<model>`; the executor's passive maker consumes them). Default: none.
+    fn drain_scores(&mut self) -> Vec<ModelScore> {
+        Vec::new()
+    }
 }
 
 pub struct RuleEngine {
@@ -24,6 +29,14 @@ impl RuleEngine {
         let mut out = Vec::new();
         for r in self.rules.iter_mut() {
             out.extend(r.on_event(ev, state));
+        }
+        out
+    }
+
+    pub fn drain_scores(&mut self) -> Vec<ModelScore> {
+        let mut out = Vec::new();
+        for r in self.rules.iter_mut() {
+            out.extend(r.drain_scores());
         }
         out
     }

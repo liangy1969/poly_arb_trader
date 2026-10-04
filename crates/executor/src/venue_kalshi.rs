@@ -334,6 +334,8 @@ impl TradingVenue for KalshiVenue {
             "time_in_force": "good_till_canceled",
             "post_only": true,
             "self_trade_prevention_type": "maker",
+            // auto-route by ticker (KXBTC15M lives on shard 2 since 2026-08-25; see `submit`)
+            "exchange_index": -1,
         });
         let ts_ms = now_ns() / 1_000_000;
         let (ts, sig) = self.signer.sign("POST", ORDERS_PATH, ts_ms).map_err(|e| format!("sign: {e}"))?;

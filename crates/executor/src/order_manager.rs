@@ -647,6 +647,10 @@ impl OrderManager {
     pub fn order(&self, order_id: &str) -> Option<OrderRec> {
         self.with(|s| s.orders.get(order_id).cloned())
     }
+    /// The record our `client_order_id` maps to (pending or acked), if any.
+    pub fn order_by_client(&self, client_id: &str) -> Option<OrderRec> {
+        self.with(|s| s.by_client.get(client_id).and_then(|k| s.orders.get(k)).cloned())
+    }
     pub fn position(&self, ticker: &str) -> PositionView {
         self.with(|s| s.position(ticker, now_ms()))
     }

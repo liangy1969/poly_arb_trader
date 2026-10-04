@@ -7,6 +7,7 @@
 //! `SETUP_POLYMARKET.md`.
 
 pub mod config;
+pub mod maker;
 pub mod mirror;
 pub mod module;
 pub mod order_manager;

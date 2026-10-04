@@ -67,6 +67,7 @@ fn instrument_of(ev: &Event) -> &str {
         Payload::TradeRecord(t) => &t.instrument,
         Payload::Position(p) => &p.instrument,
         Payload::Calib(c) => &c.instrument,
+        Payload::Score(s) => &s.instrument,
     }
 }
 
