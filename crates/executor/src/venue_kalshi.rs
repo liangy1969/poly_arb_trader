@@ -20,6 +20,8 @@
 //! fill cost (`taker_fill_cost`, cents) and the fill-count field name. Until
 //! confirmed, VWAP falls back to the order's limit price (conservative for a buy).
 
+use std::collections::HashMap;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -105,6 +107,11 @@ pub struct KalshiVenue {
     http: reqwest::Client,
     signer: Signer,
     base: String,
+    /// order_id -> exchange_index, captured from the create-order response.
+    /// Cancels MUST name the shard (the router 404s a live order without it,
+    /// live 2026-10-04); for orders not in the map (placed before a restart)
+    /// the cancel falls back to iterating the known shards.
+    order_shard: Mutex<HashMap<String, i64>>,
 }
 
 impl KalshiVenue {
@@ -129,6 +136,7 @@ impl KalshiVenue {
             http,
             signer: Signer::load(key_id, pem_path)?,
             base,
+            order_shard: Mutex::new(HashMap::new()),
         })
     }
 }
@@ -355,7 +363,16 @@ impl TradingVenue for KalshiVenue {
             return Err(format!("kalshi post-only {code}: {}", resp.text().await.unwrap_or_default()));
         }
         let v: serde_json::Value = resp.json().await.map_err(|e| format!("parse: {e}"))?;
-        extract_order_id(&v).ok_or_else(|| "no order_id in resting response".to_string())
+        let order_id = extract_order_id(&v).ok_or_else(|| "no order_id in resting response".to_string())?;
+        // Remember the shard the venue placed it on: the cancel needs it.
+        if let Some(idx) = extract_num(&v, &["exchange_index"]) {
+            let mut g = self.order_shard.lock().unwrap();
+            if g.len() > 4096 {
+                g.clear(); // old entries only ever belonged to settled markets; fallback covers them
+            }
+            g.insert(order_id.clone(), idx as i64);
+        }
+        Ok(order_id)
     }
 
     /// Cancel a resting order. 200 → `Canceled{reduced_by}` (authoritative fill
@@ -373,7 +390,16 @@ impl TradingVenue for KalshiVenue {
         // has no ticker — so try the CONCRETE shards, crypto (2) first; only when
         // every shard says not-found is the order really terminal.
         let path = format!("{ORDERS_PATH}/{order_id}");
+        // The shard captured at placement goes first; the iteration only remains
+        // as the fallback for orders the map does not know (pre-restart orders).
+        let known = self.order_shard.lock().unwrap().get(order_id).copied();
+        let mut tries: Vec<String> = known.iter().map(|i| i.to_string()).collect();
         for idx in ["2", "0", "1", "3"] {
+            if known.map(|k| k.to_string() != idx).unwrap_or(true) {
+                tries.push(idx.to_string());
+            }
+        }
+        for idx in &tries {
             let ts_ms = now_ns() / 1_000_000;
             let (ts, sig) = self.signer.sign("DELETE", &path, ts_ms).map_err(|e| format!("sign: {e}"))?;
             let url = format!("{}/portfolio/events/orders/{order_id}?exchange_index={idx}", self.base);
