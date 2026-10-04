@@ -368,10 +368,12 @@ impl TradingVenue for KalshiVenue {
         // WITHOUT it the router 404s even for a RESTING order (live 2026-10-04:
         // every maker cancel 404'd and the 'Gone' mapping silently masked it; the
         // signature covers the path only, so the query is safe to vary). GET by id
-        // does not need it. Try auto-route (-1), then the known shards; only when
+        // does not need it. ⚠️ -1 (auto-route) is 400 on DELETE unless market_ticker
+        // is also passed (live 2026-10-04 20:13, second stuck order), and this call
+        // has no ticker — so try the CONCRETE shards, crypto (2) first; only when
         // every shard says not-found is the order really terminal.
         let path = format!("{ORDERS_PATH}/{order_id}");
-        for idx in ["-1", "2", "0", "1", "3"] {
+        for idx in ["2", "0", "1", "3"] {
             let ts_ms = now_ns() / 1_000_000;
             let (ts, sig) = self.signer.sign("DELETE", &path, ts_ms).map_err(|e| format!("sign: {e}"))?;
             let url = format!("{}/portfolio/events/orders/{order_id}?exchange_index={idx}", self.base);
