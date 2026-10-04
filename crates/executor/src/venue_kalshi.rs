@@ -364,34 +364,43 @@ impl TradingVenue for KalshiVenue {
     /// swallowing it as a generic error is the oversell-incident bug. Other
     /// statuses/transport failures → `Err` (order state UNKNOWN — do not re-post).
     async fn cancel_order(&self, order_id: &str) -> Result<CancelOutcome, String> {
+        // ⚠️ DELETE /portfolio/events/orders/{id} requires `?exchange_index=N` —
+        // WITHOUT it the router 404s even for a RESTING order (live 2026-10-04:
+        // every maker cancel 404'd and the 'Gone' mapping silently masked it; the
+        // signature covers the path only, so the query is safe to vary). GET by id
+        // does not need it. Try auto-route (-1), then the known shards; only when
+        // every shard says not-found is the order really terminal.
         let path = format!("{ORDERS_PATH}/{order_id}");
-        let ts_ms = now_ns() / 1_000_000;
-        let (ts, sig) = self.signer.sign("DELETE", &path, ts_ms).map_err(|e| format!("sign: {e}"))?;
-        let url = format!("{}/portfolio/events/orders/{order_id}", self.base);
-        let resp = self
-            .http
-            .delete(&url)
-            .header("KALSHI-ACCESS-KEY", self.signer.key_id.as_str())
-            .header("KALSHI-ACCESS-TIMESTAMP", ts)
-            .header("KALSHI-ACCESS-SIGNATURE", sig)
-            .send()
-            .await
-            .map_err(|e| format!("http: {e}"))?;
-        if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            return Ok(CancelOutcome::Gone);
+        for idx in ["-1", "2", "0", "1", "3"] {
+            let ts_ms = now_ns() / 1_000_000;
+            let (ts, sig) = self.signer.sign("DELETE", &path, ts_ms).map_err(|e| format!("sign: {e}"))?;
+            let url = format!("{}/portfolio/events/orders/{order_id}?exchange_index={idx}", self.base);
+            let resp = self
+                .http
+                .delete(&url)
+                .header("KALSHI-ACCESS-KEY", self.signer.key_id.as_str())
+                .header("KALSHI-ACCESS-TIMESTAMP", ts)
+                .header("KALSHI-ACCESS-SIGNATURE", sig)
+                .send()
+                .await
+                .map_err(|e| format!("http: {e}"))?;
+            if resp.status() == reqwest::StatusCode::NOT_FOUND {
+                continue; // not on this shard (or terminal — decided after the last shard)
+            }
+            if !resp.status().is_success() {
+                let code = resp.status();
+                return Err(format!("kalshi cancel {code}: {}", resp.text().await.unwrap_or_default()));
+            }
+            let v: serde_json::Value = resp.json().await.map_err(|e| format!("parse: {e}"))?;
+            return match extract_reduced_by(&v) {
+                Some(r) => Ok(CancelOutcome::Canceled { reduced_by: r }),
+                // 200 without reduced_by: canceled but unparseable — report 0 reduced
+                // (= assume fully filled) so the caller errs toward accounting a fill;
+                // the position poll self-heals any overstatement next cycle.
+                None => Ok(CancelOutcome::Canceled { reduced_by: 0.0 }),
+            };
         }
-        if !resp.status().is_success() {
-            let code = resp.status();
-            return Err(format!("kalshi cancel {code}: {}", resp.text().await.unwrap_or_default()));
-        }
-        let v: serde_json::Value = resp.json().await.map_err(|e| format!("parse: {e}"))?;
-        match extract_reduced_by(&v) {
-            Some(r) => Ok(CancelOutcome::Canceled { reduced_by: r }),
-            // 200 without reduced_by: canceled but unparseable — report 0 reduced
-            // (= assume fully filled) so the caller errs toward accounting a fill;
-            // the position poll self-heals any overstatement next cycle.
-            None => Ok(CancelOutcome::Canceled { reduced_by: 0.0 }),
-        }
+        Ok(CancelOutcome::Gone)
     }
 
     /// Poll contracts filled so far on a resting order. `Ok(None)` = 404: the
