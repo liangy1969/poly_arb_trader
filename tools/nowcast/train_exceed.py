@@ -28,6 +28,10 @@ ap.add_argument("--ba", action="store_true", help="BID/ASK inputs instead of the
 ap.add_argument("--spr", action="store_true", help="ADD 10 spread-change lags: 100*(spread now - spread at lag j), cents (the side that moved first widens the spread)")
 ap.add_argument("--bam", action="store_true", help="ADD bid/ask MOMENTUM: 10 logit(bid now) - logit(bid at lag j) + 10 for the ask (bid/ask at lag from mh -/+ sh/2); keeps the standard mid lags")
 ap.add_argument("--perp-raw", action="store_true", help="perp lag inputs in raw DOLLARS (perp at lag - perp now), NOT divided by sigma (sigma stays a ctx input)")
+ap.add_argument("--dm", default="", help="ADD Kalshi orderbook DEPTH-momentum deltas from the v10 lagged-book (bl): comma groups of imb (book-size imbalance), micro (microprice, cents), pimb (perp size imbalance); now-value minus value at each --dm-lags lag")
+ap.add_argument("--szm", default="", help="Kalshi RAW SIZE features from the midmove_v10_sz side-file: 'raw' = log1p(bid/ask size) at now + --szm-lags; 'mom' = log-size momentum (now - lag) per side at --szm-lags")
+ap.add_argument("--szm-lags", default="1,3,5,10,25,50", help="size-history lag TICKS (200 ms) for --szm; in {1,2,3,5,10,25,50}")
+ap.add_argument("--dm-lags", default="1,3,5,10,25,50", help="bl lag TICKS (200 ms each) for --dm; must be in {1,2,3,5,10,25,50}")
 ap.add_argument("--bam-lags", default="", help="ADD bid/ask momentum at ONLY these lags (ticks of 200 ms, e.g. '5' = 1 s -> 2 features)")
 a = ap.parse_args()
 torch.set_num_threads(4); torch.manual_seed(a.seed); np.random.seed(a.seed)
@@ -45,7 +49,7 @@ def lg(p):
 
 
 def load(paths):
-    X, MID, FUT, MK = [], [], [], []
+    X, MID, FUT, MK, FM = [], [], [], [], []
     groups = FEAT.split(",")
     for di, p in enumerate(paths):
         z = np.load(p); tte = z["ctx"][:, 1]
@@ -86,6 +90,23 @@ def load(paths):
                 bl = np.array([int(v) for v in a.bam_lags.split(",")])
                 mh_b = z["mh"][sel][:, bl - 1].astype(np.float32); sh_b = z["sh"][sel][:, bl - 1].astype(np.float32)
                 F.append(lg(bid0)[:, None] - lg(mh_b - 0.5 * sh_b)); F.append(lg(ask0)[:, None] - lg(mh_b + 0.5 * sh_b))
+            if a.szm:
+                zs = np.load(os.path.join(SP, "midmove_v10_sz", os.path.basename(p).replace(".npz", ".sz.npz")))
+                LBS = [0, 1, 2, 3, 5, 10, 25, 50]
+                si = np.array([LBS.index(int(v)) for v in a.szm_lags.split(",")])
+                szb, sza = zs["szb"][sel].astype(np.float32), zs["sza"][sel].astype(np.float32)
+                if a.szm == "raw":
+                    F.append(szb[:, [0]]); F.append(sza[:, [0]])
+                    F.append(szb[:, si]); F.append(sza[:, si])
+                else:   # mom: now - lag, per side
+                    F.append(szb[:, [0]] - szb[:, si]); F.append(sza[:, [0]] - sza[:, si])
+            if a.dm:
+                LBV = [1, 2, 3, 5, 10, 25, 50]
+                li = np.array([LBV.index(int(v)) for v in a.dm_lags.split(",")])
+                blk = z["bl"][sel].astype(np.float32)
+                for g in a.dm.split(","):
+                    g0, now, scale = {"imb": (0, mx[:, 2], 1.0), "micro": (7, mx[:, 3], 100.0), "pimb": (14, mx[:, 6], 1.0)}[g]
+                    F.append(scale * (now[:, None] - blk[:, g0 + li]))
         if a.ba:
             F.append(np.column_stack([np.log(np.maximum(tte[sel], 1)), sig, 100 * spr, lg(bid0), lg(ask0), mid0 * (1 - mid0)]))
         else:
@@ -93,8 +114,13 @@ def load(paths):
         fut4 = z["fut"][sel].reshape(len(sel), 4, 3)[:, :, 0]
         fp = os.path.join(SP, "midmove_v10_fut", os.path.basename(p).replace(".npz", ".fut.npz"))
         m3 = np.load(fp)["mid3s"][sel].astype(np.float32)
+        FM.append(np.abs(mid0 - z["mh"][sel][:, 4].astype(np.float32)) >= 0.02)   # fast tape: |mid - mid(1s ago)| >= 2c
         X.append(np.concatenate(F, 1).astype(np.float32)); MID.append(mid0); FUT.append(np.column_stack([fut4, m3])); MK.append(di * 10000 + z["tk"][sel])
-    return np.concatenate(X), np.concatenate(MID), np.concatenate(FUT), np.concatenate(MK)
+    Xc, MIDc, FUTc, MKc, FMc = np.concatenate(X), np.concatenate(MID), np.concatenate(FUT), np.concatenate(MK), np.concatenate(FM)
+    fin = np.isfinite(Xc).all(1)
+    if not fin.all():
+        Xc, MIDc, FUTc, MKc, FMc = Xc[fin], MIDc[fin], FUTc[fin], MKc[fin], FMc[fin]
+    return Xc, MIDc, FUTc, MKc, FMc
 
 
 days = sorted(glob.glob(os.path.join(SP, a.data, "*.npz")))
@@ -112,7 +138,7 @@ print("features %d (%s%s%s%s%s, data %s) | rows tr %d va %d te %d" % (NF, "ctx-o
 
 
 def labels(k, h, x):
-    X_, mid, fut, mk = D[k]
+    X_, mid, fut, mk, _ = D[k]
     mv = 100 * (fut[:, FUTI[h]] - mid)
     ok = np.isfinite(mv)
     return ok, mv, np.column_stack([(mv >= x), (mv <= -x)]).astype(np.float32)
@@ -164,10 +190,15 @@ for h in HS:
             return "/".join("%2.0f" % (100 * y_[p_ >= np.quantile(p_, 1 - k / 100)].mean()) for k in KS)
         print("%-5g %-4s | %4.1f / %4.1f | %.3f / %.3f   | %.3f / %.3f   | %-12s | %-12s | %-12s | %-12s | %+5.2fc / %+5.2fc" % (
             x, HNAME[h], 100 * yt[:, 0].mean(), 100 * yt[:, 1].mean(), au_v, au_t, ad_v, ad_t, prec(pva[:, 0], yv[:, 0]), prec(pte[:, 0], yt[:, 0]), prec(pva[:, 1], yv[:, 1]), prec(pte[:, 1], yt[:, 1]), mu_, md_), flush=True)
+        fm_t = D["te"][4][okte]
+        if fm_t.sum() > 200:
+            fy, fp, fmv = yt[fm_t], pte[fm_t], mv_t[fm_t]
+            print("      FAST rows (|dmid 1s|>=2c) TEST n=%d (%.1f%%): AUC up %.3f dn %.3f | prec up %s | dn %s | base %2.0f/%2.0f" % (
+                fm_t.sum(), 100 * fm_t.mean(), auc(fy[:, 0], fp[:, 0]), auc(fy[:, 1], fp[:, 1]), prec(fp[:, 0], fy[:, 0]), prec(fp[:, 1], fy[:, 1]), 100 * fy[:, 0].mean(), 100 * fy[:, 1].mean()), flush=True)
         if a.save_pred:
             os.makedirs(a.save_pred, exist_ok=True)
             np.savez_compressed(os.path.join(a.save_pred, "%s_%s_x%g_s%d.npz" % (a.tag, h, x, a.seed)), p_va=predict(net, "va"), p_te=predict(net, "te"), okva=okva, okte=okte)
-        if a.export and not a.cb and not a.ctx_only and not a.ba and not a.spr and not a.bam and not a.bam_lags:
+        if a.export and not a.cb and not a.ctx_only and not a.ba and not a.spr and not a.bam and not a.bam_lags and not a.dm and not a.szm:
             os.makedirs(a.export, exist_ok=True)
             torch.save({"state": net.state_dict(), "mu": mu.astype(np.float32), "sd": sd.astype(np.float32), "arch": "mlp", "hidden": a.hidden, "dropout": a.dropout,
                         "feat": FEAT, "lookback": 6.0, "market": "residual", "target": h, "x": x, "nf": NF, "nout": 2, "use": LAGS.tolist(), "kind": "exceed", "perp_raw": bool(a.perp_raw)},
