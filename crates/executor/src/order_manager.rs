@@ -581,7 +581,8 @@ pub struct OrderManagerCfg {
     pub fills_sync_ms: u64,
     /// A managed order missing from the resting list is `Unknown` only after this quiet period.
     pub unknown_grace_ms: u64,
-    /// Write-action budget (place + cancel) per second, manager-wide.
+    /// Write-action budget (place + cancel) per second, manager-wide. 0 = UNLIMITED
+    /// (removed at user direction 2026-10-05: the shared budget starved cancels).
     pub max_actions_per_s: f64,
     /// Health line cadence (0 = off).
     pub health_log_s: u64,
@@ -673,7 +674,7 @@ impl OrderManager {
             if st.side_locked(ticker, side) {
                 return Err(PlaceError::SideLocked);
             }
-            if !st.action_ok(t0, self.inner.cfg.max_actions_per_s) {
+            if self.inner.cfg.max_actions_per_s > 0.0 && !st.action_ok(t0, self.inner.cfg.max_actions_per_s) {
                 return Err(PlaceError::Budget);
             }
             st.register_pending(&intent.client_id, ticker, side, intent.price, intent.size, t0);
@@ -698,7 +699,7 @@ impl OrderManager {
         let t0 = now_ms();
         {
             let mut st = self.inner.st.lock().unwrap();
-            if !st.action_ok(t0, self.inner.cfg.max_actions_per_s) {
+            if self.inner.cfg.max_actions_per_s > 0.0 && !st.action_ok(t0, self.inner.cfg.max_actions_per_s) {
                 return Err("action budget".into());
             }
             st.on_cancel_sent(order_id, t0);
