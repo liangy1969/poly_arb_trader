@@ -32,6 +32,7 @@ ap.add_argument("--dm", default="", help="ADD Kalshi orderbook DEPTH-momentum de
 ap.add_argument("--szm", default="", help="Kalshi RAW SIZE features from the midmove_v10_sz side-file: 'raw' = log1p(bid/ask size) at now + --szm-lags; 'mom' = log-size momentum (now - lag) per side at --szm-lags")
 ap.add_argument("--szm-lags", default="1,3,5,10,25,50", help="size-history lag TICKS (200 ms) for --szm; in {1,2,3,5,10,25,50}")
 ap.add_argument("--slm", action="store_true", help="SAME-LEVEL size momentum at one 200 ms lag, per side (2 features): log1p(size now) - log1p(size 0.2 s ago) when that side's touch PRICE is unchanged; +/-20 sentinel when the touch moved (sign = move direction). Needs the midmove_v10_sz side-file")
+ap.add_argument("--slm-fb", default="sent", help="--slm fallback when the touch price moved: 'sent' = +/-20 by move direction, 'zero' = 0 (pure same-level drain, no price info)")
 ap.add_argument("--dm-lags", default="1,3,5,10,25,50", help="bl lag TICKS (200 ms each) for --dm; must be in {1,2,3,5,10,25,50}")
 ap.add_argument("--bam-lags", default="", help="ADD bid/ask momentum at ONLY these lags (ticks of 200 ms, e.g. '5' = 1 s -> 2 features)")
 a = ap.parse_args()
@@ -110,7 +111,8 @@ def load(paths):
                 for sz2, p0_, p1_ in ((szb2, bid0, b1), (sza2, ask0, a1)):
                     mom = sz2[:, 0] - sz2[:, 1]                 # log-size momentum over 0.2 s, same level only
                     dpx = p0_ - p1_
-                    f = np.where(np.abs(dpx) <= TOL, mom, np.where(dpx > 0, 20.0, -20.0)).astype(np.float32)
+                    fb = np.zeros_like(mom) if a.slm_fb == "zero" else np.where(dpx > 0, 20.0, -20.0)
+                    f = np.where(np.abs(dpx) <= TOL, mom, fb).astype(np.float32)
                     F.append(f[:, None])
             if a.dm:
                 LBV = [1, 2, 3, 5, 10, 25, 50]
