@@ -31,6 +31,7 @@ ap.add_argument("--perp-raw", action="store_true", help="perp lag inputs in raw 
 ap.add_argument("--dm", default="", help="ADD Kalshi orderbook DEPTH-momentum deltas from the v10 lagged-book (bl): comma groups of imb (book-size imbalance), micro (microprice, cents), pimb (perp size imbalance); now-value minus value at each --dm-lags lag")
 ap.add_argument("--szm", default="", help="Kalshi RAW SIZE features from the midmove_v10_sz side-file: 'raw' = log1p(bid/ask size) at now + --szm-lags; 'mom' = log-size momentum (now - lag) per side at --szm-lags")
 ap.add_argument("--szm-lags", default="1,3,5,10,25,50", help="size-history lag TICKS (200 ms) for --szm; in {1,2,3,5,10,25,50}")
+ap.add_argument("--slm", action="store_true", help="SAME-LEVEL size momentum at one 200 ms lag, per side (2 features): log1p(size now) - log1p(size 0.2 s ago) when that side's touch PRICE is unchanged; +/-20 sentinel when the touch moved (sign = move direction). Needs the midmove_v10_sz side-file")
 ap.add_argument("--dm-lags", default="1,3,5,10,25,50", help="bl lag TICKS (200 ms each) for --dm; must be in {1,2,3,5,10,25,50}")
 ap.add_argument("--bam-lags", default="", help="ADD bid/ask momentum at ONLY these lags (ticks of 200 ms, e.g. '5' = 1 s -> 2 features)")
 a = ap.parse_args()
@@ -100,6 +101,17 @@ def load(paths):
                     F.append(szb[:, si]); F.append(sza[:, si])
                 else:   # mom: now - lag, per side
                     F.append(szb[:, [0]] - szb[:, si]); F.append(sza[:, [0]] - sza[:, si])
+            if a.slm:
+                zs2 = np.load(os.path.join(SP, "midmove_v10_sz", os.path.basename(p).replace(".npz", ".sz.npz")))
+                szb2, sza2 = zs2["szb"][sel].astype(np.float32), zs2["sza"][sel].astype(np.float32)
+                mh1 = z["mh"][sel][:, 0].astype(np.float32); sh1 = z["sh"][sel][:, 0].astype(np.float32)
+                b1, a1 = mh1 - 0.5 * sh1, mh1 + 0.5 * sh1       # touch prices one 200 ms tick ago (fp16-derived)
+                TOL = 5e-4                                      # under half of the 0.001 tick after fp16 rounding
+                for sz2, p0_, p1_ in ((szb2, bid0, b1), (sza2, ask0, a1)):
+                    mom = sz2[:, 0] - sz2[:, 1]                 # log-size momentum over 0.2 s, same level only
+                    dpx = p0_ - p1_
+                    f = np.where(np.abs(dpx) <= TOL, mom, np.where(dpx > 0, 20.0, -20.0)).astype(np.float32)
+                    F.append(f[:, None])
             if a.dm:
                 LBV = [1, 2, 3, 5, 10, 25, 50]
                 li = np.array([LBV.index(int(v)) for v in a.dm_lags.split(",")])
@@ -198,7 +210,7 @@ for h in HS:
         if a.save_pred:
             os.makedirs(a.save_pred, exist_ok=True)
             np.savez_compressed(os.path.join(a.save_pred, "%s_%s_x%g_s%d.npz" % (a.tag, h, x, a.seed)), p_va=predict(net, "va"), p_te=predict(net, "te"), okva=okva, okte=okte)
-        if a.export and not a.cb and not a.ctx_only and not a.ba and not a.spr and not a.bam and not a.bam_lags and not a.dm and not a.szm:
+        if a.export and not a.cb and not a.ctx_only and not a.ba and not a.spr and not a.bam and not a.bam_lags and not a.dm and not a.szm and not a.slm:
             os.makedirs(a.export, exist_ok=True)
             torch.save({"state": net.state_dict(), "mu": mu.astype(np.float32), "sd": sd.astype(np.float32), "arch": "mlp", "hidden": a.hidden, "dropout": a.dropout,
                         "feat": FEAT, "lookback": 6.0, "market": "residual", "target": h, "x": x, "nf": NF, "nout": 2, "use": LAGS.tolist(), "kind": "exceed", "perp_raw": bool(a.perp_raw)},
