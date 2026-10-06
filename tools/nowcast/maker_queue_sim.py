@@ -43,6 +43,8 @@ ap.add_argument("--maxrange", type=float, default=0.0, help="regime gate: quote 
 ap.add_argument("--flatten", action="store_true", help="exit the net inventory as a TAKER at the touch (fee 0.07 p(1-p)) at tte < 45 s instead of holding to settlement")
 ap.add_argument("--tag", default="", help="write data/nowcast/qsim_<day>_<tag>.parquet (fills) and _mkts.parquet (per-market incl. zero-fill) for maker_days.py")
 ap.add_argument("--theta-pull", type=float, default=None, help="fav policy hysteresis: POST when g > --theta, but keep a resting order until g <= this (default = --theta)")
+ap.add_argument("--rest-offset", type=float, default=0.0, help="OVERSHOOT resting: place the favoured-side order this many CENTS behind the touch (bid at touch-off / ask at touch+off) — fills only when the price overshoots through our level; 0 = at the touch")
+ap.add_argument("--rest-dyn", type=float, default=0.0, help="score-scaled overshoot buffer: off_c = clip(round(k*|g|), 1, 8) with this k (overrides --rest-offset when > 0)")
 ap.add_argument("--stepback", type=float, default=0.0, help="instead of pulling a side flagged against by more than this (cents), rest it ONE TICK behind the touch (early queue at the level the move goes to); 0 = off")
 a = ap.parse_args()
 TTE_LO, TTE_HI = (float(x) for x in a.tte.split(","))
@@ -233,7 +235,14 @@ def sim_market(tk, B, P, Dk):
                 cand = jump_px[side]
                 if (side == BID and cand < ya[i] - EPSP and cand > yb[i] - EPSP) or (side == ASK and cand > yb[i] + EPSP and cand < ya[i] + EPSP):
                     jp = cand
-            target_px = jp if not np.isnan(jp) else touch
+            off_c = 0.0
+            if a.rest_dyn > 0 and not np.isnan(gs):
+                off_c = min(8.0, max(1.0, round(a.rest_dyn * abs(gs))))
+            elif a.rest_offset > 0:
+                off_c = a.rest_offset
+            rest_px = touch - off_c / 100.0 if side == BID else touch + off_c / 100.0
+            rest_px = min(max(rest_px, 0.005), 0.995)
+            target_px = jp if not np.isnan(jp) else rest_px
             # step-back: flagged against beyond the step-back threshold -> rest one tick behind the touch instead of pulling
             stepped = False
             if a.stepback > 0 and eligible and not closing and not np.isnan(gs) and gs < -a.stepback and not (adds and abs(q) >= a.q):
@@ -249,7 +258,7 @@ def sim_market(tk, B, P, Dk):
                     reason = "move"                                          # step back (or return to the touch when the flag clears)
                 elif abs(target_px - s_["price"]) >= EPSP and (np.isnan(jp) or target_px > s_["price"] + EPSP if side == BID else True) and (np.isnan(jp) or target_px < s_["price"] - EPSP if side == ASK else True):
                     reason = "move"                                          # R5: touch moved (or a jump level opened ahead of us): re-post at target
-                elif lvl < a.lone and np.isnan(jp) and not s_["jumped"]:
+                elif lvl < a.lone and np.isnan(jp) and not s_["jumped"] and off_c == 0.0:
                     reason = "lone"                                          # R5: alone / thin at the touch
                 if reason:
                     lc = lat("cancel"); s_["pend"].append((t + lc, "cancel", np.nan)); s_["off_reason"] = reason; s_["clear_since"] = None
