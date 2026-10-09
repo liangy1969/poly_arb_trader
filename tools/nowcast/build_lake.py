@@ -24,7 +24,7 @@ SP = r"C:/Users/fatli/AppData/Local/Temp/claude/e--poly-crypto-trader/0ed64f57-c
 V10 = os.path.join(SP, os.environ.get("V10_OUT", "midmove_v10"))
 BAR_MS, LAG_MS, FF_BARS = 100, 50, 20
 BARS = os.environ.get("LAKE_BARS", "") == "1"          # write full-day bar matrices for the harness join instead
-BARS_DIR = r"E:/poly/crypto_trader/data/nowcast/lake_bars"
+BARS_DIR = os.environ.get("LAKE_BARS_OUT", r"E:/poly/crypto_trader/data/nowcast/lake_bars")
 BIG = 1.0            # BTC
 BANDS = (5.0, 10.0, 25.0)   # bps
 

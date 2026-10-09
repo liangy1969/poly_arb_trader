@@ -1,0 +1,10 @@
+{
+ "kind": "exceed",
+ "note": "ETH exceedance classifier, RAW-DOLLAR perp variant (train_exceed.py --perp-raw --export, --data midmove_v10e): X=1c, 1 s, 3 seeds, standard 43 inputs, KXETH15M + ETHUSDT lake. 2026-10-09.",
+ "members": [
+  "../data/nowcast/exceed_models_eth/exceedraw_mid5_x1_s0.pt",
+  "../data/nowcast/exceed_models_eth/exceedraw_mid5_x1_s1.pt",
+  "../data/nowcast/exceed_models_eth/exceedraw_mid5_x1_s2.pt"
+ ],
+ "extras": []
+}
