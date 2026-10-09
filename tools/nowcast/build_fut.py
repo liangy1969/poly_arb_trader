@@ -11,15 +11,15 @@ import numpy as np
 import pandas as pd
 
 SP = r"C:/Users/fatli/AppData/Local/Temp/claude/e--poly-crypto-trader/0ed64f57-c300-45f3-b675-113fb239783c/scratchpad"
-V10 = os.path.join(SP, "midmove_v10")
-OUT = os.path.join(SP, "midmove_v10_fut")
+V10 = os.path.join(SP, os.environ.get("V10_OUT", "midmove_v10"))
+OUT = V10 + "_fut"
 HOR = {"mid3s": 3000, "mid5s": 5000}
 
 
 def build_day(day):
     z = np.load(os.path.join(V10, day + ".npz"))
     ts = z["ts"].astype(np.int64); tk = z["tk"]; names = [str(x) for x in z["names"]]
-    fn = glob.glob(f"E:/poly/crypto_trader/data/samples/{day}.csv*")[0]
+    fn = glob.glob("E:/poly/crypto_trader/%s/%s.csv*" % (os.environ.get("V10_SAMPLES", "data/samples"), day))[0]
     S = pd.read_csv(fn, usecols=["ts_ms", "ticker", "ybid", "yask"], dtype=str, on_bad_lines="skip")
     for c in ("ts_ms", "ybid", "yask"):
         S[c] = pd.to_numeric(S[c], errors="coerce")

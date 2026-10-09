@@ -32,6 +32,7 @@ ap.add_argument("--dm", default="", help="ADD Kalshi orderbook DEPTH-momentum de
 ap.add_argument("--szm", default="", help="Kalshi RAW SIZE features from the midmove_v10_sz side-file: 'raw' = log1p(bid/ask size) at now + --szm-lags; 'mom' = log-size momentum (now - lag) per side at --szm-lags")
 ap.add_argument("--szm-lags", default="1,3,5,10,25,50", help="size-history lag TICKS (200 ms) for --szm; in {1,2,3,5,10,25,50}")
 ap.add_argument("--slm", action="store_true", help="SAME-LEVEL size momentum at one 200 ms lag, per side (2 features): log1p(size now) - log1p(size 0.2 s ago) when that side's touch PRICE is unchanged; +/-20 sentinel when the touch moved (sign = move direction). Needs the midmove_v10_sz side-file")
+ap.add_argument("--slm-lag", type=int, default=1, help="--slm window in 200 ms TICKS (one of 1,2,3,5,10,25,50); same-level = touch price equal at BOTH endpoints")
 ap.add_argument("--slm-fb", default="sent", help="--slm fallback when the touch price moved: 'sent' = +/-20 by move direction, 'zero' = 0 (pure same-level drain, no price info)")
 ap.add_argument("--dm-lags", default="1,3,5,10,25,50", help="bl lag TICKS (200 ms each) for --dm; must be in {1,2,3,5,10,25,50}")
 ap.add_argument("--bam-lags", default="", help="ADD bid/ask momentum at ONLY these lags (ticks of 200 ms, e.g. '5' = 1 s -> 2 features)")
@@ -79,7 +80,7 @@ def load(paths):
             for g, col, scale in (("kbs", 0, 1), ("kas", 1, 1), ("kim", 2, 1), ("kmi", 3, 100), ("pbs", 4, 1), ("pas", 5, 1)):
                 if g in groups:
                     F.append(scale * mx[:, col:col + 1])
-            zl = np.load(os.path.join(SP, "midmove_v10_lake", os.path.basename(p).replace(".npz", ".lake.npz")))
+            zl = np.load(os.path.join(SP, a.data + "_lake", os.path.basename(p).replace(".npz", ".lake.npz")))
             ln = [str(x) for x in zl["names"]]; want = [i for i, nm in enumerate(ln) if ("lf_" + nm) in groups]
             F.append(zl["lk"][sel][:, want].astype(np.float32))
             if a.spr or a.bam:
@@ -105,11 +106,13 @@ def load(paths):
             if a.slm:
                 zs2 = np.load(os.path.join(SP, "midmove_v10_sz", os.path.basename(p).replace(".npz", ".sz.npz")))
                 szb2, sza2 = zs2["szb"][sel].astype(np.float32), zs2["sza"][sel].astype(np.float32)
-                mh1 = z["mh"][sel][:, 0].astype(np.float32); sh1 = z["sh"][sel][:, 0].astype(np.float32)
+                LBS2 = [0, 1, 2, 3, 5, 10, 25, 50]
+                ci = LBS2.index(a.slm_lag)
+                mh1 = z["mh"][sel][:, a.slm_lag - 1].astype(np.float32); sh1 = z["sh"][sel][:, a.slm_lag - 1].astype(np.float32)
                 b1, a1 = mh1 - 0.5 * sh1, mh1 + 0.5 * sh1       # touch prices one 200 ms tick ago (fp16-derived)
                 TOL = 5e-4                                      # under half of the 0.001 tick after fp16 rounding
                 for sz2, p0_, p1_ in ((szb2, bid0, b1), (sza2, ask0, a1)):
-                    mom = sz2[:, 0] - sz2[:, 1]                 # log-size momentum over 0.2 s, same level only
+                    mom = sz2[:, 0] - sz2[:, ci]                # log-size momentum over the --slm-lag window, same level only
                     dpx = p0_ - p1_
                     fb = np.zeros_like(mom) if a.slm_fb == "zero" else np.where(dpx > 0, 20.0, -20.0)
                     f = np.where(np.abs(dpx) <= TOL, mom, fb).astype(np.float32)
@@ -126,7 +129,7 @@ def load(paths):
         else:
             F.append(np.column_stack([np.log(np.maximum(tte[sel], 1)), sig, 100 * spr, l0, mid0 * (1 - mid0)]))
         fut4 = z["fut"][sel].reshape(len(sel), 4, 3)[:, :, 0]
-        fp = os.path.join(SP, "midmove_v10_fut", os.path.basename(p).replace(".npz", ".fut.npz"))
+        fp = os.path.join(SP, a.data + "_fut", os.path.basename(p).replace(".npz", ".fut.npz"))
         m3 = np.load(fp)["mid3s"][sel].astype(np.float32)
         FM.append(np.abs(mid0 - z["mh"][sel][:, 4].astype(np.float32)) >= 0.02)   # fast tape: |mid - mid(1s ago)| >= 2c
         X.append(np.concatenate(F, 1).astype(np.float32)); MID.append(mid0); FUT.append(np.column_stack([fut4, m3])); MK.append(di * 10000 + z["tk"][sel])

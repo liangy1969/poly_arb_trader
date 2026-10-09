@@ -955,6 +955,25 @@ mod tests {
         assert!(n > 0);
     }
 
+    /// Torch parity for the ETH raw model (same 43-input layout; trained on KXETH15M + the ETHUSDT lake).
+    #[test]
+    fn exceed_eth_raw_score_matches_torch() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../models/exceed-1s-x1-raw-rs-eth.json");
+        let Ok(text) = std::fs::read_to_string(path) else { return };
+        let js: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let m = ExceedModel::from_json(&text).unwrap();
+        assert!(m.perp_raw && m.nf == 43);
+        let mut n = 0;
+        for tv in js["test_vectors"].as_array().unwrap() {
+            let x: Vec<f64> = tv["x"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect();
+            let (up, dn) = m.score(&x);
+            let (wu, wd) = (tv["p_up"].as_f64().unwrap(), tv["p_dn"].as_f64().unwrap());
+            assert!((up - wu).abs() < 1e-5 && (dn - wd).abs() < 1e-5, "({up},{dn}) vs torch ({wu},{wd})");
+            n += 1;
+        }
+        assert!(n > 0);
+    }
+
     /// Same torch parity for the raw-dollar perp model, and the perp_raw flag is carried through.
     #[test]
     fn exceed_raw_score_matches_torch() {
