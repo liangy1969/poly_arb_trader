@@ -33,6 +33,9 @@ ap.add_argument("--szm", default="", help="Kalshi RAW SIZE features from the mid
 ap.add_argument("--szm-lags", default="1,3,5,10,25,50", help="size-history lag TICKS (200 ms) for --szm; in {1,2,3,5,10,25,50}")
 ap.add_argument("--slm", action="store_true", help="SAME-LEVEL size momentum at one 200 ms lag, per side (2 features): log1p(size now) - log1p(size 0.2 s ago) when that side's touch PRICE is unchanged; +/-20 sentinel when the touch moved (sign = move direction). Needs the midmove_v10_sz side-file")
 ap.add_argument("--slm-lag", type=int, default=1, help="--slm window in 200 ms TICKS (one of 1,2,3,5,10,25,50); same-level = touch price equal at BOTH endpoints")
+ap.add_argument("--xa-filter", action="store_true", help="apply the --xa row filter (drop rows without cross-asset coverage) WITHOUT adding the features — the paired baseline control")
+ap.add_argument("--xa", action="store_true", help="ADD cross-asset perp momentum from the midmove_v10*_xa side-file: 10 dollar deltas (price at lag - price now) on the model's lag grid, z-scored like all inputs")
+ap.add_argument("--lake-extra", default="", help="append EXTRA lake columns by bare name (comma list, e.g. 'depth_imb1,depth_imb5,depth_imb20,depth_micro_bps') on top of the standard 14")
 ap.add_argument("--slm-fb", default="sent", help="--slm fallback when the touch price moved: 'sent' = +/-20 by move direction, 'zero' = 0 (pure same-level drain, no price info)")
 ap.add_argument("--dm-lags", default="1,3,5,10,25,50", help="bl lag TICKS (200 ms each) for --dm; must be in {1,2,3,5,10,25,50}")
 ap.add_argument("--bam-lags", default="", help="ADD bid/ask momentum at ONLY these lags (ticks of 200 ms, e.g. '5' = 1 s -> 2 features)")
@@ -83,6 +86,9 @@ def load(paths):
             zl = np.load(os.path.join(SP, a.data + "_lake", os.path.basename(p).replace(".npz", ".lake.npz")))
             ln = [str(x) for x in zl["names"]]; want = [i for i, nm in enumerate(ln) if ("lf_" + nm) in groups]
             F.append(zl["lk"][sel][:, want].astype(np.float32))
+            if a.lake_extra:
+                xi = [ln.index(nm) for nm in a.lake_extra.split(",")]
+                F.append(zl["lk"][sel][:, xi].astype(np.float32))
             if a.spr or a.bam:
                 sh_l = z["sh"][sel][:, LAGS - 1].astype(np.float32)
             if a.spr:
@@ -93,6 +99,14 @@ def load(paths):
                 bl = np.array([int(v) for v in a.bam_lags.split(",")])
                 mh_b = z["mh"][sel][:, bl - 1].astype(np.float32); sh_b = z["sh"][sel][:, bl - 1].astype(np.float32)
                 F.append(lg(bid0)[:, None] - lg(mh_b - 0.5 * sh_b)); F.append(lg(ask0)[:, None] - lg(mh_b + 0.5 * sh_b))
+            if a.xa or a.xa_filter:
+                zx = np.load(os.path.join(SP, a.data + "_xa", os.path.basename(p).replace(".npz", ".xa.npz")))
+                eh = zx["eh"][sel].astype(np.float32)        # cols: [now, lag1..lag30]
+                d = eh[:, 1:11] - eh[:, [0]]
+                if a.xa:
+                    F.append(d)                               # deltas at the 10 model lags
+                else:
+                    F.append(np.where(np.isfinite(d.sum(1, keepdims=True)), 0.0, np.nan).astype(np.float32))  # filter-only
             if a.szm:
                 zs = np.load(os.path.join(SP, "midmove_v10_sz", os.path.basename(p).replace(".npz", ".sz.npz")))
                 LBS = [0, 1, 2, 3, 5, 10, 25, 50]
@@ -215,7 +229,7 @@ for h in HS:
         if a.save_pred:
             os.makedirs(a.save_pred, exist_ok=True)
             np.savez_compressed(os.path.join(a.save_pred, "%s_%s_x%g_s%d.npz" % (a.tag, h, x, a.seed)), p_va=predict(net, "va"), p_te=predict(net, "te"), okva=okva, okte=okte)
-        if a.export and not a.cb and not a.ctx_only and not a.ba and not a.spr and not a.bam and not a.bam_lags and not a.dm and not a.szm and not a.slm:
+        if a.export and not a.cb and not a.ctx_only and not a.ba and not a.spr and not a.bam and not a.bam_lags and not a.dm and not a.szm and not a.slm and not a.lake_extra and not a.xa:
             os.makedirs(a.export, exist_ok=True)
             torch.save({"state": net.state_dict(), "mu": mu.astype(np.float32), "sd": sd.astype(np.float32), "arch": "mlp", "hidden": a.hidden, "dropout": a.dropout,
                         "feat": FEAT, "lookback": 6.0, "market": "residual", "target": h, "x": x, "nf": NF, "nout": 2, "use": LAGS.tolist(), "kind": "exceed", "perp_raw": bool(a.perp_raw)},
