@@ -65,6 +65,12 @@ pub struct KalshiCfg {
     /// e.g. {KXINXU: databento.ES, KXWTI: databento.CL}. Series absent here use
     /// nearest-close ordering (fine for up/down series like KXBTC15M).
     pub atm_references: HashMap<String, String>,
+    /// Append every WS `orderbook_snapshot`/`orderbook_delta` to daily CSVs in this
+    /// directory (`deltas-YYYY-MM-DD.csv`; ev s=snapshot level, d=delta). "" = off.
+    /// Full event-level book granularity at ~tens of bytes per event — the published
+    /// bus books are per-update SNAPSHOTS and the recorder samples them, so this is
+    /// the only persisted source of true delta timing (added 2026-10-14).
+    pub delta_log_dir: String,
 }
 
 impl Default for KalshiCfg {
@@ -87,6 +93,7 @@ impl Default for KalshiCfg {
             ob_poll_s: 2,
             trades_poll_s: 3,
             atm_references: HashMap::new(),
+            delta_log_dir: String::new(),
         }
     }
 }
@@ -467,6 +474,63 @@ fn build_ws_request(ws_url: &str, signer: &Signer) -> anyhow::Result<Request<()>
     Ok(req)
 }
 
+/// Daily-rolling CSV appender for raw book events (see `KalshiCfg::delta_log_dir`).
+/// Line: recv_ms,ticker,ev,side,px,qty,seq  (ev: s=snapshot level, S=snapshot begin,
+/// d=delta; snapshot rows share one recv_ms). Buffered; flushed every 200 lines.
+struct DeltaLog {
+    dir: String,
+    day: String,
+    w: Option<std::io::BufWriter<std::fs::File>>,
+    n: u32,
+}
+
+impl DeltaLog {
+    fn new(dir: &str) -> Option<DeltaLog> {
+        if dir.is_empty() {
+            return None;
+        }
+        let _ = std::fs::create_dir_all(dir);
+        Some(DeltaLog { dir: dir.to_string(), day: String::new(), w: None, n: 0 })
+    }
+
+    fn line(&mut self, recv_ns: i64, ticker: &str, ev: char, side: &str, px: f64, qty: f64, seq: Option<i64>) {
+        use std::io::Write;
+        let day = chrono::DateTime::from_timestamp(recv_ns / 1_000_000_000, 0)
+            .map(|d| d.format("%Y-%m-%d").to_string())
+            .unwrap_or_default();
+        if day != self.day || self.w.is_none() {
+            if let Some(w) = self.w.as_mut() {
+                let _ = w.flush();
+            }
+            let path = format!("{}/deltas-{}.csv", self.dir, day);
+            let new_file = !std::path::Path::new(&path).exists();
+            match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+                Ok(f) => {
+                    let mut w = std::io::BufWriter::new(f);
+                    if new_file {
+                        let _ = writeln!(w, "recv_ms,ticker,ev,side,px,qty,seq");
+                    }
+                    self.w = Some(w);
+                    self.day = day;
+                }
+                Err(e) => {
+                    tracing::warn!("delta log open {path}: {e}");
+                    return;
+                }
+            }
+        }
+        if let Some(w) = self.w.as_mut() {
+            let _ = writeln!(w, "{},{},{},{},{},{},{}", recv_ns / 1_000_000, ticker, ev, side, px, qty,
+                seq.map(|x| x.to_string()).unwrap_or_default());
+            self.n += 1;
+            if self.n >= 200 {
+                let _ = w.flush();
+                self.n = 0;
+            }
+        }
+    }
+}
+
 fn route_ws(
     frame: &Value,
     books: &mut HashMap<String, KalshiBook>,
@@ -474,6 +538,7 @@ fn route_ws(
     bus: &dyn Bus,
     top_n: usize,
     seq: &mut u64,
+    dlog: &mut Option<DeltaLog>,
 ) -> bool {
     let t = frame.get("type").and_then(Value::as_str).unwrap_or("");
     let ticker = frame
@@ -488,6 +553,15 @@ fn route_ws(
     match t {
         "orderbook_snapshot" => {
             let (yes, no, s) = parse_ws_snapshot(frame);
+            if let Some(dl) = dlog.as_mut() {
+                dl.line(recv, ticker, 'S', "", 0.0, (yes.len() + no.len()) as f64, s);
+                for &(p, q) in &yes {
+                    dl.line(recv, ticker, 's', "y", p, q, s);
+                }
+                for &(p, q) in &no {
+                    dl.line(recv, ticker, 's', "n", p, q, s);
+                }
+            }
             let book = books.entry(ticker.to_string()).or_default();
             book.apply_snapshot(&yes, &no, s);
             publish_books(bus, ticker, book, recv, top_n, seq);
@@ -495,6 +569,9 @@ fn route_ws(
         }
         "orderbook_delta" => {
             if let Some((side, p, d, s)) = parse_ws_delta(frame) {
+                if let Some(dl) = dlog.as_mut() {
+                    dl.line(recv, ticker, 'd', if matches!(side, crate::book::KSide::Yes) { "y" } else { "n" }, p, d, s);
+                }
                 let book = books.entry(ticker.to_string()).or_default();
                 let gap = book.apply_delta(side, p, d, s);
                 publish_books(bus, ticker, book, recv, top_n, seq);
@@ -516,6 +593,10 @@ async fn ws_task(
 ) {
     let mut seq = 0u64;
     let mut backoff = 1u64;
+    let mut dlog = DeltaLog::new(&cfg.delta_log_dir);
+    if dlog.is_some() {
+        tracing::info!("kalshi delta log -> {}/deltas-YYYY-MM-DD.csv", cfg.delta_log_dir);
+    }
     loop {
         let desired = desired_rx.borrow().clone();
         if desired.tickers.is_empty() {
@@ -559,7 +640,7 @@ async fn ws_task(
                         msg = ws.next() => match msg {
                             Some(Ok(Message::Text(t))) => {
                                 if let Ok(v) = serde_json::from_str::<Value>(t.as_str()) {
-                                    if route_ws(&v, &mut books, &ticker_inst, &*bus, cfg.top_n, &mut seq) {
+                                    if route_ws(&v, &mut books, &ticker_inst, &*bus, cfg.top_n, &mut seq, &mut dlog) {
                                         tracing::info!("kalshi seq gap -> reconnect");
                                         break;
                                     }
