@@ -586,6 +586,9 @@ pub struct ExceedCfg {
     /// crossing still consumes the arm (harness default, no --episode-arm). 0 = off.
     pub quiet_window_s: f64,
     pub quiet_max_range: f64,
+    /// Only take CHEAP entries (bought ticket < 50c: YES in the low tail / NO in the high tail). A dear
+    /// crossing still consumes the arm like a normal fire (harness composition semantics) but places no order.
+    pub cheap_only: bool,
     /// Publish every evaluation's score (topic `score.exceed`) while the YES mid is in
     /// [score_lo, score_hi] — the executor's passive maker quotes off it. Off by default.
     pub score_publish: bool,
@@ -617,6 +620,7 @@ impl Default for ExceedCfg {
             feat_log_every_s: 10.0,
             quiet_window_s: 0.0,
             quiet_max_range: 0.03,
+            cheap_only: false,
             score_publish: false,
             score_lo: 0.10,
             score_hi: 0.90,
@@ -647,6 +651,7 @@ pub struct ExceedRule {
     n_invalid: u64,
     n_sig: u64,
     n_gate_rej: u64,
+    n_dear_skip: u64,
     last_stat_ns: i64,
     /// Scores queued for `drain_scores` (only when `score_publish`).
     scores: Vec<ModelScore>,
@@ -669,6 +674,7 @@ impl ExceedRule {
             n_invalid: 0,
             n_sig: 0,
             n_gate_rej: 0,
+            n_dear_skip: 0,
             last_stat_ns: 0,
             scores: Vec::new(),
             n_score: 0,
@@ -764,8 +770,8 @@ impl ExceedRule {
             if self.last_stat_ns != 0 {
                 tracing::info!(
                     target: "exceed",
-                    "stats evals={} invalid={} signals={} gate_rej={} scores={} sigma={:.3} lake_depth={} lake_vol={} tracked={}",
-                    self.n_eval, self.n_invalid, self.n_sig, self.n_gate_rej, self.n_score, self.hist.sigma(), self.lake.n_depth, self.lake.n_vol, self.evs.len()
+                    "stats evals={} invalid={} signals={} gate_rej={} dear_skip={} scores={} sigma={:.3} lake_depth={} lake_vol={} tracked={}",
+                    self.n_eval, self.n_invalid, self.n_sig, self.n_gate_rej, self.n_dear_skip, self.n_score, self.hist.sigma(), self.lake.n_depth, self.lake.n_vol, self.evs.len()
                 );
             }
             self.last_stat_ns = now;
@@ -851,8 +857,22 @@ impl ExceedRule {
                 return None;
             }
         }
-        self.n_sig += 1;
         let up = sig > 0.0;
+        // CHEAP-ONLY: skip dear entries (bought ticket > 50c). The arm is already consumed above, so the
+        // episode behaves exactly as if the fire happened — only the order is withheld.
+        if self.cfg.cheap_only {
+            let ticket = if up { yask } else { 1.0 - ybid };
+            if ticket > 0.5 {
+                self.n_dear_skip += 1;
+                tracing::info!(
+                    target: "exceed",
+                    "{} DEAR-SKIP tte={:.1} s={:+.4} mid={:.4} ticket={:.3} entry#{}",
+                    inst, tte_s, sig, mid, ticket, entry_no
+                );
+                return None;
+            }
+        }
+        self.n_sig += 1;
         Some(TradeSignal {
             strategy: "exceed".into(),
             ts_ns: now,
