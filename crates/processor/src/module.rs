@@ -33,6 +33,8 @@ pub struct ProcCfg {
     pub fair_ride: crate::rule::FairRideCfg,
     /// Exceedance-classifier strategy config (used when `strategy == "exceed"`).
     pub exceed: crate::exceed::ExceedCfg,
+    /// Turnaround shadow scorer (runs beside the exceed rule when enabled; never trades).
+    pub turnaround: crate::turnaround::TurnCfg,
 }
 
 impl Default for ProcCfg {
@@ -53,6 +55,7 @@ impl Default for ProcCfg {
             ring_horizon_ms: 5000,
             fair_ride: crate::rule::FairRideCfg::default(),
             exceed: crate::exceed::ExceedCfg::default(),
+            turnaround: crate::turnaround::TurnCfg::default(),
         }
     }
 }
@@ -103,7 +106,15 @@ impl Module for Processor {
                 ec.model_path, hash, model.nf, model.perp_raw, ec.cut, ec.rearm_eps, ec.px_mode, ec.px_lo, ec.px_hi,
                 ec.entry_min_tte_s, ec.entry_max_tte_s, ec.eval_min_ms, ec.quiet_window_s, ec.quiet_max_range
             );
-            vec![Box::new(crate::exceed::ExceedRule::new(ec, model))]
+            let mut v: Vec<Box<dyn crate::rule::Rule>> = vec![Box::new(crate::exceed::ExceedRule::new(ec, model))];
+            if self.cfg.turnaround.enabled {
+                let tc = self.cfg.turnaround.clone();
+                let tbytes = std::fs::read(&tc.model_path)?;
+                let tmodel = crate::turnaround::TurnModel::from_json(std::str::from_utf8(&tbytes)?)?;
+                tracing::info!("turnaround shadow: model={} hash={:016x} nf={}", tc.model_path, crate::calib::fnv1a(&tbytes), tmodel.nf);
+                v.push(Box::new(crate::turnaround::TurnRule::new(tc, tmodel)));
+            }
+            v
         } else {
             vec![Box::new(PerpMoveRule::new(
                 self.cfg.strategy.clone(),
