@@ -79,7 +79,9 @@ async fn main() -> anyhow::Result<()> {
                         // exceedance-classifier rule: per-market score stream + input
                         // vectors (offline parity vs the harness's kind=exceed rows)
                         .with_target("exceed", LevelFilter::INFO)
-                        .with_target("exceedfeat", LevelFilter::INFO),
+                        .with_target("exceedfeat", LevelFilter::INFO)
+                        // turnaround shadow head: TURN-SIG entries + stats (fill-reality analysis)
+                        .with_target("turn", LevelFilter::INFO),
                 );
             tracing_subscriber::registry().with(stdout_layer).with(events_layer).init();
             tracing::info!("trader events -> {events_path} (append; survives relaunches)");
