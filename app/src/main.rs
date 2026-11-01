@@ -52,6 +52,7 @@ async fn main() -> anyhow::Result<()> {
         ring_horizon_ms: 5000,
         fair_ride: Default::default(),
         exceed: Default::default(),
+        turnaround: Default::default(),
     });
     processor.start(bus.clone()).await?;
 
