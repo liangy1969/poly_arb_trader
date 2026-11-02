@@ -160,6 +160,9 @@ impl TurnModel {
 #[serde(default)]
 pub struct TurnCfg {
     pub enabled: bool,
+    /// false = shadow (TURN-SIG logs only). true = EMIT TradeSignals at the tier_lo threshold — the
+    /// executor applies its usual gates (one-position-per-event cap, maker_open, risk, balance switch).
+    pub armed: bool,
     pub model_path: String,
     /// Perp reference (bookTicker mid) and the coinbase mid instrument (kz needs both).
     pub reference: String,
@@ -184,6 +187,7 @@ impl Default for TurnCfg {
     fn default() -> Self {
         TurnCfg {
             enabled: false,
+            armed: false,
             model_path: "models/turnaround-up30-rs-btc.json".into(),
             reference: "binance.usdt_perp.BTCUSDT".into(),
             cb_instrument: "coinbase.BTC".into(),
@@ -235,8 +239,8 @@ impl TurnRule {
     pub fn new(cfg: TurnCfg, model: TurnModel) -> Self {
         let thr_lo = *model.thresholds.get(&cfg.tier_lo).unwrap_or(&1.1);
         let thr_hi = *model.thresholds.get(&cfg.tier_hi).unwrap_or(&1.1);
-        tracing::info!(target: "turn", "turnaround shadow up: target={} tiers {}={:.4} {}={:.4} band [{},{}] tte ({},{}]",
-            model.target, cfg.tier_lo, thr_lo, cfg.tier_hi, thr_hi, cfg.px_lo, cfg.px_hi, cfg.entry_min_tte_s, cfg.entry_max_tte_s);
+        tracing::info!(target: "turn", "turnaround up: armed={} target={} tiers {}={:.4} {}={:.4} band [{},{}] tte ({},{}]",
+            cfg.armed, model.target, cfg.tier_lo, thr_lo, cfg.tier_hi, thr_hi, cfg.px_lo, cfg.px_hi, cfg.entry_min_tte_s, cfg.entry_max_tte_s);
         TurnRule {
             cfg, model, thr_lo, thr_hi,
             perp: VecDeque::new(), perp_last: f64::NAN, grid_next: 0, grid: VecDeque::new(), c1: VecDeque::new(),
@@ -287,45 +291,45 @@ impl TurnRule {
         var.sqrt().max(SIG_FLOOR)
     }
 
-    fn eval(&mut self, inst: &str, state: &MarketState, now: i64) {
-        let Some(t) = state.get(inst) else { return };
-        let Some(expiry) = t.expiry_ts_ns else { return };
+    fn eval(&mut self, inst: &str, state: &MarketState, now: i64) -> Option<TradeSignal> {
+        let t = state.get(inst)?;
+        let expiry = t.expiry_ts_ns?;
         let tte_s = (expiry - now) as f64 / 1e9;
         if tte_s <= 0.0 {
             self.evs.remove(inst);
             self.yes.remove(inst);
-            return;
+            return None;
         }
         if !(tte_s > self.cfg.entry_min_tte_s && tte_s <= self.cfg.entry_max_tte_s) {
-            return;
+            return None;
         }
-        let Some(strike) = t.strike else { return };
+        let strike = t.strike?;
         let (ybid, yask) = (t.best_bid, t.best_ask);
         let spr = yask - ybid;
         if !(ybid > 0.01 && yask < 0.99 && yask > ybid && spr <= self.cfg.max_spread) {
-            return;
+            return None;
         }
         let mid = 0.5 * (ybid + yask);
         if !(mid < self.cfg.px_lo || mid > self.cfg.px_hi) {
-            return;
+            return None;
         }
         let lo = mid < 0.5;
         {
             let st = self.evs.entry(inst.to_string()).or_default();
             if now - st.last_eval_ns < self.cfg.eval_min_ms * 1_000_000 {
-                return;
+                return None;
             }
             st.last_eval_ns = now;
             if (lo && st.fired_lo) || (!lo && st.fired_hi) {
-                return;
+                return None;
             }
         }
         self.n_eval += 1;
         if self.grid_next == 0 || !(self.perp_last > 0.0) {
-            return;
+            return None;
         }
         if now - self.cb_ts > self.cfg.cb_max_age_ms * 1_000_000 || !(self.cb_mid > 0.0) {
-            return;
+            return None;
         }
         self.grid_fill(now, true);
         let perp_now = self.perp_last;
@@ -333,24 +337,24 @@ impl TurnRule {
         let p_cheap = if lo { mid } else { 1.0 - mid };
         let cheap_ask = if lo { yask } else { 1.0 - ybid };
         if cheap_ask > self.cfg.max_cheap_ask {
-            return;
+            return None;
         }
         let mut x = Vec::with_capacity(self.model.nf);
         let l0 = lg(mid);
         let yring = match self.yes.get(inst) {
             Some(r) => r,
-            None => return,
+            None => return None,
         };
         for &j in &self.model.lags {
             match at(yring, now - GRID_NS * j as i64) {
                 Some(v) => x.push(m * (l0 - lg(v))),
-                None => return, // history not yet covering the lag window
+                None => return None, // history not yet covering the lag window
             }
         }
         for &j in &self.model.lags {
             match at(&self.perp, now - GRID_NS * j as i64) {
                 Some(v) => x.push(m * (v - perp_now)),
-                None => return,
+                None => return None,
             }
         }
         let sig = self.sigma();
@@ -361,10 +365,11 @@ impl TurnRule {
                               m * (ndtr(dc / sc) - mid), m * (ndtr(dp / sc) - mid)]);
         x.extend_from_slice(&[tte_s.max(1.0).ln(), sig, 100.0 * spr, lg(p_cheap), mid * (1.0 - mid), if lo { 1.0 } else { 0.0 }]);
         if x.len() != self.model.nf || x.iter().any(|v| !v.is_finite()) {
-            return;
+            return None;
         }
         self.n_scored += 1;
         let p = self.model.score(&x);
+        let mut out = None;
         if p >= self.thr_lo {
             let tier = if p >= self.thr_hi { "HI" } else { "LO" };
             let st = self.evs.entry(inst.to_string()).or_default();
@@ -376,10 +381,28 @@ impl TurnRule {
             self.n_sig += 1;
             tracing::info!(
                 target: "turn",
-                "{} TURN-SIG tier={} p={:.4} side={} cheap_ask={:.3} mid={:.4} tte={:.1} spr={:.3} sig={:.2} dp={:+.1} dc={:+.1} cb_age_ms={}",
+                "{} TURN-SIG tier={} p={:.4} side={} cheap_ask={:.3} mid={:.4} tte={:.1} spr={:.3} sig={:.2} dp={:+.1} dc={:+.1} cb_age_ms={} armed={}",
                 inst, tier, p, if lo { "YES" } else { "NO" }, cheap_ask, mid, tte_s, spr, sig, dp, dc,
-                (now - self.cb_ts) / 1_000_000
+                (now - self.cb_ts) / 1_000_000, self.cfg.armed as u8
             );
+            if self.cfg.armed {
+                out = Some(TradeSignal {
+                    strategy: "turnaround".into(),
+                    ts_ns: now,
+                    reason: format!("p={p:.4} tier={tier} mid={mid:.4} tte={tte_s:.1}s cheap_ask={cheap_ask:.3} sig={sig:.2}"),
+                    reference: self.cfg.reference.clone(),
+                    target: inst.to_string(),
+                    direction: if lo { 1 } else { -1 },
+                    trigger: arb_core::model::Trigger {
+                        move_bps: 100.0 * p,
+                        window_ms: 30_000,
+                        yes_price: cheap_ask,
+                        target_move_c: f64::NAN,
+                    },
+                    hold_ms: 0,
+                    ttl_ms: 500,
+                });
+            }
         }
         if now - self.last_stat_ns >= (self.cfg.log_every_s * 1e9) as i64 {
             if self.last_stat_ns != 0 {
@@ -388,6 +411,7 @@ impl TurnRule {
             }
             self.last_stat_ns = now;
         }
+        out
     }
 }
 
@@ -428,7 +452,7 @@ impl Rule for TurnRule {
                     }
                 }
                 let inst = b.instrument.clone();
-                self.eval(&inst, state, b.recv_ts_ns);
+                return self.eval(&inst, state, b.recv_ts_ns).into_iter().collect();
             }
             Payload::Meta(m) => {
                 use arb_core::model::MarketStatus::*;
@@ -439,7 +463,7 @@ impl Rule for TurnRule {
             }
             _ => {}
         }
-        Vec::new() // SHADOW: never a trade signal
+        Vec::new()
     }
 }
 
