@@ -20,45 +20,63 @@ UA = {"User-Agent": "Mozilla/5.0"}
 
 
 def get_json(url):
-    for attempt in range(4):
+    for attempt in range(7):
         try:
             with urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=30) as r:
                 return json.loads(r.read().decode())
         except Exception as e:
-            if attempt == 3:
+            if attempt == 6:
                 raise
-            time.sleep(2 * (attempt + 1))
+            time.sleep(min(60, 2 ** attempt * 2))
 
 
 def fetch_kalshi():
-    rows, cursor = [], ""
-    base = "https://api.elections.kalshi.com/trade-api/v2/markets?limit=1000&status=open"
+    """Enumerate open EVENTS (the human-level catalog; /markets is drowned in millions of
+    auto-generated zero-quote shells). Each nested market becomes a row WITHOUT quotes;
+    spread_scan fetches live quotes per matched event at scan time."""
+    rows, cursor, npages = [], "", 0
+    part = os.path.join(OUT, "kalshi_partial.json")
+    if os.path.exists(part):
+        st = json.load(open(part))
+        rows, cursor = st["rows"], st["cursor"]
+        print("resuming kalshi from %d rows" % len(rows), flush=True)
+    base = "https://api.elections.kalshi.com/trade-api/v2/events?status=open&limit=200&with_nested_markets=true"
     while True:
-        url = base + ("&cursor=" + cursor if cursor else "")
-        js = get_json(url)
-        for m in js.get("markets", []):
-            rows.append({
-                "venue": "kalshi",
-                "id": m["ticker"],
-                "title": (m.get("title") or "") + " | " + (m.get("subtitle") or "") + " | " + (m.get("yes_sub_title") or ""),
-                "yes_bid": (m.get("yes_bid") or 0) / 100.0,
-                "yes_ask": (m.get("yes_ask") or 0) / 100.0,
-                "close_ts": m.get("close_time") or "",
-                "volume": m.get("volume") or 0,
-                "extra": {"event": m.get("event_ticker"), "strike": m.get("floor_strike") or m.get("cap_strike")},
-            })
+        js = get_json(base + ("&cursor=" + cursor if cursor else ""))
+        for e in js.get("events", []):
+            for m in e.get("markets", []):
+                rows.append({
+                    "venue": "kalshi",
+                    "id": m["ticker"],
+                    "title": " | ".join(x for x in (e.get("title"), e.get("sub_title"), m.get("yes_sub_title")) if x),
+                    "yes_bid": 0.0, "yes_ask": 0.0,
+                    "close_ts": m.get("close_time") or "",
+                    "volume": m.get("volume") or 0,
+                    "extra": {"event": e.get("event_ticker"), "category": e.get("category"),
+                              "strike": m.get("floor_strike") or m.get("cap_strike")},
+                })
         cursor = js.get("cursor") or ""
-        print("kalshi: %d markets so far" % len(rows), flush=True)
+        npages += 1
+        if npages % 25 == 0:
+            print("kalshi: %d markets / %d event pages" % (len(rows), npages), flush=True)
+            json.dump({"rows": rows, "cursor": cursor}, open(part, "w"))
+        time.sleep(0.25)
         if not cursor:
             break
     json.dump(rows, open(os.path.join(OUT, "kalshi_markets.json"), "w"))
-    print("kalshi: wrote %d" % len(rows))
+    if os.path.exists(part):
+        os.remove(part)
+    print("kalshi: wrote %d markets" % len(rows))
 
 
 def fetch_poly():
     rows, offset = [], 0
     while True:
-        js = get_json("https://gamma-api.polymarket.com/markets?active=true&closed=false&limit=500&offset=%d" % offset)
+        try:
+            js = get_json("https://gamma-api.polymarket.com/markets?active=true&closed=false&order=volumeNum&ascending=false&limit=100&offset=%d" % offset)
+        except Exception as e:
+            print("polymarket: pagination stopped at offset %d (%s)" % (offset, e))
+            break
         if not js:
             break
         for m in js:
@@ -80,9 +98,12 @@ def fetch_poly():
                 "volume": float(m.get("volumeNum") or 0),
                 "extra": {"yes_mid": yes_px, "slug": m.get("slug"), "neg_risk": m.get("negRisk"), "clob": m.get("clobTokenIds")},
             })
-        offset += 500
-        print("polymarket: %d markets so far" % len(rows), flush=True)
-        if len(js) < 500:
+        offset += len(js)
+        if offset % 2000 < 100:
+            print("polymarket: %d markets so far" % len(rows), flush=True)
+            json.dump(rows, open(os.path.join(OUT, "polymarket_markets.json"), "w"))
+        time.sleep(0.2)
+        if len(js) < 100:
             break
     json.dump(rows, open(os.path.join(OUT, "polymarket_markets.json"), "w"))
     print("polymarket: wrote %d" % len(rows))

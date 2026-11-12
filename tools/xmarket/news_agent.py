@@ -15,6 +15,22 @@ Usage: news_agent.py [--max-headlines 20] [--min-volume 10000]
 import json
 import os
 import subprocess
+
+def claude_bin():
+    """Resolve the claude CLI: PATH first, then the newest VS Code extension bundle."""
+    import glob as _g
+    import os as _os
+    import shutil as _sh
+    for name in ("claude", "claude.cmd", "claude.exe"):
+        p = _sh.which(name)
+        if p:
+            return p
+    pat = _os.path.expanduser(r"~/.vscode/extensions/anthropic.claude-code-*/resources/native-binary/claude.exe")
+    cands = sorted(_g.glob(pat))
+    if cands:
+        return cands[-1]
+    raise FileNotFoundError("claude CLI not found on PATH or in VS Code extensions")
+
 import sys
 import time
 
@@ -54,7 +70,7 @@ def fresh_headlines(limit):
 
 
 def ask_claude(prompt):
-    r = subprocess.run(["claude", "-p", "--output-format", "text"], input=prompt,
+    r = subprocess.run([claude_bin(), "-p", "--output-format", "text"], input=prompt,
                        capture_output=True, text=True, timeout=300, encoding="utf-8")
     return r.stdout.strip()
 
