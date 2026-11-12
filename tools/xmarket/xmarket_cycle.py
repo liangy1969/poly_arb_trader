@@ -47,6 +47,13 @@ def main():
         except Exception as e:
             out = "FAILED: %s" % e
         log.write("-- news_agent.py --\n%s\n" % out.strip()[-2000:])
+    if n % 96 == 0:   # ~daily: correlation agent data pass + thesis validation
+        for script, args in (("corr_agent.py", ("analyze",)), ("corr_agent.py", ("validate",))):
+            try:
+                out = run(script, *args)
+            except Exception as e:
+                out = "FAILED: %s" % e
+            log.write("-- %s %s --\n%s\n" % (script, args[0], out.strip()[-2000:]))
     if n % 32 == 0:   # ~every 8 hours: score the news agent
         try:
             out = run("news_eval.py", "--horizon", "60")
