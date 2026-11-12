@@ -1,17 +1,16 @@
-"""Periodic top-of-book snapshot of liquid markets on both venues, for the correlation layer.
+"""Periodic top-of-book snapshot of the markets our monitors actually reference.
 
-Each run appends one row per tracked market to data/xmarket/snapshots.csv:
-  ts,venue,id,yes_bid,yes_ask
-Tracked = markets from the catalogs with volume >= --min-volume (default 5000), capped at
---max-markets (default 1500) by volume. Kalshi prices come in one paginated sweep of
-/markets (fresh quotes); Polymarket from gamma (bestBid/bestAsk refresh on fetch).
-Run on a schedule (e.g. every 5 minutes); corr_track.py consumes the file.
-Usage: snapshot_prices.py [--min-volume 5000] [--max-markets 1500]
+The tracked set is the union of: matched pairs (score >= 0.7), classified relations, and any
+market the news agent has ever named. Kalshi quotes come from the authenticated host in
+batches of 100 tickers (the public host throttles and the /markets sweep drowns in shells);
+Polymarket from gamma by condition id in batches of 20.
+Appends to data/xmarket/snapshots.csv: ts,venue,id,yes_bid,yes_ask
+Run on a schedule; news_eval.py and the correlation layer consume the file.
+Usage: snapshot_prices.py
 """
 import csv
 import json
 import os
-import sys
 import time
 import urllib.request
 
@@ -19,52 +18,72 @@ OUT = "data/xmarket"
 UA = {"User-Agent": "Mozilla/5.0"}
 
 
-def get_json(url):
-    with urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=30) as r:
-        return json.loads(r.read().decode())
+def signed_get(path):
+    import base64
+    import http.client
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import padding
+    key = serialization.load_pem_private_key(open(r"C:/Users/fatli/.poly/kalshi_private.txt", "rb").read(), password=None)
+    conn = http.client.HTTPSConnection("external-api.kalshi.com", timeout=30)
+    ts = str(int(time.time() * 1000))
+    sig = key.sign((ts + "GET" + path.split("?")[0]).encode(), padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=32), hashes.SHA256())
+    conn.request("GET", path, headers={"KALSHI-ACCESS-KEY": "e547e0c2-c92f-4d1a-aaef-58d6d589032d",
+                                       "KALSHI-ACCESS-TIMESTAMP": ts, "KALSHI-ACCESS-SIGNATURE": base64.b64encode(sig).decode(),
+                                       "User-Agent": "Mozilla/5.0"})
+    return json.loads(conn.getresponse().read().decode())
+
+
+def px(m, side):
+    v = m.get(side + "_dollars")
+    if v is not None:
+        return float(v)
+    return (m.get(side) or 0) / 100.0
+
+
+def tracked():
+    k, p = set(), set()
+    try:
+        for r in json.load(open(OUT + "/pairs.json")):
+            if r["score"] >= 0.7:
+                k.add(r["k_id"]); p.add(r["p_id"])
+    except FileNotFoundError:
+        pass
+    try:
+        for r in json.load(open(OUT + "/relations.json")):
+            k.add(r["k_id"]); p.add(r["p_id"])
+    except FileNotFoundError:
+        pass
+    if os.path.exists(OUT + "/news_calls.jsonl"):
+        for line in open(OUT + "/news_calls.jsonl", encoding="utf-8"):
+            try:
+                for c in json.loads(line).get("calls", []):
+                    (k if c.get("venue") == "kalshi" else p).add(str(c.get("id")))
+            except Exception:
+                continue
+    return sorted(k), sorted(p)
 
 
 def main():
-    min_vol = 5000.0
-    if "--min-volume" in sys.argv:
-        min_vol = float(sys.argv[sys.argv.index("--min-volume") + 1])
-    max_m = 1500
-    if "--max-markets" in sys.argv:
-        max_m = int(sys.argv[sys.argv.index("--max-markets") + 1])
-    track = {}
-    for fn in ("kalshi_markets.json", "polymarket_markets.json"):
-        for m in json.load(open(os.path.join(OUT, fn))):
-            if (m["volume"] or 0) >= min_vol:
-                track[(m["venue"], m["id"])] = m["volume"]
-    keep = set(sorted(track, key=lambda k: -track[k])[:max_m])
-    k_ids = {i for v, i in keep if v == "kalshi"}
-    p_ids = {i for v, i in keep if v == "polymarket"}
+    kids, pids = tracked()
     ts = int(time.time())
     rows = []
-    # kalshi sweep
-    cursor = ""
-    while True:
-        url = "https://api.elections.kalshi.com/trade-api/v2/markets?limit=1000&status=open" + ("&cursor=" + cursor if cursor else "")
-        js = get_json(url)
-        for m in js.get("markets", []):
-            if m["ticker"] in k_ids:
-                rows.append((ts, "kalshi", m["ticker"], (m.get("yes_bid") or 0) / 100.0, (m.get("yes_ask") or 0) / 100.0))
-        cursor = js.get("cursor") or ""
-        if not cursor:
-            break
-    # polymarket sweep
-    offset = 0
-    while True:
-        js = get_json("https://gamma-api.polymarket.com/markets?active=true&closed=false&limit=500&offset=%d" % offset)
-        if not js:
-            break
-        for m in js:
-            cid = m.get("conditionId") or str(m.get("id"))
-            if cid in p_ids:
-                rows.append((ts, "polymarket", cid, float(m.get("bestBid") or 0), float(m.get("bestAsk") or 0)))
-        offset += 500
-        if len(js) < 500:
-            break
+    for i in range(0, len(kids), 100):
+        try:
+            js = signed_get("/trade-api/v2/markets?tickers=" + ",".join(kids[i:i + 100]))
+            for m in js.get("markets", []):
+                rows.append((ts, "kalshi", m["ticker"], px(m, "yes_bid"), px(m, "yes_ask")))
+        except Exception as e:
+            print("kalshi batch %d: %s" % (i, e))
+        time.sleep(0.5)
+    for i in range(0, len(pids), 20):
+        url = "https://gamma-api.polymarket.com/markets?" + "&".join("condition_ids=" + c for c in pids[i:i + 20])
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=30) as r:
+                for m in json.loads(r.read().decode()):
+                    rows.append((ts, "polymarket", m.get("conditionId"), float(m.get("bestBid") or 0), float(m.get("bestAsk") or 0)))
+        except Exception as e:
+            print("poly batch %d: %s" % (i, e))
+        time.sleep(0.4)
     path = os.path.join(OUT, "snapshots.csv")
     new = not os.path.exists(path)
     with open(path, "a", newline="") as f:
@@ -72,7 +91,7 @@ def main():
         if new:
             w.writerow(["ts", "venue", "id", "yes_bid", "yes_ask"])
         w.writerows(rows)
-    print("snapshot @%d: %d rows (%d tracked)" % (ts, len(rows), len(keep)))
+    print("snapshot @%d: %d rows (%d kalshi + %d poly tracked)" % (ts, len(rows), len(kids), len(pids)))
 
 
 if __name__ == "__main__":
