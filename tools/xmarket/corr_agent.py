@@ -80,7 +80,7 @@ def mid_panel(df):
 def cmd_graph():
     tm = titles_map()
     ids, _ = tracked_ids()
-    rows = ["%s|%s|%s" % (v, str(i)[:44], tm.get((v, i), "?")) for v, i in sorted(ids) if tm.get((v, i))]
+    rows = ["%s|%s|%s" % (v, i, tm.get((v, i), "?")) for v, i in sorted(ids) if tm.get((v, i))]
     print("graphing %d tracked markets" % len(rows))
     prompt = (
         "You are a cross-market analyst. Below are active prediction markets (venue|id|title).\n"
