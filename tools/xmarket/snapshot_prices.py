@@ -53,6 +53,14 @@ def tracked():
             k.add(r["k_id"]); p.add(r["p_id"])
     except FileNotFoundError:
         pass
+    if os.path.exists(OUT + "/hidden_links.jsonl"):
+        for line in open(OUT + "/hidden_links.jsonl", encoding="utf-8"):
+            try:
+                j = json.loads(line)
+                for leg in (j["a"], j["b"]):
+                    (k if leg["venue"] == "kalshi" else p).add(str(leg["id"]))
+            except Exception:
+                continue
     if os.path.exists(OUT + "/news_calls.jsonl"):
         for line in open(OUT + "/news_calls.jsonl", encoding="utf-8"):
             try:

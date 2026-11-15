@@ -178,8 +178,24 @@ def main():
         D = pd.read_csv(os.path.join(OUT, "consistency_log.csv"))
         rec = D[D.ts > time.time() - 48 * 3600]
         g = rec.groupby(["k_id", "p_id"]).edge.agg(["min", "max"])
-        movers = (g["max"] - g["min"]).sort_values(ascending=False).head(n)
+        recent = set()
+        hl = os.path.join(OUT, "hidden_links.jsonl")
+        if os.path.exists(hl):
+            for line in open(hl, encoding="utf-8"):
+                try:
+                    j = json.loads(line)
+                    if time.time() - j["t"] < 3 * 86400:
+                        recent.add((j["a"]["id"], j["b"]["id"]))
+                except Exception:
+                    pass
+        movers = (g["max"] - g["min"]).sort_values(ascending=False).head(3 * n)
+        done = 0
         for (k, p), mv in movers.items():
+            if done >= n:
+                break
+            if (k, p) in recent:
+                continue
+            done += 1
             print("\n### analyzing mover (%.1fc spread movement): %s <-> %s" % (100 * mv, k, p[:30]))
             try:
                 analyze(k, p)

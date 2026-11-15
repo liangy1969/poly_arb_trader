@@ -54,6 +54,12 @@ def main():
             except Exception as e:
                 out = "FAILED: %s" % e
             log.write("-- %s %s --\n%s\n" % (script, args[0], out.strip()[-2000:]))
+    if n % 96 == 48:   # ~daily (offset from the corr pass): hidden-driver agent on the top movers
+        try:
+            out = run("hidden_link_agent.py", "--from-watch", "3")
+        except Exception as e:
+            out = "FAILED: %s" % e
+        log.write("-- hidden_link_agent --\n%s\n" % out.strip()[-3000:])
     if n % 32 == 0:   # ~every 8 hours: score the news agent
         try:
             out = run("news_eval.py", "--horizon", "60")
