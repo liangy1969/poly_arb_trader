@@ -188,12 +188,24 @@ def main():
                         recent.add((j["a"]["id"], j["b"]["id"]))
                 except Exception:
                     pass
-        movers = (g["max"] - g["min"]).sort_values(ascending=False).head(3 * n)
+        movers = (g["max"] - g["min"]).sort_values(ascending=False).head(6 * n)
         done = 0
         for (k, p), mv in movers.items():
             if done >= n:
                 break
             if (k, p) in recent:
+                continue
+            # skip resolved/closing markets: require a live two-sided Kalshi book and >24h to close
+            try:
+                m = signed_get("/trade-api/v2/markets/" + k).get("market", {})
+                bid = float(m.get("yes_bid_dollars") or 0)
+                ask = float(m.get("yes_ask_dollars") or 0)
+                import datetime as _dt
+                close = m.get("close_time") or "2000-01-01T00:00:00Z"
+                hrs = (_dt.datetime.fromisoformat(close.replace("Z", "+00:00")).timestamp() - time.time()) / 3600
+                if m.get("status") != "active" or not (0 < bid < 1 and 0 < ask < 1) or hrs < 24:
+                    continue
+            except Exception:
                 continue
             done += 1
             print("\n### analyzing mover (%.1fc spread movement): %s <-> %s" % (100 * mv, k, p[:30]))
