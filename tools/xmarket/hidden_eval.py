@@ -73,6 +73,37 @@ def main():
                          "now": m1, "gap_c": 100 * gap, "real_c": 100 * realized,
                          "hit": (gap == 0 and abs(realized) < 0.005) or (gap * realized > 0),
                          "conf": v.get("confidence", 0)})
+    # HIDDEN-EVENT-NEUTRAL score: use the agent's own latent model to strip out moves caused by the hidden
+    # event's probability changing. A move in leg B implies dP(H) = dB / (P(B|H) - P(B|notH)); that dP(H)
+    # should move A by (P(A|H) - P(A|notH)) * dP(H). What A does BEYOND that is the mispricing closing
+    # (or widening) — the part the agent actually claimed to know. Symmetric for B.
+    rel = []
+    for line in open(os.path.join(OUT, "hidden_links.jsonl"), encoding="utf-8"):
+        try:
+            j = json.loads(line)
+        except Exception:
+            continue
+        v = j.get("verdict") or {}
+        md = v.get("model") or {}
+        if now - j["t"] < age_d * 86400 or not md:
+            continue
+        t_eval = j["t"] + hor_d * 86400 if hor_d else now
+        ka, kb = (j["a"]["venue"], str(j["a"]["id"])), (j["b"]["venue"], str(j["b"]["id"]))
+        a1, b1 = mid_at(ka, min(t_eval, now)), mid_at(kb, min(t_eval, now))
+        a0, b0 = v.get("mkt_a"), v.get("mkt_b")
+        if None in (a1, b1, a0, b0, v.get("fair_a"), v.get("fair_b")):
+            continue
+        sa = md.get("a_given_h", 0) - md.get("a_given_not_h", 0)
+        sb = md.get("b_given_h", 0) - md.get("b_given_not_h", 0)
+        if abs(sa) < 0.2 or abs(sb) < 0.2:   # both legs must load materially on H, else the residual is just H's move
+            continue
+        da, db = a1 - a0, b1 - b0
+        resid_a = da - sa * (db / sb)          # A's move not explained by B-implied hidden-event change
+        resid_b = db - sb * (da / sa)
+        for leg, resid, gap in (("A", resid_a, v["fair_a"] - a0), ("B", resid_b, v["fair_b"] - b0)):
+            if abs(gap) >= 0.005:
+                rel.append({"id": str(j[leg.lower()]["id"])[:28], "leg": leg, "gap_c": 100 * gap, "resid_c": 100 * resid,
+                            "hit": gap * resid > 0})
     if not rows:
         print("nothing scoreable yet (verdicts younger than %.0f days or no snapshot coverage)" % age_d)
         return
@@ -83,6 +114,15 @@ def main():
             time.strftime("%m-%d", time.gmtime(r.t)), r.leg, r.id, r.mkt, r.fair, r.now, r.gap_c, r.real_c, "Y" if r.hit else "n"))
     print("\nall %d legs: direction hit %.0f%% | predicted %.1fc total, captured toward fair %.1fc" % (
         len(D), 100 * D.hit.mean(), D.gap_c.abs().sum(), (D.gap_c.apply(lambda x: 1 if x > 0 else -1) * D.real_c).sum()))
+    if rel:
+        R = pd.DataFrame(rel)
+        print("\nHIDDEN-EVENT-NEUTRAL (move beyond what the hidden event's own change explains):")
+        for r in R.itertuples():
+            print("  %-3s %-28s predicted %+5.1fc | residual move %+6.1fc %s" % (r.leg, r.id, r.gap_c, r.resid_c, "Y" if r.hit else "n"))
+        print("  legs %d | toward-fair %.0f%% | residual captured %.1fc of %.1fc predicted" % (
+            len(R), 100 * R.hit.mean(), (R.gap_c.apply(lambda x: 1 if x > 0 else -1) * R.resid_c).sum(), R.gap_c.abs().sum()))
+        cap = R.assign(c=(R.gap_c.apply(lambda x: 1 if x > 0 else -1) * R.resid_c).clip(-5, 5))
+        print("  same with each leg's contribution capped at +/-5c (no single news shock dominates): %.1fc" % cap.c.sum())
     big = D[D.gap_c.abs() >= 1.0]
     if len(big):
         print("legs with >=1c predicted gap: %d | hit %.0f%% | captured %.1fc of %.1fc predicted" % (
