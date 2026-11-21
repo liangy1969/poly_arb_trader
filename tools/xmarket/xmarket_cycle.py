@@ -60,6 +60,12 @@ def main():
         except Exception as e:
             out = "FAILED: %s" % e
         log.write("-- hidden_link_agent --\n%s\n" % out.strip()[-3000:])
+    if n % 8 == 4:    # ~every 2 hours: extend the Kalshi trade tapes for the maker-flow study
+        try:
+            out = run("maker_flow_probe.py", "collect")
+        except Exception as e:
+            out = "FAILED: %s" % e
+        log.write("-- maker_flow_probe collect --\n%s\n" % out.strip()[-1000:])
     if n % 32 == 0:   # ~every 8 hours: score the news agent
         try:
             out = run("news_eval.py", "--horizon", "60")
