@@ -36,14 +36,19 @@ def main():
     for k in series:
         series[k].sort()
 
-    def mid_at(key, t):
+    def mid_at(key, t, allow_after=False):
         s = series.get(key)
         if not s:
             return None
-        i = bisect.bisect_right([x[0] for x in s], t) - 1
-        if i < 0 or t - s[i][0] > 1800:
-            return None
-        return s[i][1]
+        ts_ = [x[0] for x in s]
+        i = bisect.bisect_right(ts_, t) - 1
+        if i >= 0 and t - s[i][0] <= 1800:
+            return s[i][1]
+        # a market the agent names is only added to snapshot tracking AFTER the call, so its first
+        # price comes from the next cycle: accept the first snapshot within 30 min after t as the start
+        if allow_after and i + 1 < len(s) and s[i + 1][0] - t <= 1800:
+            return s[i + 1][1]
+        return None
 
     import time
     now = time.time()
@@ -59,7 +64,7 @@ def main():
             continue
         for c in j["calls"]:
             key = (c.get("venue"), c.get("id"))
-            m0 = mid_at(key, j["t"])
+            m0 = mid_at(key, j["t"], allow_after=True)
             m1 = mid_at(key, j["t"] + horizon_s)
             if m0 is None or m1 is None:
                 continue

@@ -44,7 +44,7 @@ def catalog_digest(min_vol):
         try:
             for m in json.load(open(os.path.join(OUT, fn))):
                 if (m["volume"] or 0) >= min_vol:
-                    rows.append("%s|%s|%s" % (m["venue"], m["id"][:40], m["title"][:100].replace("\n", " ")))
+                    rows.append("%s|%s|%s" % (m["venue"], m["id"], m["title"][:100].replace("\n", " ")))
         except FileNotFoundError:
             pass
     return rows

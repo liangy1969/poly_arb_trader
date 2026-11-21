@@ -62,9 +62,13 @@ def tracked():
             except Exception:
                 continue
     if os.path.exists(OUT + "/news_calls.jsonl"):
+        cutoff = time.time() - 2 * 86400          # scoring horizons are <= 1 day: track called markets 2 days
         for line in open(OUT + "/news_calls.jsonl", encoding="utf-8"):
             try:
-                for c in json.loads(line).get("calls", []):
+                j = json.loads(line)
+                if j.get("t", 0) < cutoff:
+                    continue
+                for c in j.get("calls", []):
                     (k if c.get("venue") == "kalshi" else p).add(str(c.get("id")))
             except Exception:
                 continue
@@ -83,15 +87,22 @@ def main():
         except Exception as e:
             print("kalshi batch %d: %s" % (i, e))
         time.sleep(0.5)
+    nfail = 0
     for i in range(0, len(pids), 20):
         url = "https://gamma-api.polymarket.com/markets?" + "&".join("condition_ids=" + c for c in pids[i:i + 20])
-        try:
-            with urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=30) as r:
-                for m in json.loads(r.read().decode()):
-                    rows.append((ts, "polymarket", m.get("conditionId"), float(m.get("bestBid") or 0), float(m.get("bestAsk") or 0)))
-        except Exception as e:
-            print("poly batch %d: %s" % (i, e))
-        time.sleep(0.4)
+        for att in range(5):
+            try:
+                with urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=30) as r:
+                    for m in json.loads(r.read().decode()):
+                        rows.append((ts, "polymarket", m.get("conditionId"), float(m.get("bestBid") or 0), float(m.get("bestAsk") or 0)))
+                break
+            except Exception as e:
+                if att == 4:
+                    nfail += 1
+                time.sleep(3 * (att + 1))
+        time.sleep(0.8)
+    if nfail:
+        print("poly batches failed after retries: %d of %d" % (nfail, (len(pids) + 19) // 20))
     path = os.path.join(OUT, "snapshots.csv")
     new = not os.path.exists(path)
     with open(path, "a", newline="") as f:
