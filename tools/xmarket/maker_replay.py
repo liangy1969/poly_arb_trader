@@ -45,12 +45,20 @@ def book_timeline(ticker):
     """Rebuild the top of book after every recorded event -> arrays ts, best_bid, best_ask."""
     yes, no = {}, {}
     ts_l, bid_l, ask_l = [], [], []
-    for f in sorted(glob.glob(os.path.join(OUT, "books", "*.jsonl"))):
-        for line in open(f, encoding="utf-8"):
+    def records(path):
+        # early recordings split each message across two lines (Kalshi messages end in a newline);
+        # accumulate lines until the buffer parses
+        buf = ""
+        for line in open(path, encoding="utf-8"):
+            buf += line
             try:
-                rec = json.loads(line)
+                yield json.loads(buf)
+                buf = ""
             except Exception:
-                continue
+                if len(buf) > 2_000_000:
+                    buf = ""
+    for f in sorted(glob.glob(os.path.join(OUT, "books", "*.jsonl"))):
+        for rec in records(f):
             m = rec.get("m", {})
             typ, msg = m.get("type"), m.get("msg", {})
             if msg.get("market_ticker") != ticker:

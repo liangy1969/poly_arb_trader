@@ -72,7 +72,7 @@ class DailyLog:
                 self.f.close()
             self.day = day
             self.f = open(os.path.join(OUT, day + ".jsonl"), "a", encoding="utf-8")
-        self.f.write('{"rt":%d,"m":%s}\n' % (int(time.time() * 1000), raw))
+        self.f.write('{"rt":%d,"m":%s}\n' % (int(time.time() * 1000), raw.strip()))
         self.n += 1
         self.f.flush()          # low-volume market: flush every message so a kill never loses data
 
